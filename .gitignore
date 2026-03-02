@@ -141,3 +141,4 @@ a.out.*
 
 hexagon-sdk
 !/build-npu-opencl.sh
+command.md

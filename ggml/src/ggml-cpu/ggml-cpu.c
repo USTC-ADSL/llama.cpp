@@ -15,6 +15,10 @@
 #include "ggml.h"
 #include "common.h"
 
+#ifdef GGML_CPU_PROFILING
+#include "ggml-profiler.h"
+#endif
+
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
 #elif !defined(__FreeBSD__) && !defined(__NetBSD__) && !defined(__OpenBSD__)
@@ -2929,6 +2933,171 @@ struct ggml_cplan ggml_graph_plan(
     return cplan;
 }
 
+//
+// CPU Stage Profiling
+//
+
+#ifdef GGML_CPU_PROFILING
+
+// CPU profiling info for a single operation
+struct ggml_cpu_profiling_info {
+    char op_name[GGML_MAX_NAME];
+    enum ggml_stage_type stage;
+    int layer_id;
+    uint64_t duration_us;
+};
+
+// Global CPU profiling storage
+static struct {
+    struct ggml_cpu_profiling_info * entries;
+    size_t count;
+    size_t capacity;
+    bool enabled;
+} g_cpu_profiling = { NULL, 0, 0, true };
+
+// Record a profiling entry
+static void ggml_cpu_profiling_record(const struct ggml_tensor * tensor, uint64_t duration_us) {
+    if (!g_cpu_profiling.enabled) {
+        return;
+    }
+
+    // Expand capacity if needed
+    if (g_cpu_profiling.count >= g_cpu_profiling.capacity) {
+        size_t new_capacity = g_cpu_profiling.capacity ? g_cpu_profiling.capacity * 2 : 4096;
+        struct ggml_cpu_profiling_info * new_entries = (struct ggml_cpu_profiling_info *)
+            realloc(g_cpu_profiling.entries, new_capacity * sizeof(struct ggml_cpu_profiling_info));
+        if (!new_entries) {
+            GGML_LOG_ERROR("ggml_cpu_profiling: failed to allocate memory\n");
+            return;
+        }
+        g_cpu_profiling.entries = new_entries;
+        g_cpu_profiling.capacity = new_capacity;
+    }
+    struct ggml_cpu_profiling_info * info = &g_cpu_profiling.entries[g_cpu_profiling.count++];
+
+    const char * name_src = tensor->name;
+    if (name_src == NULL || name_src[0] == '\0') {
+        name_src = ggml_op_name(tensor->op);
+    }
+    if (name_src == NULL || name_src[0] == '\0') {
+        name_src = "op_unknown";
+    }
+
+    // Store a stable bounded copy for later CSV writing.
+    snprintf(info->op_name, sizeof(info->op_name), "%s", name_src);
+    info->stage = ggml_classify_stage(info->op_name);
+    info->layer_id = ggml_extract_layer_id(info->op_name);
+    info->duration_us = duration_us;
+}
+
+// Write profiling results to file and console
+void ggml_cpu_profiling_write(void) {
+    if (g_cpu_profiling.count == 0) {
+        GGML_LOG_INFO("ggml_cpu_profiling: no profiling data to write\n");
+        return;
+    }
+
+    // Aggregate stage statistics
+    struct ggml_stage_stats stage_stats[GGML_STAGE_COUNT];
+    for (int i = 0; i < GGML_STAGE_COUNT; i++) {
+        ggml_stage_stats_init(&stage_stats[i]);
+    }
+
+    uint64_t total_time_us = 0;
+    for (size_t i = 0; i < g_cpu_profiling.count; i++) {
+        enum ggml_stage_type stage = g_cpu_profiling.entries[i].stage;
+        uint64_t time_ns = g_cpu_profiling.entries[i].duration_us * 1000;  // Convert to ns
+        ggml_stage_stats_update(&stage_stats[stage], time_ns);
+        total_time_us += g_cpu_profiling.entries[i].duration_us;
+    }
+
+    // Write detailed CSV
+    FILE * fdetail = fopen("cpu_profiling.csv", "w");
+    if (fdetail) {
+        fprintf(fdetail, "op_name,stage,layer_id,duration_us\n");
+        for (size_t i = 0; i < g_cpu_profiling.count; i++) {
+            const struct ggml_cpu_profiling_info * info = &g_cpu_profiling.entries[i];
+            fprintf(fdetail, "%s,%s,%d,%" PRIu64 "\n",
+                info->op_name,
+                ggml_stage_name(info->stage),
+                info->layer_id,
+                info->duration_us);
+        }
+        fclose(fdetail);
+        GGML_LOG_INFO("ggml_cpu_profiling: wrote cpu_profiling.csv\n");
+    }
+
+    // Write stage summary CSV
+    FILE * fstage = fopen("cpu_stage_profiling.csv", "w");
+    if (fstage) {
+        fprintf(fstage, "stage,total_time_ms,count,avg_time_ms,min_time_ms,max_time_ms,percentage\n");
+        uint64_t total_time_ns = total_time_us * 1000;
+        for (int i = 0; i < GGML_STAGE_COUNT; i++) {
+            if (stage_stats[i].count > 0) {
+                double percentage = total_time_ns > 0
+                    ? (100.0 * stage_stats[i].total_time_ns / total_time_ns)
+                    : 0.0;
+                fprintf(fstage, "%s,%.3f,%" PRIu64 ",%.3f,%.3f,%.3f,%.2f\n",
+                    ggml_stage_name((enum ggml_stage_type)i),
+                    stage_stats[i].total_time_ns / 1.e6,
+                    stage_stats[i].count,
+                    ggml_stage_stats_avg_ns(&stage_stats[i]) / 1.e6,
+                    stage_stats[i].min_time_ns / 1.e6,
+                    stage_stats[i].max_time_ns / 1.e6,
+                    percentage);
+            }
+        }
+        fprintf(fstage, "TOTAL,%.3f,%" PRIu64 ",,,,100.00\n",
+            total_time_us / 1000.0, (uint64_t)g_cpu_profiling.count);
+        fclose(fstage);
+        GGML_LOG_INFO("ggml_cpu_profiling: wrote cpu_stage_profiling.csv\n");
+    }
+
+    // Print stage summary to console
+    GGML_LOG_INFO("\n=== CPU Stage Profiling Summary ===\n");
+    GGML_LOG_INFO("%-12s %12s %8s %12s %8s\n", "Stage", "Time (ms)", "Count", "Avg (ms)", "Percent");
+    GGML_LOG_INFO("%-12s %12s %8s %12s %8s\n", "------------", "------------", "--------", "------------", "--------");
+    uint64_t total_time_ns = total_time_us * 1000;
+    for (int i = 0; i < GGML_STAGE_COUNT; i++) {
+        if (stage_stats[i].count > 0) {
+            double percentage = total_time_ns > 0
+                ? (100.0 * stage_stats[i].total_time_ns / total_time_ns)
+                : 0.0;
+            GGML_LOG_INFO("%-12s %12.3f %8" PRIu64 " %12.3f %7.2f%%\n",
+                ggml_stage_name((enum ggml_stage_type)i),
+                stage_stats[i].total_time_ns / 1.e6,
+                stage_stats[i].count,
+                ggml_stage_stats_avg_ns(&stage_stats[i]) / 1.e6,
+                percentage);
+        }
+    }
+    GGML_LOG_INFO("%-12s %12s %8s %12s %8s\n", "------------", "------------", "--------", "------------", "--------");
+    GGML_LOG_INFO("%-12s %12.3f %8zu\n", "TOTAL", total_time_us / 1000.0, g_cpu_profiling.count);
+}
+
+// Reset profiling data
+void ggml_cpu_profiling_reset(void) {
+    g_cpu_profiling.count = 0;
+}
+
+// Free profiling resources
+void ggml_cpu_profiling_free(void) {
+    if (g_cpu_profiling.entries) {
+        free(g_cpu_profiling.entries);
+        g_cpu_profiling.entries = NULL;
+    }
+    g_cpu_profiling.count = 0;
+    g_cpu_profiling.capacity = 0;
+}
+
+// Enable/disable profiling
+void ggml_cpu_profiling_enable(bool enable) {
+    g_cpu_profiling.enabled = enable;
+}
+
+#endif // GGML_CPU_PROFILING
+
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -2956,6 +3125,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
+#ifdef GGML_CPU_PROFILING
+                int64_t t0 = 0;
+                if (state->ith == 0) {
+                    t0 = ggml_time_us();
+                }
+#endif
+
+
         if (ggml_op_is_empty(node->op)) {
             // skip NOPs
             continue;
@@ -2976,6 +3153,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
         }
+#ifdef GGML_CPU_PROFILING
+        if (state->ith == 0) {
+            int64_t t1 = ggml_time_us();
+            ggml_cpu_profiling_record(node, (uint64_t)(t1 - t0));
+        }
+#endif
     }
 
 #ifdef GGML_USE_OPENMP

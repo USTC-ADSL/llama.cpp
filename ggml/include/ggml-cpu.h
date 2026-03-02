@@ -146,6 +146,28 @@ extern "C" {
     GGML_BACKEND_API void ggml_cpu_fp32_to_bf16(const float *, ggml_bf16_t *, int64_t);
     GGML_BACKEND_API void ggml_cpu_bf16_to_fp32(const ggml_bf16_t *, float *, int64_t);
 
+    //
+    // CPU Stage Profiling (enabled with GGML_CPU_PROFILING)
+    //
+    // These functions are only available when compiled with -DGGML_CPU_PROFILING=ON
+    // They provide low-overhead stage-level profiling for CPU inference.
+    //
+
+#ifdef GGML_CPU_PROFILING
+    // Write profiling results to files and console
+    // Outputs: cpu_profiling.csv (detailed), cpu_stage_profiling.csv (summary)
+    GGML_BACKEND_API void ggml_cpu_profiling_write(void);
+
+    // Reset profiling data (keeps allocated memory)
+    GGML_BACKEND_API void ggml_cpu_profiling_reset(void);
+
+    // Free all profiling resources
+    GGML_BACKEND_API void ggml_cpu_profiling_free(void);
+
+    // Enable or disable profiling collection
+    GGML_BACKEND_API void ggml_cpu_profiling_enable(bool enable);
+#endif // GGML_CPU_PROFILING
+
 #ifdef __cplusplus
 }
 #endif

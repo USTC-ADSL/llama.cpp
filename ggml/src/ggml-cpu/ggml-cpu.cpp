@@ -116,6 +116,12 @@ static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_cpu_free(ggml_backend_t backend) {
+#ifdef GGML_CPU_PROFILING
+    // Write profiling data before freeing the backend
+    ggml_cpu_profiling_write();
+    ggml_cpu_profiling_free();
+#endif
+
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
     delete[] cpu_ctx->work_data;
     delete cpu_ctx;
