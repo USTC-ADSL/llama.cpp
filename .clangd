@@ -1,0 +1,66 @@
+# 全局配置
+CompileFlags:
+  # 指定 compile_commands.json 的位置
+  # clangd 会从这个目录读取 compile_commands.json 来获取编译选项
+  CompilationDatabase: build
+
+Diagnostics:
+  Suppress:
+    - unused-includes
+
+---
+
+# Hexagon HTP 代码的配置 (ggml/src/ggml-hexagon/htp/ 目录下的文件)
+# 这些文件需要使用 Hexagon 编译器配置，而不是主机编译器配置
+If:
+  PathMatch: .*/ggml-hexagon/htp/.*
+CompileFlags:
+  Compiler: clang
+  Add:
+    # Hexagon 目标架构
+    - "-target"
+    - "hexagon"
+    - "-mhvx"
+    - "-mhvx-length=128B"
+    
+    # 强制包含必要的头文件
+    - "-include"
+    - "AEEStdDef.h"
+    - "-include"
+    - "ggml-common.h"
+    - "-include"
+    - "HAP_farf.h"
+    
+    # Hexagon 目标标准 C 库头文件路径 (包含 stdint.h, stddef.h 等)
+    - "-isystem"
+    - "hexagon-sdk/tools/HEXAGON_Tools/19.0.04/Tools/target/hexagon/include"
+    
+    # Hexagon 编译器内部头文件路径 (包含 clang 内置头文件)
+    - "-isystem"
+    - "hexagon-sdk/tools/HEXAGON_Tools/19.0.04/Tools/lib/clang/19/include"
+    
+    # 强制引入 HVX 类型定义
+    - "-include"
+    - "hexagon_types.h"
+    - "-include"
+    - "hvx_hexagon_protos.h"
+
+    # Hexagon C++ 标准库路径
+    - "-stdlib=libc++"
+    - "-isystem"
+    - "hexagon-sdk/tools/HEXAGON_Tools/19.0.04/Tools/target/hexagon/include/c++/v1"
+    - "-isystem"
+    - "hexagon-sdk/tools/HEXAGON_Tools/19.0.04/Tools/target/hexagon/include/c++"
+
+    # HVX 相关宏定义
+    - "-D__hexagon__"
+    - "-D__qdsp6__"
+    - "-D__QDSP6_ARCH__=79"
+    - "-D__HVX__"
+    - "-D__HVX_LENGTH__=128"
+    - "-D__HVX_ARCH__=79"
+  Remove:
+    # 移除主机编译器的选项
+    - "-march=*"
+    - "--march=*"
+    - "-m64"
