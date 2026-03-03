@@ -136,6 +136,14 @@ struct ggml_hexagon_session {
     uint32_t         prof_usecs;
     uint32_t         prof_cycles;
     uint32_t         prof_pkts;
+
+    struct prof_pending_entry {
+        const ggml_tensor * op;
+        uint64_t            call_usecs;
+    };
+
+    std::vector<prof_pending_entry> prof_pending;
+    size_t                          prof_pending_head;
 };
 
 void ggml_hexagon_session::enqueue(struct htp_general_req &req, struct dspqueue_buffer *bufs, uint32_t n_bufs, bool sync) {
@@ -205,10 +213,25 @@ void ggml_hexagon_session::flush() {
             // TODO: handle errors
         }
 
-        // TODO: update profiling implementation, currently only works for opt_opsync mode
         this->prof_usecs  = rsp.prof_usecs;
         this->prof_cycles = rsp.prof_cycles;
         this->prof_pkts   = rsp.prof_pkts;
+
+        if (opt_profile && !opt_opsync) {
+            if (this->prof_pending_head < this->prof_pending.size()) {
+                const auto & prof = this->prof_pending[this->prof_pending_head++];
+                ggml_hexagon_dump_op_prof(this->name, prof.op, rsp.prof_usecs, rsp.prof_cycles, rsp.prof_pkts, prof.call_usecs);
+
+                // Fast path: drop consumed entries in O(1) and keep capacity for reuse.
+                if (this->prof_pending_head == this->prof_pending.size()) {
+                    this->prof_pending.clear();
+                    this->prof_pending_head = 0;
+                }
+            } else {
+                GGML_LOG_DEBUG("ggml-hex: %s profile-op: missing pending context for response op %u\n",
+                               this->name.c_str(), rsp.op);
+            }
+        }
 
         this->op_pending--;  // atomic dec
     }
@@ -1547,6 +1570,8 @@ void ggml_hexagon_session::allocate(int dev_id) noexcept(false) {
     this->prof_usecs  = 0;
     this->prof_cycles = 0;
     this->prof_pkts   = 0;
+    this->prof_pending.clear();
+    this->prof_pending_head = 0;
 
     GGML_LOG_INFO("ggml-hex: allocating new session: %s\n", this->name.c_str());
 
@@ -2217,6 +2242,7 @@ typedef size_t (*htp_req_init_func_t)(htp_general_req * req, dspqueue_buffer * b
 template <htp_req_init_func_t _init_req_func>
 static inline void ggml_hexagon_dispatch_op(ggml_hexagon_session *sess, const struct ggml_tensor * op, uint32_t flags) {
     uint64_t t = ggml_time_us();
+    bool queued = false;
 
     // Construct HTP request
     htp_general_req req;
@@ -2236,11 +2262,18 @@ static inline void ggml_hexagon_dispatch_op(ggml_hexagon_session *sess, const st
         dspqueue_buffer bufs[HTP_MAX_PACKET_BUFFERS];
         size_t n_bufs = _init_req_func(&req, bufs, op);
         sess->enqueue(req, bufs, n_bufs, opt_opsync);
+        queued = true;
     }
 
     t = ggml_time_us() - t;
 
-    ggml_hexagon_dump_op_prof(sess->name, op, sess->prof_usecs, sess->prof_cycles, sess->prof_pkts, t);
+    if (opt_profile && queued) {
+        if (opt_opsync) {
+            ggml_hexagon_dump_op_prof(sess->name, op, sess->prof_usecs, sess->prof_cycles, sess->prof_pkts, t);
+        } else {
+            sess->prof_pending.push_back({ op, t });
+        }
+    }
 }
 
 template <bool _is_src0_constant>
