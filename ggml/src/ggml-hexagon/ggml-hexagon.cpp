@@ -31,6 +31,7 @@
 #include "ggml-common.h"
 #include "ggml-hexagon.h"
 #include "ggml-impl.h"
+#include "ggml-profiler.h"
 #include "ggml-quants.h"
 #include "op-desc.h"
 #include "htp-msg.h"
@@ -106,6 +107,16 @@ static void ggml_hexagon_dump_op_prof(const std::string &sess_name, const ggml_t
                 op_usec, op_cycles, op_pkts, (float) op_cycles / op_pkts, (unsigned long long) call_usec);
 }
 
+struct ggml_hexagon_profiling_info {
+    char op_name[GGML_MAX_NAME];
+    enum ggml_stage_type stage;
+    int layer_id;
+    uint32_t exec_usecs;
+    uint64_t host_usecs;
+    uint32_t op_cycles;
+    uint32_t op_pkts;
+};
+
 // ** backend sessions
 
 struct ggml_hexagon_session {
@@ -114,6 +125,9 @@ struct ggml_hexagon_session {
 
     void allocate(int dev_id) noexcept(false);
     void release() noexcept(true);
+    void profile_record(const struct ggml_tensor * op, uint32_t exec_usecs, uint32_t op_cycles, uint32_t op_pkts, uint64_t host_usecs);
+    void write_profile_csv();
+    void profile_flush_and_write_once(bool flush_pending);
 
     void enqueue(struct htp_general_req &req, struct dspqueue_buffer *bufs, uint32_t n_bufs, bool sync = false);
     void flush();
@@ -142,9 +156,145 @@ struct ggml_hexagon_session {
         uint64_t            call_usecs;
     };
 
+    std::vector<ggml_hexagon_profiling_info> prof_entries;
     std::vector<prof_pending_entry> prof_pending;
     size_t                          prof_pending_head;
+    std::atomic<int>                active_backends;
+    std::atomic<bool>               profile_written;
+    std::mutex                      profile_write_mutex;
 };
+
+void ggml_hexagon_session::profile_record(const struct ggml_tensor * op, uint32_t exec_usecs, uint32_t op_cycles, uint32_t op_pkts, uint64_t host_usecs) {
+    const char * name_src = op->name;
+    if (name_src == NULL || name_src[0] == '\0') {
+        name_src = ggml_op_name(op->op);
+    }
+    if (name_src == NULL || name_src[0] == '\0') {
+        name_src = "op_unknown";
+    }
+
+    ggml_hexagon_profiling_info info = {};
+    snprintf(info.op_name, sizeof(info.op_name), "%s", name_src);
+    info.stage      = ggml_classify_stage(name_src);
+    info.layer_id   = ggml_extract_layer_id(name_src);
+    info.exec_usecs = exec_usecs;
+    info.host_usecs = host_usecs;
+    info.op_cycles  = op_cycles;
+    info.op_pkts    = op_pkts;
+    this->prof_entries.push_back(info);
+}
+
+void ggml_hexagon_session::write_profile_csv() {
+    if (!opt_profile || this->prof_entries.empty()) {
+        return;
+    }
+
+    char fdetail_name[128];
+    char fstage_name[128];
+    snprintf(fdetail_name, sizeof(fdetail_name), "hex_%s_profiling.csv", this->name.c_str());
+    snprintf(fstage_name, sizeof(fstage_name), "hex_%s_stage_profiling.csv", this->name.c_str());
+
+    FILE * fdetail = fopen(fdetail_name, "w");
+    if (!fdetail) {
+        GGML_LOG_ERROR("ggml-hex: failed to open %s\n", fdetail_name);
+        return;
+    }
+
+    struct ggml_stage_stats exec_stage_stats[GGML_STAGE_COUNT];
+    uint64_t host_stage_total_ns[GGML_STAGE_COUNT] = { 0 };
+    for (int i = 0; i < GGML_STAGE_COUNT; ++i) {
+        ggml_stage_stats_init(&exec_stage_stats[i]);
+    }
+
+    uint64_t total_exec_ns = 0;
+    uint64_t total_host_ns = 0;
+
+    fprintf(fdetail, "op_name,stage,layer_id,exec_us,host_us,op_cycles,op_pkts,cycles_per_pkt\n");
+    for (const ggml_hexagon_profiling_info & info : this->prof_entries) {
+        const uint64_t exec_ns = (uint64_t) info.exec_usecs * 1000;
+        const uint64_t host_ns = info.host_usecs * 1000;
+
+        ggml_stage_stats_update(&exec_stage_stats[info.stage], exec_ns);
+        host_stage_total_ns[info.stage] += host_ns;
+        total_exec_ns += exec_ns;
+        total_host_ns += host_ns;
+
+        const double cycles_per_pkt = info.op_pkts > 0 ? (double) info.op_cycles / info.op_pkts : 0.0;
+        fprintf(fdetail, "%s,%s,%d,%u,%" PRIu64 ",%u,%u,%.3f\n",
+            info.op_name,
+            ggml_stage_name(info.stage),
+            info.layer_id,
+            info.exec_usecs,
+            info.host_usecs,
+            info.op_cycles,
+            info.op_pkts,
+            cycles_per_pkt);
+    }
+    fclose(fdetail);
+    GGML_LOG_INFO("ggml-hex: wrote %s\n", fdetail_name);
+
+    FILE * fstage = fopen(fstage_name, "w");
+    if (!fstage) {
+        GGML_LOG_ERROR("ggml-hex: failed to open %s\n", fstage_name);
+        return;
+    }
+
+    fprintf(fstage, "stage,exec_total_ms,count,exec_avg_ms,exec_min_ms,exec_max_ms,exec_percentage,host_total_ms,host_avg_ms,host_percentage\n");
+    for (int i = 0; i < GGML_STAGE_COUNT; ++i) {
+        if (exec_stage_stats[i].count == 0) {
+            continue;
+        }
+
+        const double exec_pct = total_exec_ns > 0
+            ? (100.0 * exec_stage_stats[i].total_time_ns / total_exec_ns)
+            : 0.0;
+        const double host_pct = total_host_ns > 0
+            ? (100.0 * host_stage_total_ns[i] / total_host_ns)
+            : 0.0;
+        const double host_avg_ms = exec_stage_stats[i].count > 0
+            ? (host_stage_total_ns[i] / 1.e6 / exec_stage_stats[i].count)
+            : 0.0;
+
+        fprintf(fstage, "%s,%.3f,%" PRIu64 ",%.3f,%.3f,%.3f,%.2f,%.3f,%.3f,%.2f\n",
+            ggml_stage_name((enum ggml_stage_type) i),
+            exec_stage_stats[i].total_time_ns / 1.e6,
+            exec_stage_stats[i].count,
+            ggml_stage_stats_avg_ns(&exec_stage_stats[i]) / 1.e6,
+            exec_stage_stats[i].min_time_ns / 1.e6,
+            exec_stage_stats[i].max_time_ns / 1.e6,
+            exec_pct,
+            host_stage_total_ns[i] / 1.e6,
+            host_avg_ms,
+            host_pct);
+    }
+    fprintf(fstage, "TOTAL,%.3f,%" PRIu64 ",,,,100.00,%.3f,,100.00\n",
+        total_exec_ns / 1.e6,
+        (uint64_t) this->prof_entries.size(),
+        total_host_ns / 1.e6);
+    fclose(fstage);
+    GGML_LOG_INFO("ggml-hex: wrote %s\n", fstage_name);
+
+    this->prof_entries.clear();
+}
+
+void ggml_hexagon_session::profile_flush_and_write_once(bool flush_pending) {
+    if (!opt_profile) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(this->profile_write_mutex);
+
+    if (this->profile_written.load()) {
+        return;
+    }
+
+    if (flush_pending && this->op_pending.load() > 0) {
+        flush();
+    }
+
+    write_profile_csv();
+    this->profile_written.store(true);
+}
 
 void ggml_hexagon_session::enqueue(struct htp_general_req &req, struct dspqueue_buffer *bufs, uint32_t n_bufs, bool sync) {
     // Bump pending flag (cleared in the session::flush once we get the responce)
@@ -221,6 +371,7 @@ void ggml_hexagon_session::flush() {
             if (this->prof_pending_head < this->prof_pending.size()) {
                 const auto & prof = this->prof_pending[this->prof_pending_head++];
                 ggml_hexagon_dump_op_prof(this->name, prof.op, rsp.prof_usecs, rsp.prof_cycles, rsp.prof_pkts, prof.call_usecs);
+                this->profile_record(prof.op, rsp.prof_usecs, rsp.prof_cycles, rsp.prof_pkts, prof.call_usecs);
 
                 // Fast path: drop consumed entries in O(1) and keep capacity for reuse.
                 if (this->prof_pending_head == this->prof_pending.size()) {
@@ -1570,8 +1721,11 @@ void ggml_hexagon_session::allocate(int dev_id) noexcept(false) {
     this->prof_usecs  = 0;
     this->prof_cycles = 0;
     this->prof_pkts   = 0;
+    this->prof_entries.clear();
     this->prof_pending.clear();
     this->prof_pending_head = 0;
+    this->active_backends = 0;
+    this->profile_written = false;
 
     GGML_LOG_INFO("ggml-hex: allocating new session: %s\n", this->name.c_str());
 
@@ -1708,6 +1862,12 @@ void ggml_hexagon_session::release() noexcept(true) {
     GGML_LOG_INFO("ggml-hex: releasing session: %s\n", this->name.c_str());
 
     int err;
+
+    if (this->op_pending.load() > 0) {
+        flush();
+    }
+
+    profile_flush_and_write_once(false);
 
     // Stop the DSP-side service and close the queue
     if (this->valid_iface) {
@@ -2270,6 +2430,7 @@ static inline void ggml_hexagon_dispatch_op(ggml_hexagon_session *sess, const st
     if (opt_profile && queued) {
         if (opt_opsync) {
             ggml_hexagon_dump_op_prof(sess->name, op, sess->prof_usecs, sess->prof_cycles, sess->prof_pkts, t);
+            sess->profile_record(op, sess->prof_usecs, sess->prof_cycles, sess->prof_pkts, t);
         } else {
             sess->prof_pending.push_back({ op, t });
         }
@@ -2496,8 +2657,18 @@ static const char * ggml_backend_hexagon_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_hexagon_free(ggml_backend_t backend) {
-    // we just need to delete the backend here
-    // the sessions are allocated & freed as part of the registry
+    auto sess = static_cast<ggml_hexagon_session *>(backend->context);
+
+    // Profiles are accumulated at session scope, so write once when the last backend is released.
+    const int active_backends = --sess->active_backends;
+    if (active_backends == 0) {
+        sess->profile_flush_and_write_once(true);
+    } else if (active_backends < 0) {
+        GGML_LOG_WARN("ggml-hex: %s backend refcount underflow (%d)\n", sess->name.c_str(), active_backends);
+        sess->active_backends = 0;
+    }
+
+    // sessions are allocated/freed as part of the registry
     delete backend;
 }
 
@@ -2847,14 +3018,21 @@ bool ggml_backend_is_hexagon(ggml_backend_t backend) {
 static ggml_backend_t ggml_backend_hexagon_device_init(ggml_backend_dev_t dev, const char * params) {
     auto sess = static_cast<ggml_hexagon_session *>(dev->context);
 
-    return new ggml_backend{
+    GGML_UNUSED(params);
+
+    ggml_backend_t backend = new ggml_backend{
         /* .guid      = */ ggml_backend_hexagon_guid(),
         /* .interface = */ hexagon_backend_i,
         /* .device    = */ dev,
         /* .context   = */ sess,
     };
 
-    GGML_UNUSED(params);
+    const int active_backends = ++sess->active_backends;
+    if (active_backends == 1) {
+        sess->profile_written.store(false);
+    }
+
+    return backend;
 }
 
 static const char * ggml_backend_hexagon_device_get_name(ggml_backend_dev_t dev) {

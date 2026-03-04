@@ -12,6 +12,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml.h"
+#include "ggml-profiler.h"
 
 #include <CL/cl.h>
 
@@ -293,6 +294,8 @@ struct ggml_cl_buffer {
 // Profiling
 struct ProfilingInfo {
     std::string op_name;
+    enum ggml_stage_type stage;
+    int layer_id;
     std::string kernel_name;
 
     cl_kernel kernel;
@@ -326,7 +329,17 @@ static void populateProfilingInfo(
         ProfilingInfo& info, cl_event evt, cl_kernel kernel, cl_uint work_dim,
         size_t global_size[3], size_t local_size[3],
         const ggml_tensor * tensor) {
-    info.op_name     = tensor->name;
+    const char * name_src = tensor->name;
+    if (name_src == NULL || name_src[0] == '\0') {
+        name_src = ggml_op_name(tensor->op);
+    }
+    if (name_src == NULL || name_src[0] == '\0') {
+        name_src = "op_unknown";
+    }
+
+    info.op_name     = name_src;
+    info.stage       = ggml_classify_stage(name_src);
+    info.layer_id    = ggml_extract_layer_id(name_src);
     info.kernel      = kernel;
     info.evt         = evt;
 
@@ -583,6 +596,15 @@ struct ggml_backend_opencl_context {
             return;
         }
 
+        struct ggml_stage_stats exec_stage_stats[GGML_STAGE_COUNT];
+        uint64_t host_stage_total_ns[GGML_STAGE_COUNT] = { 0 };
+        for (int i = 0; i < GGML_STAGE_COUNT; ++i) {
+            ggml_stage_stats_init(&exec_stage_stats[i]);
+        }
+
+        uint64_t total_exec_ns = 0;
+        uint64_t total_host_ns = 0;
+
         // Populate profiling info
         for (ProfilingInfo & info : profiling_info) {
             cl_ulong cmd_queued;
@@ -619,19 +641,77 @@ struct ggml_backend_opencl_context {
             info.cmd_duration_ns            = cmd_end       - cmd_start;
             info.cmd_complete_duration_ns   = cmd_complete  - cmd_end;
             info.cmd_total_duration_ns      = cmd_complete  - cmd_queued;
+
+            const uint64_t exec_ns = (uint64_t) info.cmd_duration_ns;
+            const uint64_t total_ns = (uint64_t) info.cmd_total_duration_ns;
+            const uint64_t host_ns = total_ns > exec_ns ? (total_ns - exec_ns) : 0;
+
+            ggml_stage_stats_update(&exec_stage_stats[info.stage], exec_ns);
+            host_stage_total_ns[info.stage] += host_ns;
+            total_exec_ns += exec_ns;
+            total_host_ns += host_ns;
         }
 
         // Dump a csv
-        fprintf(fperf, "op name, kernel name, exec duration (ms), global size, local size, output size\n");
+        fprintf(fperf, "op_name,stage,layer_id,kernel_name,exec_us,host_us,queue_us,submit_us,complete_us,total_us,global_size,local_size,output_size\n");
         for (const ProfilingInfo & info : profiling_info) {
-            fprintf(fperf, "%s,%s,%f,%zux%zux%zu,%zux%zux%zu,%zux%zux%zux%zu\n",
-                info.op_name.c_str(), info.kernel_name.c_str(),
-                info.cmd_duration_ns/1.e6f,
+            const uint64_t exec_ns = (uint64_t) info.cmd_duration_ns;
+            const uint64_t total_ns = (uint64_t) info.cmd_total_duration_ns;
+            const uint64_t host_ns = total_ns > exec_ns ? (total_ns - exec_ns) : 0;
+
+            fprintf(fperf, "%s,%s,%d,%s,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%zux%zux%zu,%zux%zux%zu,%zux%zux%zux%zu\n",
+                info.op_name.c_str(),
+                ggml_stage_name(info.stage),
+                info.layer_id,
+                info.kernel_name.c_str(),
+                exec_ns / 1000,
+                host_ns / 1000,
+                (uint64_t) info.cmd_queued_duration_ns / 1000,
+                (uint64_t) info.cmd_submit_duration_ns / 1000,
+                (uint64_t) info.cmd_complete_duration_ns / 1000,
+                total_ns / 1000,
                 info.global_size[0], info.global_size[1], info.global_size[2],
                 info.local_size[0], info.local_size[1], info.local_size[2],
                 info.output_size[0], info.output_size[1], info.output_size[2], info.output_size[3]);
         }
         fclose(fperf);
+
+        FILE * fstage = fopen("cl_stage_profiling.csv", "w");
+        if (fstage) {
+            fprintf(fstage, "stage,exec_total_ms,count,exec_avg_ms,exec_min_ms,exec_max_ms,exec_percentage,host_total_ms,host_avg_ms,host_percentage\n");
+            for (int i = 0; i < GGML_STAGE_COUNT; ++i) {
+                if (exec_stage_stats[i].count == 0) {
+                    continue;
+                }
+
+                const double exec_pct = total_exec_ns > 0
+                    ? (100.0 * exec_stage_stats[i].total_time_ns / total_exec_ns)
+                    : 0.0;
+                const double host_pct = total_host_ns > 0
+                    ? (100.0 * host_stage_total_ns[i] / total_host_ns)
+                    : 0.0;
+                const double host_avg_ms = exec_stage_stats[i].count > 0
+                    ? (host_stage_total_ns[i] / 1.e6 / exec_stage_stats[i].count)
+                    : 0.0;
+
+                fprintf(fstage, "%s,%.3f,%" PRIu64 ",%.3f,%.3f,%.3f,%.2f,%.3f,%.3f,%.2f\n",
+                    ggml_stage_name((enum ggml_stage_type) i),
+                    exec_stage_stats[i].total_time_ns / 1.e6,
+                    exec_stage_stats[i].count,
+                    ggml_stage_stats_avg_ns(&exec_stage_stats[i]) / 1.e6,
+                    exec_stage_stats[i].min_time_ns / 1.e6,
+                    exec_stage_stats[i].max_time_ns / 1.e6,
+                    exec_pct,
+                    host_stage_total_ns[i] / 1.e6,
+                    host_avg_ms,
+                    host_pct);
+            }
+            fprintf(fstage, "TOTAL,%.3f,%" PRIu64 ",,,,100.00,%.3f,,100.00\n",
+                total_exec_ns / 1.e6,
+                (uint64_t) profiling_info.size(),
+                total_host_ns / 1.e6);
+            fclose(fstage);
+        }
 
         // Dump a simple chrome trace
         FILE* ftrace = fopen("cl_trace.json", "w");
