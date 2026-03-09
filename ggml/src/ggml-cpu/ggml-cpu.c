@@ -2942,6 +2942,7 @@ struct ggml_cplan ggml_graph_plan(
 // CPU profiling info for a single operation
 struct ggml_cpu_profiling_info {
     char op_name[GGML_MAX_NAME];
+    enum ggml_inference_phase phase;
     enum ggml_stage_type stage;
     int layer_id;
     uint64_t duration_us;
@@ -2985,6 +2986,7 @@ static void ggml_cpu_profiling_record(const struct ggml_tensor * tensor, uint64_
 
     // Store a stable bounded copy for later CSV writing.
     snprintf(info->op_name, sizeof(info->op_name), "%s", name_src);
+    info->phase = ggml_profiler_get_inference_phase();
     info->stage = ggml_classify_stage(info->op_name);
     info->layer_id = ggml_extract_layer_id(info->op_name);
     info->duration_us = duration_us;
@@ -3014,11 +3016,12 @@ void ggml_cpu_profiling_write(void) {
     // Write detailed CSV
     FILE * fdetail = fopen("cpu_profiling.csv", "w");
     if (fdetail) {
-        fprintf(fdetail, "op_name,stage,layer_id,duration_us\n");
+        fprintf(fdetail, "op_name,phase,stage,layer_id,duration_us\n");
         for (size_t i = 0; i < g_cpu_profiling.count; i++) {
             const struct ggml_cpu_profiling_info * info = &g_cpu_profiling.entries[i];
-            fprintf(fdetail, "%s,%s,%d,%" PRIu64 "\n",
+            fprintf(fdetail, "%s,%s,%s,%d,%" PRIu64 "\n",
                 info->op_name,
+                ggml_inference_phase_name(info->phase),
                 ggml_stage_name(info->stage),
                 info->layer_id,
                 info->duration_us);

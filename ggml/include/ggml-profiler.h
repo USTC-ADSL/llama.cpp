@@ -44,6 +44,30 @@ enum ggml_stage_type {
 };
 
 //
+// Inference phase annotation (prefill vs decode)
+//
+// This is a lightweight process-global tag that callers can set before graph
+// compute so backend profiler CSV rows can include phase labels.
+//
+enum ggml_inference_phase {
+    GGML_INFERENCE_PHASE_UNKNOWN = 0,
+    GGML_INFERENCE_PHASE_PREFILL,
+    GGML_INFERENCE_PHASE_DECODE,
+};
+
+extern void ggml_profiler_set_inference_phase(enum ggml_inference_phase phase);
+extern enum ggml_inference_phase ggml_profiler_get_inference_phase(void);
+
+static inline const char * ggml_inference_phase_name(enum ggml_inference_phase phase) {
+    switch (phase) {
+        case GGML_INFERENCE_PHASE_PREFILL: return "prefill";
+        case GGML_INFERENCE_PHASE_DECODE:  return "decode";
+        case GGML_INFERENCE_PHASE_UNKNOWN:
+        default:                           return "unknown";
+    }
+}
+
+//
 // ggml_classify_stage - Classify a tensor into a computational stage
 //
 // Parameters:

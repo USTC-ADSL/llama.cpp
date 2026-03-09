@@ -7,6 +7,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "ggml-profiler.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -1430,6 +1431,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
     }
+
+    // Tag this decode invocation as prefill/decode for backend profiler CSVs.
+    // Use the user-visible batch shape (not ubatch splitting) so llama-bench phase
+    // runs map to expected labels.
+    ggml_profiler_set_inference_phase(batch_inp.n_tokens > 1 ? GGML_INFERENCE_PHASE_PREFILL : GGML_INFERENCE_PHASE_DECODE);
 
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;

@@ -12,6 +12,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#include "ggml-profiler.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -20,12 +21,23 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
 #include <vector>
 
 #ifdef __APPLE__
 #include <sys/types.h>
 #include <sys/sysctl.h>
 #endif
+
+static std::atomic<int> g_ggml_profiler_inference_phase { GGML_INFERENCE_PHASE_UNKNOWN };
+
+extern "C" void ggml_profiler_set_inference_phase(enum ggml_inference_phase phase) {
+    g_ggml_profiler_inference_phase.store((int) phase, std::memory_order_relaxed);
+}
+
+extern "C" enum ggml_inference_phase ggml_profiler_get_inference_phase(void) {
+    return (enum ggml_inference_phase) g_ggml_profiler_inference_phase.load(std::memory_order_relaxed);
+}
 
 
 // backend buffer type

@@ -294,6 +294,7 @@ struct ggml_cl_buffer {
 // Profiling
 struct ProfilingInfo {
     std::string op_name;
+    enum ggml_inference_phase phase;
     enum ggml_stage_type stage;
     int layer_id;
     std::string kernel_name;
@@ -338,6 +339,7 @@ static void populateProfilingInfo(
     }
 
     info.op_name     = name_src;
+    info.phase       = ggml_profiler_get_inference_phase();
     info.stage       = ggml_classify_stage(name_src);
     info.layer_id    = ggml_extract_layer_id(name_src);
     info.kernel      = kernel;
@@ -652,14 +654,15 @@ struct ggml_backend_opencl_context {
         }
 
         // Dump a csv
-        fprintf(fperf, "op_name,stage,layer_id,kernel_name,exec_us,host_us,queue_us,submit_us,complete_us,total_us,global_size,local_size,output_size\n");
+        fprintf(fperf, "op_name,phase,stage,layer_id,kernel_name,exec_us,host_us,queue_us,submit_us,complete_us,total_us,global_size,local_size,output_size\n");
         for (const ProfilingInfo & info : profiling_info) {
             const uint64_t exec_ns = (uint64_t) info.cmd_duration_ns;
             const uint64_t total_ns = (uint64_t) info.cmd_total_duration_ns;
             const uint64_t host_ns = total_ns > exec_ns ? (total_ns - exec_ns) : 0;
 
-            fprintf(fperf, "%s,%s,%d,%s,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%zux%zux%zu,%zux%zux%zu,%zux%zux%zux%zu\n",
+            fprintf(fperf, "%s,%s,%s,%d,%s,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%zux%zux%zu,%zux%zux%zu,%zux%zux%zux%zu\n",
                 info.op_name.c_str(),
+                ggml_inference_phase_name(info.phase),
                 ggml_stage_name(info.stage),
                 info.layer_id,
                 info.kernel_name.c_str(),

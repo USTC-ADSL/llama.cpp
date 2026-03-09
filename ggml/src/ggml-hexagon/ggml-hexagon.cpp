@@ -109,6 +109,7 @@ static void ggml_hexagon_dump_op_prof(const std::string &sess_name, const ggml_t
 
 struct ggml_hexagon_profiling_info {
     char op_name[GGML_MAX_NAME];
+    enum ggml_inference_phase phase;
     enum ggml_stage_type stage;
     int layer_id;
     uint32_t exec_usecs;
@@ -175,6 +176,7 @@ void ggml_hexagon_session::profile_record(const struct ggml_tensor * op, uint32_
 
     ggml_hexagon_profiling_info info = {};
     snprintf(info.op_name, sizeof(info.op_name), "%s", name_src);
+    info.phase      = ggml_profiler_get_inference_phase();
     info.stage      = ggml_classify_stage(name_src);
     info.layer_id   = ggml_extract_layer_id(name_src);
     info.exec_usecs = exec_usecs;
@@ -209,7 +211,7 @@ void ggml_hexagon_session::write_profile_csv() {
     uint64_t total_exec_ns = 0;
     uint64_t total_host_ns = 0;
 
-    fprintf(fdetail, "op_name,stage,layer_id,exec_us,host_us,op_cycles,op_pkts,cycles_per_pkt\n");
+    fprintf(fdetail, "op_name,phase,stage,layer_id,exec_us,host_us,op_cycles,op_pkts,cycles_per_pkt\n");
     for (const ggml_hexagon_profiling_info & info : this->prof_entries) {
         const uint64_t exec_ns = (uint64_t) info.exec_usecs * 1000;
         const uint64_t host_ns = info.host_usecs * 1000;
@@ -220,8 +222,9 @@ void ggml_hexagon_session::write_profile_csv() {
         total_host_ns += host_ns;
 
         const double cycles_per_pkt = info.op_pkts > 0 ? (double) info.op_cycles / info.op_pkts : 0.0;
-        fprintf(fdetail, "%s,%s,%d,%u,%" PRIu64 ",%u,%u,%.3f\n",
+        fprintf(fdetail, "%s,%s,%s,%d,%u,%" PRIu64 ",%u,%u,%.3f\n",
             info.op_name,
+            ggml_inference_phase_name(info.phase),
             ggml_stage_name(info.stage),
             info.layer_id,
             info.exec_usecs,
