@@ -1,4 +1,5 @@
 #include "ggml-vulkan.h"
+#include "ggml-profiler.h"
 #include <vulkan/vulkan_core.h>
 #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
 #include <chrono>
@@ -1656,18 +1657,55 @@ private:
 std::mutex vk_memory_logger::log_mutex;
 
 static bool vk_perf_logger_enabled = false;
+static bool vk_perf_logger_console_enabled = false;
 static bool vk_perf_logger_concurrent = false;
 static bool vk_enable_sync_logger = false;
 // number of calls between perf logger prints
 static uint32_t vk_perf_logger_frequency = 1;
 static std::string vk_pipeline_stats_filter;
+#ifdef GGML_VULKAN_PROFILING
+static bool vk_csv_profiling_enabled = false;
+
+struct vk_profile_record {
+    std::string op_name;
+    enum ggml_inference_phase phase;
+    enum ggml_stage_type stage;
+    int layer_id;
+    std::string fusion_name;
+    uint64_t exec_time_ns;
+};
+#endif
 
 class vk_perf_logger {
   public:
     void print_timings(bool force = false) {
-        if (timings.empty()) {
+        const bool have_timings = !timings.empty();
+#ifdef GGML_VULKAN_PROFILING
+        const bool have_profile_records = !profile_records.empty();
+#else
+        const bool have_profile_records = false;
+#endif
+        if (!have_timings && !have_profile_records) {
             return;
         }
+
+#ifdef GGML_VULKAN_PROFILING
+        if (!vk_perf_logger_console_enabled) {
+            timings.clear();
+            flops.clear();
+            if (force && vk_csv_profiling_enabled && have_profile_records) {
+                write_profiling_info();
+            }
+            return;
+        }
+#endif
+
+        if (!vk_perf_logger_console_enabled) {
+            timings.clear();
+            flops.clear();
+            return;
+        }
+
         print_count++;
         if ((print_count % vk_perf_logger_frequency) != 0 && !force) {
             return;
@@ -1683,7 +1721,6 @@ class vk_perf_logger {
             std::cerr << t.first << ": " << t.second.size() << " x " << (total_op_times / t.second.size() / 1000.0)
                       << " us = " << (total_op_times / 1000.0) << " us";
 
-            // If we have as many flops entries as timing entries for the op, then compute and log the flops/S.
             auto it = flops.find(t.first);
             if (it != flops.end() && (it->second).size() == t.second.size()) {
                 uint64_t total_op_flops = 0;
@@ -1697,7 +1734,6 @@ class vk_perf_logger {
             }
 
             total_all_op_times += total_op_times;
-
             std::cerr << std::endl;
         }
 
@@ -1707,6 +1743,11 @@ class vk_perf_logger {
 
         timings.clear();
         flops.clear();
+#ifdef GGML_VULKAN_PROFILING
+        if (force && vk_csv_profiling_enabled && have_profile_records) {
+            write_profiling_info();
+        }
+#endif
     }
 
     std::string get_node_fusion_name(const ggml_tensor * node, const char *fusion_name, uint64_t *n_flops) {
@@ -1751,7 +1792,6 @@ class vk_perf_logger {
             uint64_t      KW      = knl->ne[0];
             uint64_t      KH      = knl->ne[1];
             uint64_t      Cin     = node->src[1]->ne[2];
-            // KxCRS @ CRSxNPQ = KxNPQ -> M=K, K=CRS, N=NPQ
             uint64_t      size_M  = Cout;
             uint64_t      size_K  = Cin * KW * KH;
             uint64_t      size_N  = N * OW * OH;
@@ -1802,6 +1842,9 @@ class vk_perf_logger {
             flops[name].push_back(n_flops);
         }
         timings[name].push_back(time);
+#ifdef GGML_VULKAN_PROFILING
+        append_profile_record(node, fusion_name, time);
+#endif
     }
 
     void log_timing(const std::vector<ggml_tensor *> &nodes, const std::vector<const char *> &names, uint64_t time) {
@@ -1820,11 +1863,106 @@ class vk_perf_logger {
             flops[name].push_back(total_flops);
         }
         timings[name].push_back(time);
+#ifdef GGML_VULKAN_PROFILING
+        if (!nodes.empty()) {
+            append_profile_record(nodes.front(), names.empty() ? nullptr : names.front(), time);
+        }
+#endif
     }
 
   private:
+#ifdef GGML_VULKAN_PROFILING
+    void append_profile_record(const ggml_tensor * node, const char * fusion_name, uint64_t time_ns) {
+        if (!vk_csv_profiling_enabled || node == nullptr) {
+            return;
+        }
+
+        const char * name_src = node->name;
+        if (name_src == nullptr || name_src[0] == '\0') {
+            name_src = ggml_op_name(node->op);
+        }
+        if (name_src == nullptr || name_src[0] == '\0') {
+            name_src = "op_unknown";
+        }
+
+        uint64_t dummy_flops = 0;
+        vk_profile_record rec;
+        rec.op_name = name_src;
+        rec.phase = ggml_profiler_get_inference_phase();
+        rec.stage = ggml_classify_stage(name_src);
+        rec.layer_id = ggml_extract_layer_id(name_src);
+        rec.fusion_name = get_node_fusion_name(node, fusion_name, &dummy_flops);
+        rec.exec_time_ns = time_ns;
+        profile_records.push_back(std::move(rec));
+    }
+
+    void write_profiling_info() {
+        FILE * fperf = fopen("vk_profiling.csv", "w");
+        if (fperf) {
+            fprintf(fperf, "op_name,phase,stage,layer_id,fusion_name,exec_us\n");
+            for (const auto & rec : profile_records) {
+                fprintf(fperf, "%s,%s,%s,%d,%s,%.3f\n",
+                    rec.op_name.c_str(),
+                    ggml_inference_phase_name(rec.phase),
+                    ggml_stage_name(rec.stage),
+                    rec.layer_id,
+                    rec.fusion_name.c_str(),
+                    rec.exec_time_ns / 1.0e3);
+            }
+            fclose(fperf);
+            GGML_LOG_INFO("ggml_vulkan_profiling: wrote vk_profiling.csv\n");
+        } else {
+            GGML_LOG_ERROR("ggml_vulkan_profiling: failed to open vk_profiling.csv\n");
+        }
+
+        struct ggml_stage_stats exec_stage_stats[GGML_STAGE_COUNT];
+        uint64_t total_exec_ns = 0;
+        for (int i = 0; i < GGML_STAGE_COUNT; ++i) {
+            ggml_stage_stats_init(&exec_stage_stats[i]);
+        }
+
+        for (const auto & rec : profile_records) {
+            ggml_stage_stats_update(&exec_stage_stats[rec.stage], rec.exec_time_ns);
+            total_exec_ns += rec.exec_time_ns;
+        }
+
+        FILE * fstage = fopen("vk_stage_profiling.csv", "w");
+        if (fstage) {
+            fprintf(fstage, "stage,exec_total_ms,count,exec_avg_ms,exec_min_ms,exec_max_ms,exec_percentage,host_total_ms,host_avg_ms,host_percentage\n");
+            for (int i = 0; i < GGML_STAGE_COUNT; ++i) {
+                if (exec_stage_stats[i].count == 0) {
+                    continue;
+                }
+                const double exec_pct = total_exec_ns > 0
+                    ? (100.0 * exec_stage_stats[i].total_time_ns / total_exec_ns)
+                    : 0.0;
+                fprintf(fstage, "%s,%.3f,%llu,%.3f,%.3f,%.3f,%.2f,0.000,0.000,0.00\n",
+                    ggml_stage_name((enum ggml_stage_type) i),
+                    exec_stage_stats[i].total_time_ns / 1.e6,
+                    (unsigned long long) exec_stage_stats[i].count,
+                    ggml_stage_stats_avg_ns(&exec_stage_stats[i]) / 1.e6,
+                    exec_stage_stats[i].min_time_ns / 1.e6,
+                    exec_stage_stats[i].max_time_ns / 1.e6,
+                    exec_pct);
+            }
+            fprintf(fstage, "TOTAL,%.3f,%llu,,,,100.00,0.000,,0.00\n",
+                total_exec_ns / 1.e6,
+                (unsigned long long) profile_records.size());
+            fclose(fstage);
+            GGML_LOG_INFO("ggml_vulkan_profiling: wrote vk_stage_profiling.csv\n");
+        } else {
+            GGML_LOG_ERROR("ggml_vulkan_profiling: failed to open vk_stage_profiling.csv\n");
+        }
+
+        profile_records.clear();
+    }
+#endif
+
     std::map<std::string, std::vector<uint64_t>> timings;
     std::map<std::string, std::vector<uint64_t>> flops;
+#ifdef GGML_VULKAN_PROFILING
+    std::vector<vk_profile_record> profile_records;
+#endif
     uint32_t print_count {};
 };
 
@@ -5687,7 +5825,12 @@ static void ggml_vk_instance_init() {
         vk_instance.pfn_vkCmdInsertDebugUtilsLabelEXT = (PFN_vkCmdInsertDebugUtilsLabelEXT) vkGetInstanceProcAddr(vk_instance.instance, "vkCmdInsertDebugUtilsLabelEXT");
     }
 
-    vk_perf_logger_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;
+    vk_perf_logger_console_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;
+    vk_perf_logger_enabled = vk_perf_logger_console_enabled;
+#ifdef GGML_VULKAN_PROFILING
+    vk_csv_profiling_enabled = getenv("GGML_VK_PROFILING") != nullptr;
+    vk_perf_logger_enabled = vk_perf_logger_enabled || vk_csv_profiling_enabled;
+#endif
     vk_perf_logger_concurrent = getenv("GGML_VK_PERF_LOGGER_CONCURRENT") != nullptr;
     vk_enable_sync_logger = getenv("GGML_VK_SYNC_LOGGER") != nullptr;
     vk_memory_logger_enabled = getenv("GGML_VK_MEMORY_LOGGER") != nullptr;
