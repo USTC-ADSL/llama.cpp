@@ -198,6 +198,7 @@ constexpr const qnn_op_caps_t kOpCaps[] = {
     {}, // GGML_OP_GATED_LINEAR_ATTN
     {}, // GGML_OP_RWKV_WKV7
     {}, // GGML_OP_SOLVE_TRI
+    {}, // GGML_OP_GATED_DELTA_NET
 
     {}, // GGML_OP_UNARY
 
@@ -391,6 +392,7 @@ constexpr const op_constructor_t kOpConstructors[] = {
     nullptr,  // GGML_OP_GATED_LINEAR_ATTN
     nullptr,  // GGML_OP_RWKV_WKV7
     nullptr,  // GGML_OP_SOLVE_TRI
+    nullptr,  // GGML_OP_GATED_DELTA_NET
 
     nullptr,  // GGML_OP_UNARY
 

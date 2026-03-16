@@ -5,6 +5,7 @@ file(GLOB qnn_srcs "${CMAKE_CURRENT_LIST_DIR}/*.cpp")
 add_library(qnn-backend STATIC
     ${qnn_srcs}
 )
+set_target_properties(qnn-backend PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_include_directories(qnn-backend PRIVATE
     ${GGML_QNN_SDK_PATH}/include/QNN/

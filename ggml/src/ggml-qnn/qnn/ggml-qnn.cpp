@@ -406,3 +406,12 @@ backend_device_proxy_ptr create_qnn_backend_context(backend_index_type device) {
 
     return std::make_unique<qnn_device_proxy>(device);
 }
+
+// Force the QNN registry implementation from runtime-common into libggml-qnn.
+ggml_backend_reg_t ggml_backend_qnn_link_anchor(void);
+
+ggml_backend_reg_t ggml_backend_qnn_link_anchor(void) {
+    return ggml_backend_qnn_reg();
+}
+
+GGML_BACKEND_DL_IMPL(ggml_backend_qnn_reg)

@@ -43,6 +43,12 @@ ggml_add_backend_library(ggml-qnn
 )
 target_link_libraries(ggml-qnn PRIVATE ${COMMON_LINK_LIBRARIES})
 
+if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
+    set(GGML_QNN_RUNTIME_COMMON_LINK "$<LINK_LIBRARY:WHOLE_ARCHIVE,runtime-common>")
+else()
+    set(GGML_QNN_RUNTIME_COMMON_LINK runtime-common)
+endif()
+
 add_subdirectory(shared)
 
 if(GGML_HEXAGON_NPU_ONLY)
@@ -61,7 +67,7 @@ if(GGML_QNN_ENABLE_HEXAGON_BACKEND)
     target_link_libraries(ggml-qnn PRIVATE hexagon-npu-host)
 else()
     message("GGML_QNN_ENABLE_HEXAGON_BACKEND is disabled")
-    target_link_libraries(ggml-qnn PRIVATE runtime-common)
+    target_link_libraries(ggml-qnn PRIVATE ${GGML_QNN_RUNTIME_COMMON_LINK})
 endif()
 
 # Copy dynamic libraries
@@ -95,13 +101,19 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Android" OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
                 list(APPEND BACKEND_RUNTIME_LIBS "${CMAKE_ANDROID_NDK}/prebuilt/android-arm64/gdbserver/gdbserver")
                 message("old ndk, copy gdbserver")
             else()
-                file(GLOB LLDB_SERVER "${CMAKE_ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/lib64/clang/*/lib/linux/aarch64/lldb-server")
+                file(GLOB LLDB_SERVER
+                    "${CMAKE_ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/lib64/clang/*/lib/linux/aarch64/lldb-server"
+                    "${CMAKE_ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/*/lib/linux/aarch64/lldb-server")
                 list(APPEND BACKEND_RUNTIME_LIBS ${LLDB_SERVER})
                 message("new ndk, copy lldb-server")
             endif()
 
-            file(GLOB OMP_LIBS "${CMAKE_ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/lib64/clang/*/lib/linux/aarch64/libomp.so")
-            file(GLOB ASAN_LIBS "${CMAKE_ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/lib64/clang/*/lib/linux/libclang_rt.asan-aarch64-android.so")
+            file(GLOB OMP_LIBS
+                "${CMAKE_ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/lib64/clang/*/lib/linux/aarch64/libomp.so"
+                "${CMAKE_ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/*/lib/linux/aarch64/libomp.so")
+            file(GLOB ASAN_LIBS
+                "${CMAKE_ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/lib64/clang/*/lib/linux/libclang_rt.asan-aarch64-android.so"
+                "${CMAKE_ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/*/lib/linux/libclang_rt.asan-aarch64-android.so")
             list(APPEND BACKEND_RUNTIME_LIBS ${OMP_LIBS})
             list(APPEND BACKEND_RUNTIME_LIBS ${ASAN_LIBS})
         endif()

@@ -4,6 +4,7 @@ file(GLOB common_srcs "${CMAKE_CURRENT_LIST_DIR}/*.cpp")
 add_library(runtime-common STATIC
     ${common_srcs}
 )
+set_target_properties(runtime-common PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_include_directories(runtime-common PUBLIC
     ${CMAKE_CURRENT_LIST_DIR}/

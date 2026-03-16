@@ -147,6 +147,7 @@ constexpr const bool kQnnSupportedOps[] = {
     false,  // GGML_OP_GATED_LINEAR_ATTN
     false,  // GGML_OP_RWKV_WKV7
     false,  // GGML_OP_SOLVE_TRI
+    false,  // GGML_OP_GATED_DELTA_NET
 
     false,  // GGML_OP_UNARY
 
