@@ -10,7 +10,10 @@
 #include "ggml-profiler.h"
 #include "llama-ext.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cinttypes>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -2192,12 +2195,58 @@ ggml_status llama_context::graph_compute(
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {
-    return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
+    const bool qnn_aot_enabled = std::getenv("GGML_QNN_AOT_CONFIG") != nullptr;
+    ggml_backend_t qnn_aot_backend = nullptr;
+    ggml_backend_t opencl_backend = nullptr;
+
+    for (const auto & backend : backends) {
+        const char * backend_name = ggml_backend_name(backend.get());
+        if (backend_name == nullptr) {
+            continue;
+        }
+
+        if (qnn_aot_enabled && std::strcmp(backend_name, "qnn-npu") == 0) {
+            qnn_aot_backend = backend.get();
+        }
+        if (std::strcmp(backend_name, "OpenCL") == 0) {
+            opencl_backend = backend.get();
+        }
+    }
+
+    const auto parse_hetero_backend = [&](const char * value) -> ggml_backend_t {
+        if (value == nullptr) {
+            return nullptr;
+        }
+
+        std::string normalized(value);
+        std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char ch) {
+            return (char) std::tolower(ch);
+        });
+
+        if (normalized == "cpu") {
+            return backend_cpu;
+        }
+        if (normalized == "opencl" || normalized == "gpuopencl" || normalized == "gpu") {
+            return opencl_backend;
+        }
+        return nullptr;
+    };
+
+    const ggml_backend_t hetero_attn_backend = parse_hetero_backend(std::getenv("GGML_HETERO_ATTN_BACKEND"));
+    const ggml_backend_t hetero_ffn_backend  = parse_hetero_backend(std::getenv("GGML_HETERO_FFN_BACKEND"));
+    const bool hetero_stage_enabled = hetero_attn_backend != nullptr || hetero_ffn_backend != nullptr;
+
+    return [&, qnn_aot_enabled, qnn_aot_backend, hetero_stage_enabled, hetero_attn_backend, hetero_ffn_backend](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
         if (il >= 0) {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
             ggml_set_name(cur, name);
         }
+
+        const char * tensor_name = ggml_get_name(cur);
+        const auto has_prefix = [](const char * value, const char * prefix) {
+            return value != nullptr && prefix != nullptr && std::strncmp(value, prefix, std::strlen(prefix)) == 0;
+        };
 
         // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // FIXME: fix in ggml_backend_sched
@@ -2213,6 +2262,78 @@ llm_graph_cb llama_context::graph_get_cb() const {
                     }
                 }
             }
+        }
+
+        const bool force_cpu = tensor_name != nullptr && (
+            std::strcmp(tensor_name, "inp_tokens") == 0 ||
+            std::strcmp(tensor_name, "embd") == 0 ||
+            std::strcmp(tensor_name, "norm") == 0 ||
+            std::strcmp(tensor_name, "result_norm") == 0 ||
+            std::strcmp(tensor_name, "result_output") == 0);
+
+        if (qnn_aot_enabled && qnn_aot_backend != nullptr) {
+            const bool aot_transformer_stage = has_prefix(tensor_name, "norm-") ||
+                has_prefix(tensor_name, "attn_norm-") ||
+                has_prefix(tensor_name, "attn_out-") ||
+                has_prefix(tensor_name, "Qcur-") ||
+                has_prefix(tensor_name, "Kcur-") ||
+                has_prefix(tensor_name, "Vcur-") ||
+                has_prefix(tensor_name, "kq-") ||
+                has_prefix(tensor_name, "kq_soft_max-") ||
+                has_prefix(tensor_name, "kqv-") ||
+                has_prefix(tensor_name, "kqv_out-") ||
+                has_prefix(tensor_name, "ffn_inp-") ||
+                has_prefix(tensor_name, "ffn_norm-") ||
+                has_prefix(tensor_name, "ffn_gate-") ||
+                has_prefix(tensor_name, "ffn_up-") ||
+                has_prefix(tensor_name, "ffn_swiglu-") ||
+                has_prefix(tensor_name, "ffn_out-") ||
+                has_prefix(tensor_name, "l_out-");
+
+            if (force_cpu) {
+                ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
+            } else if (aot_transformer_stage && ggml_backend_supports_op(qnn_aot_backend, cur)) {
+                ggml_backend_sched_set_tensor_backend(sched.get(), cur, qnn_aot_backend);
+            }
+            return;
+        }
+
+        if (!hetero_stage_enabled) {
+            return;
+        }
+
+        if (force_cpu) {
+            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
+            return;
+        }
+
+        const bool attn_stage = has_prefix(tensor_name, "attn_norm-") ||
+            has_prefix(tensor_name, "attn_out-") ||
+            has_prefix(tensor_name, "Qcur-") ||
+            has_prefix(tensor_name, "Kcur-") ||
+            has_prefix(tensor_name, "Vcur-") ||
+            has_prefix(tensor_name, "kq-") ||
+            has_prefix(tensor_name, "kq_soft_max-") ||
+            has_prefix(tensor_name, "kqv-") ||
+            has_prefix(tensor_name, "kqv_out-");
+
+        const bool ffn_stage = has_prefix(tensor_name, "ffn_inp-") ||
+            has_prefix(tensor_name, "ffn_norm-") ||
+            has_prefix(tensor_name, "ffn_gate-") ||
+            has_prefix(tensor_name, "ffn_up-") ||
+            has_prefix(tensor_name, "ffn_swiglu-") ||
+            has_prefix(tensor_name, "ffn_out-") ||
+            has_prefix(tensor_name, "l_out-");
+
+        ggml_backend_t target_backend = nullptr;
+        if (attn_stage && hetero_attn_backend != nullptr) {
+            target_backend = hetero_attn_backend;
+        } else if (ffn_stage && hetero_ffn_backend != nullptr) {
+            target_backend = hetero_ffn_backend;
+        }
+
+        if (target_backend != nullptr && ggml_backend_supports_op(target_backend, cur)) {
+            ggml_backend_sched_set_tensor_backend(sched.get(), cur, target_backend);
         }
     };
 }
