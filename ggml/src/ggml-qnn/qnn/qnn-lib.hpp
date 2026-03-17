@@ -109,6 +109,7 @@ class qnn_interface {
     DEFINE_SHIM_FUNCTION_INTERFACE(graph_finalize, graphFinalize);
     DEFINE_SHIM_FUNCTION_INTERFACE(graph_execute, graphExecute);
     DEFINE_SHIM_FUNCTION_INTERFACE(graph_retrieve, graphRetrieve);
+    DEFINE_SHIM_FUNCTION_INTERFACE(graph_set_config, graphSetConfig);
 
     // QnnLog
     DEFINE_SHIM_FUNCTION_INTERFACE(log_create, logCreate);
@@ -165,6 +166,13 @@ class qnn_instance {
             QNN_LOG_WARN("pls check why _qnn_interface is not loaded\n");
         }
         return _qnn_interface;
+    }
+
+    std::shared_ptr<qnn_system_interface> get_qnn_system_interface() {
+        if (!_qnn_sys_interface) {
+            QNN_LOG_WARN("pls check why _qnn_sys_interface is not loaded\n");
+        }
+        return _qnn_sys_interface;
     }
 
     Qnn_LogHandle_t get_qnn_log_handle() { return _qnn_log_handle; }
@@ -326,7 +334,7 @@ class qnn_instance {
     }
 
     Qnn_MemHandle_t register_rpcmem(void * p_data, const uint32_t rank, uint32_t * dimensions,
-                                    Qnn_DataType_t data_type) {
+                                    Qnn_DataType_t data_type, Qnn_ContextHandle_t context_handle = nullptr) {
         if (!p_data) {
             QNN_LOG_WARN("invalid param\n");
             return nullptr;
@@ -353,8 +361,14 @@ class qnn_instance {
             { rank, dimensions, nullptr },
             data_type, QNN_MEM_TYPE_ION, { { mem_fd } }
         };
+        auto effective_context = context_handle ? context_handle : _qnn_context_handle;
+        if (!effective_context) {
+            QNN_LOG_WARN("failed to register shared memory, context handle is null\n");
+            return nullptr;
+        }
+
         Qnn_MemHandle_t handle = nullptr;
-        auto            error  = _qnn_interface->qnn_mem_register(_qnn_context_handle, &descriptor,
+        auto            error  = _qnn_interface->qnn_mem_register(effective_context, &descriptor,
                                                                   /*numDescriptors=*/1, &handle);
         if (error != QNN_SUCCESS) {
             QNN_LOG_WARN("failed to register shared memory, error %d, %s\n", (int) QNN_GET_ERROR_CODE(error),

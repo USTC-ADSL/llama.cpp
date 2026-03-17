@@ -13,6 +13,7 @@ target_include_directories(qnn-backend PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/../
     ${CMAKE_CURRENT_LIST_DIR}/../../
     ${CMAKE_CURRENT_LIST_DIR}/../../../include/ # TODO: figure out how to remove this
+    ${CMAKE_CURRENT_LIST_DIR}/../../../../vendor
     ${CMAKE_CURRENT_LIST_DIR}/../shared/
 )
 

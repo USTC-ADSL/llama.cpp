@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "aot.hpp"
 #include "convert.hpp"
 #include "ggml-backend.h"
 #include "ggml-qnn.h"
@@ -35,6 +36,11 @@ struct ggml_backend_qnn_device_context {
 
     qnn::qnn_graph_cache_t                      qnn_graph_cache;
     std::shared_ptr<qnn::qnn_convert_context_t> convert_context = std::make_shared<qnn::qnn_convert_context_t>();
+
+    bool                                aot_mode = false;
+    std::string                         aot_config_path;
+    std::string                         aot_model_dir;
+    std::unique_ptr<qnn::qnn_aot_runtime> aot_runtime;
 
 #ifndef NDEBUG
     std::atomic_uint32_t supported_op_count   = 0;

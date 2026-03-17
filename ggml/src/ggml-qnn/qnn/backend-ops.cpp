@@ -387,6 +387,24 @@ bool device_supports_op(qnn::ggml_backend_qnn_device_context * ctx, const ggml_t
         return true;
     }
 
+    if (ctx && ctx->aot_mode && ctx->aot_runtime) {
+        if (ctx->aot_runtime->supports_op(op)) {
+#ifndef NDEBUG
+            ctx->supported_op_count++;
+            print_tensor_info(ctx, op, true);
+#endif
+            return true;
+        }
+
+        if (ctx->aot_runtime->prefers_cpu_op(op)) {
+#ifndef NDEBUG
+            ctx->unsupported_op_count++;
+            print_tensor_info(ctx, op, false);
+#endif
+            return false;
+        }
+    }
+
     if (!kQnnSupportedOps[qnn::get_qnn_op_index(op)]) {
 #ifndef NDEBUG
         ctx->unsupported_op_count++;
@@ -461,6 +479,20 @@ bool device_supports_op(qnn::ggml_backend_qnn_device_context * ctx, const ggml_t
 bool device_compute_graph(qnn::ggml_backend_qnn_device_context * ctx, ggml_cgraph * cgraph) {
     QNN_LOG_DEBUG("[%s]compute graph start, nodes count: %d\n", qnn::get_backend_name(ctx->device),
                   (int) cgraph->n_nodes);
+
+    if (ctx->aot_mode && ctx->aot_runtime) {
+        if (ctx->aot_runtime->maybe_execute(cgraph)) {
+            QNN_LOG_DEBUG("[%s][aot] compute graph, success: 1\n", qnn::get_backend_name(ctx->device));
+            return true;
+        }
+
+        const char * first_name = cgraph->n_nodes > 0 ? ggml_get_name(cgraph->nodes[0]) : nullptr;
+        const char * last_name  = cgraph->n_nodes > 0 ? ggml_get_name(cgraph->nodes[cgraph->n_nodes - 1]) : nullptr;
+        std::fprintf(stderr, "[aot] fallback to JIT for unmatched cgraph: n_nodes=%d first=%s last=%s\n",
+                     cgraph->n_nodes,
+                     first_name ? first_name : "<null>",
+                     last_name ? last_name : "<null>");
+    }
 
     auto qnn_graph = get_qnn_graph_from_cache(ctx, cgraph);
     bool success   = qnn_graph && qnn_graph->execute(cgraph, ctx->convert_context);

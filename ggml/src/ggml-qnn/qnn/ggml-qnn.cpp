@@ -6,6 +6,8 @@
 #include "tensor.hpp"
 #include "utils.hpp"
 
+#include <cstdlib>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -136,6 +138,8 @@ void ggml_backend_qnn_free(ggml_backend_t backend) {
 
     auto & instance = device_ctx->instance;
     if (instance) {
+        device_ctx->aot_runtime.reset();
+        device_ctx->aot_mode = false;
         device_ctx->qnn_graph_cache.clear();
         device_ctx->qnn_interface.reset();
         instance->qnn_finalize();
@@ -283,6 +287,28 @@ ggml_backend_t ggml_backend_qnn_init_with_device_context(ggml_backend_dev_t dev,
     dev_ctx->instance                 = instance;
     dev_ctx->qnn_interface            = qnn_interface;
     dev_ctx->socinfo                  = instance->get_soc_info();
+
+    if (device == QNN_BACKEND_NPU) {
+        if (const char * aot_config = std::getenv("GGML_QNN_AOT_CONFIG"); aot_config && aot_config[0] != '\0') {
+            dev_ctx->aot_mode        = true;
+            dev_ctx->aot_config_path = aot_config;
+
+            if (const char * aot_model_dir = std::getenv("GGML_QNN_AOT_MODEL_DIR"); aot_model_dir && aot_model_dir[0] != '\0') {
+                dev_ctx->aot_model_dir = aot_model_dir;
+            } else {
+                dev_ctx->aot_model_dir = std::filesystem::path(dev_ctx->aot_config_path).parent_path().string();
+            }
+
+            auto aot_runtime = std::make_unique<qnn::qnn_aot_runtime>(instance, device);
+            if (!aot_runtime->initialize(dev_ctx->aot_config_path, dev_ctx->aot_model_dir)) {
+                QNN_LOG_WARN("[aot] failed to initialize AoT runtime from %s\n", dev_ctx->aot_config_path.c_str());
+                dev_ctx->aot_mode = false;
+            } else {
+                dev_ctx->aot_runtime = std::move(aot_runtime);
+                QNN_LOG_INFO("[aot] enabled AoT runtime with config %s\n", dev_ctx->aot_config_path.c_str());
+            }
+        }
+    }
     dev_ctx->supported_types          = device_caps.supported_types;
     dev_ctx->cpu_preprocess_types     = device_caps.cpu_preprocess_types;
     dev_ctx->max_tensor_size_in_bytes = device_caps.max_tensor_size_in_bytes;
@@ -313,6 +339,8 @@ ggml_backend_t ggml_backend_qnn_device_init(ggml_backend_dev_t dev, const char *
 }
 
 ggml_backend_buffer_type_t ggml_backend_qnn_device_get_buffer_type(ggml_backend_dev_t dev) {
+    auto * dev_ctx = get_device_context(dev);
+    (void) dev_ctx;
     return ggml_backend_qnn_buffer_type(dev);
 }
 
@@ -338,15 +366,17 @@ bool ggml_backend_qnn_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_
 }
 
 bool ggml_backend_qnn_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
-#ifdef NDEBUG
-    GGML_UNUSED(dev);
-    GGML_UNUSED(op);
-#else
     auto * device_ctx = get_device_context(dev);
+#ifndef NDEBUG
     QNN_LOG_DEBUG("[%s][%s]offload op\n", qnn::get_backend_name(device_ctx->device), ggml_op_name(op->op));
 #endif
+    if (device_ctx->aot_mode && device_ctx->aot_runtime) {
+        return false;
+    }
+    GGML_UNUSED(op);
     return false;
 }
+
 
 constexpr const ggml_backend_device_i ggml_backend_qnn_device_interface = {
     /* .get_name             = */ ggml_backend_qnn_device_get_name,

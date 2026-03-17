@@ -70,11 +70,11 @@ using qnn_buffer_ptr = std::shared_ptr<qnn_buffer_interface>;
 class qnn_rpc_buffer : public qnn_buffer_interface {
   public:
     qnn_rpc_buffer(qnn_instance_ptr qnn_instance, const size_t size, const uint32_t rank, uint32_t * dimensions,
-                   Qnn_DataType_t data_type) :
+                   Qnn_DataType_t data_type, Qnn_ContextHandle_t context_handle = nullptr) :
         _size(size),
         _qnn_instance(qnn_instance) {
         _qnn_rpc_buffer     = static_cast<uint8_t *>(qnn_instance->alloc_rpcmem(size, alignof(uint8_t *)));
-        _qnn_rpc_mem_handle = qnn_instance->register_rpcmem(_qnn_rpc_buffer, rank, dimensions, data_type);
+        _qnn_rpc_mem_handle = qnn_instance->register_rpcmem(_qnn_rpc_buffer, rank, dimensions, data_type, context_handle);
         if (!_qnn_rpc_buffer || !_qnn_rpc_mem_handle) {
             QNN_LOG_WARN("Failed to register RPC memory: buffer or memory handle is null\n");
             // let the destructor free the buffer

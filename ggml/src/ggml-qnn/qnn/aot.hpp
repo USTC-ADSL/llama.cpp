@@ -1,0 +1,168 @@
+#pragma once
+
+#include <map>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include <nlohmann/json.hpp>
+
+#include "buffer.hpp"
+#include "ggml.h"
+#include "qnn-lib.hpp"
+#include "utils.hpp"
+
+namespace qnn {
+
+struct qnn_aot_graph_config {
+    std::string type;
+    std::string graph_name;
+    std::string model_path;
+    std::string x_name;
+    std::string out_name;
+
+    size_t batch_size     = 0;
+    size_t cache_size     = 0;
+    size_t context_size   = 0;
+    size_t start_layer_id = 0;
+    size_t end_layer_id   = 0;
+    size_t kv_size        = 0;
+
+    std::string kv_path_format;
+    size_t      n_hvx_threads = 4;
+};
+
+struct qnn_aot_model_params {
+    size_t n_layers       = 0;
+    size_t vocab_size     = 0;
+    size_t embed_dim      = 0;
+    size_t ffn_hidden_dim = 0;
+    size_t head_dim       = 0;
+    size_t n_kv_heads     = 0;
+
+    float rope_theta           = 1000000.0f;
+    float rms_norm_eps         = 1e-6f;
+    float attention_mask_value = -50000.0f;
+
+    bool tie_embedding = true;
+};
+
+struct qnn_aot_config {
+    qnn_aot_model_params model;
+    size_t               n_hvx_threads = 4;
+
+    std::vector<qnn_aot_graph_config> transformer_graphs;
+
+    bool load(const std::string & config_path);
+};
+
+struct qnn_aot_context {
+    qnn_instance_ptr                      instance;
+    std::string                           binary_path;
+    Qnn_ContextHandle_t                   context_handle = nullptr;
+    QnnSystemContext_Handle_t             system_context = nullptr;
+
+    qnn_aot_context(qnn_instance_ptr instance, const std::string & binary_path);
+    ~qnn_aot_context();
+
+    bool is_valid() const { return context_handle != nullptr && system_context != nullptr; }
+};
+
+class qnn_aot_graph {
+  public:
+    qnn_aot_graph(qnn_instance_ptr instance, std::shared_ptr<qnn_aot_context> context, qnn_aot_graph_config config);
+
+    bool is_valid() const { return _valid; }
+    bool execute();
+
+    void *       buffer_data(const std::string & name);
+    const void * buffer_data(const std::string & name) const;
+    size_t       buffer_size(const std::string & name) const;
+    bool         has_buffer(const std::string & name) const;
+    size_t       batch_size() const { return _config.batch_size; }
+    const qnn_aot_graph_config & config() const { return _config; }
+
+  private:
+    bool retrieve_graph_metadata();
+    bool allocate_tensor_buffers();
+    bool set_hvx_threads(size_t n_threads);
+
+    qnn_instance_ptr                 _instance;
+    qnn_interface_ptr                _qnn_interface;
+    std::shared_ptr<qnn_aot_context> _context;
+    qnn_aot_graph_config             _config;
+
+    Qnn_GraphHandle_t _graph_handle = nullptr;
+    bool              _valid        = false;
+
+    std::vector<Qnn_Tensor_t> _inputs;
+    std::vector<Qnn_Tensor_t> _outputs;
+
+    std::unordered_map<std::string, size_t> _input_index;
+    std::unordered_map<std::string, size_t> _output_index;
+    std::unordered_map<std::string, qnn_buffer_ptr> _buffers;
+};
+
+class qnn_aot_runtime {
+  public:
+    explicit qnn_aot_runtime(qnn_instance_ptr instance, backend_index_type device);
+
+    bool initialize(const std::string & config_path, const std::string & model_dir);
+    bool supports_op(const ggml_tensor * op) const;
+    bool prefers_cpu_op(const ggml_tensor * op) const;
+    bool maybe_execute(ggml_cgraph * cgraph);
+    void reset_state();
+
+    bool is_enabled() const { return _enabled; }
+    const std::string & config_path() const { return _config_path; }
+
+  private:
+    struct rope_embedding {
+        std::vector<float> cos_values;
+        std::vector<float> sin_values;
+    };
+
+    struct aot_match_result {
+        ggml_tensor * embd = nullptr;
+        ggml_tensor * out  = nullptr;
+        size_t        n_tokens = 0;
+        size_t        inferred_pos = 0;
+        bool          is_transformer = false;
+    };
+
+    static bool has_prefix(const char * name, const char * prefix);
+    static bool is_transformer_stage_name(const char * name);
+    static bool is_cpu_stage_name(const char * name);
+    static bool is_embedding_lookup(const ggml_tensor * op);
+
+    aot_match_result match_transformer_graph(ggml_cgraph * cgraph) const;
+    bool execute_transformer(ggml_cgraph * cgraph, const aot_match_result & match);
+    qnn_aot_graph * select_transformer_graph(size_t n_tokens) const;
+
+    void compute_rope_embeds();
+    void fill_rope_embeds(qnn_aot_graph & graph, size_t start_pos, size_t n_tokens);
+    void fill_attention_bias(qnn_aot_graph & graph, size_t n_tokens);
+    void save_kv(qnn_aot_graph & graph, size_t n_tokens);
+
+    void zero_transformer_state();
+    size_t infer_start_pos(const std::vector<ggml_tensor *> & inputs, size_t n_tokens) const;
+
+    qnn_instance_ptr   _instance;
+    backend_index_type _device;
+
+    bool        _enabled        = false;
+    bool        _profile        = false;
+    bool        _seed_kv_loaded = false;
+    std::string _config_path;
+    std::string _model_dir;
+
+    qnn_aot_config _config;
+    std::vector<rope_embedding> _rope_embeds;
+    std::map<size_t, std::unique_ptr<qnn_aot_graph>> _transformer_graphs;
+    std::unordered_map<std::string, std::shared_ptr<qnn_aot_context>> _contexts;
+
+    size_t _kv_position = 0;
+};
+
+}  // namespace qnn
