@@ -105,14 +105,18 @@ bool set_qnn_lib_search_path(const std::string & custom_lib_search_path) {
 #    if defined(__ANDROID__) || defined(ANDROID)
     {
         // See also: https://docs.qualcomm.com/bundle/publicresource/topics/80-63442-2/dsp_runtime.html
-        std::string adsp_lib_search_path = custom_lib_search_path +
-                                           ";/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp;/system/lib/"
-                                           "rfsa/adsp;/vendor/dsp/dsp;/vendor/dsp/images;/dsp";
+        auto *      original_adsp        = getenv("ADSP_LIBRARY_PATH");
+        std::string adsp_lib_search_path = original_adsp ? original_adsp : "";
+        insert_path(adsp_lib_search_path,
+                    custom_lib_search_path +
+                        ";/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp;/system/lib/"
+                        "rfsa/adsp;/vendor/dsp/dsp;/vendor/dsp/images;/dsp",
+                    ';');
         if (setenv("ADSP_LIBRARY_PATH", adsp_lib_search_path.c_str(), 1)) {
             return false;
         }
 
-        QNN_LOG_DEBUG("ADSP_LIBRARY_PATH=%s", getenv("ADSP_LIBRARY_PATH\n"));
+        QNN_LOG_DEBUG("ADSP_LIBRARY_PATH=%s", getenv("ADSP_LIBRARY_PATH"));
     }
 #    endif
 

@@ -484,6 +484,12 @@ std::shared_ptr<ggml_qnn_op_config> create_op(const ggml_tensor * op,
     auto op_index = get_qnn_op_index(op);
     GGML_ASSERT(op_index < std::size(kOpCaps));
     auto op_constructor = kOpConstructors[op_index];
+    if (!op_constructor) {
+        std::string op_desc;
+        get_qnn_op_desc(op, true, GGML_TYPE_COUNT, op_desc);
+        std::fprintf(stderr, "[qnn] missing op constructor: op=%s ggml_op=%d name=%s\n",
+                     op_desc.c_str(), (int) op->op, name.c_str());
+    }
     GGML_ASSERT(op_constructor);
     return op_constructor(op, name, qnn_instance);
 }
