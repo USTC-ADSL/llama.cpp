@@ -2,6 +2,9 @@
 
 #include <cstdint>
 #include <memory>
+#include <unordered_set>
+
+#include <HTP/QnnHtpMem.h>
 
 #include "logger.hpp"
 #include "qnn-lib.hpp"
@@ -59,6 +62,146 @@ class qnn_buffer_interface {
 };
 
 using qnn_buffer_ptr = std::shared_ptr<qnn_buffer_interface>;
+
+
+class qnn_shared_buffer_allocator {
+  public:
+    qnn_shared_buffer_allocator(qnn_instance_ptr qnn_instance, size_t size, size_t alignment = 64) :
+        _size(size),
+        _alignment(alignment),
+        _qnn_instance(std::move(qnn_instance)) {
+        _data = static_cast<uint8_t *>(_qnn_instance->alloc_rpcmem(size, alignment));
+        if (!_data) {
+            QNN_LOG_WARN("failed to allocate shared rpcmem, size=%zu\n", size);
+            return;
+        }
+
+        _fd = _qnn_instance->rpcmem_to_fd(_data);
+        if (_fd == -1) {
+            QNN_LOG_WARN("failed to get shared rpcmem fd\n");
+            _qnn_instance->free_rpcmem(_data);
+            _data = nullptr;
+            return;
+        }
+    }
+
+    ~qnn_shared_buffer_allocator() {
+        if (_qnn_instance && _data) {
+            _qnn_instance->free_rpcmem(_data);
+        }
+    }
+
+    bool is_valid() const { return _data != nullptr && _fd != -1; }
+    uint8_t * base() const { return _data; }
+    size_t size() const { return _size; }
+    int fd() const { return _fd; }
+
+    size_t allocate(size_t bytes) {
+        const size_t aligned = static_cast<size_t>(qnn::align_to(_alignment, static_cast<intptr_t>(_offset)));
+        if (aligned + bytes > _size) {
+            return SIZE_MAX;
+        }
+        _offset = aligned + bytes;
+        return aligned;
+    }
+
+  private:
+    size_t           _size      = 0;
+    size_t           _offset    = 0;
+    size_t           _alignment = 64;
+    int              _fd        = -1;
+    uint8_t *        _data      = nullptr;
+    qnn_instance_ptr _qnn_instance;
+
+    DISABLE_COPY(qnn_shared_buffer_allocator);
+    DISABLE_MOVE(qnn_shared_buffer_allocator);
+};
+
+class qnn_htp_shared_buffer : public qnn_buffer_interface {
+  public:
+    qnn_htp_shared_buffer(qnn_instance_ptr qnn_instance,
+                          std::shared_ptr<qnn_shared_buffer_allocator> allocator,
+                          size_t size,
+                          Qnn_DataType_t data_type,
+                          Qnn_ContextHandle_t context_handle) :
+        _size(size),
+        _allocator(std::move(allocator)),
+        _qnn_instance(std::move(qnn_instance)) {
+        if (!_allocator || !_allocator->is_valid() || !_qnn_instance) {
+            QNN_LOG_WARN("invalid shared buffer allocator\n");
+            return;
+        }
+
+        _offset = _allocator->allocate(size);
+        if (_offset == SIZE_MAX) {
+            QNN_LOG_WARN("no free memory in shared buffer allocator, size=%zu total=%zu\n", size, _allocator->size());
+            return;
+        }
+
+        const size_t type_size = std::max<size_t>(1, qnn::qnn_datatype_size(data_type));
+        uint32_t shape[1] = { static_cast<uint32_t>(std::max<size_t>(1, (size + type_size - 1) / type_size)) };
+        QnnMemHtp_Descriptor_t htp_mem_desc = {
+            .type = QNN_HTP_MEM_SHARED_BUFFER,
+            .size = _allocator->size(),
+            .sharedBufferConfig = {
+                .fd = _allocator->fd(),
+                .offset = _offset,
+            },
+        };
+        Qnn_MemDescriptor_t mem_desc = {
+            .memShape = {
+                .numDim = 1,
+                .dimSize = shape,
+                .shapeConfig = nullptr,
+            },
+            .dataType = data_type,
+            .memType = QNN_MEM_TYPE_CUSTOM,
+            .customInfo = &htp_mem_desc,
+        };
+
+        auto qnn_interface = _qnn_instance->get_qnn_interface();
+        if (!qnn_interface || !context_handle) {
+            QNN_LOG_WARN("failed to register shared buffer, qnn interface/context invalid\n");
+            return;
+        }
+
+        auto error = qnn_interface->qnn_mem_register(context_handle, &mem_desc, 1, &_mem_handle);
+        if (error != QNN_SUCCESS) {
+            QNN_LOG_WARN("failed to register shared buffer, err=%d (%s)\n", (int) error, get_qnn_error_string(error));
+            _mem_handle = nullptr;
+            return;
+        }
+    }
+
+    ~qnn_htp_shared_buffer() {
+        if (_qnn_instance && _mem_handle) {
+            auto qnn_interface = _qnn_instance->get_qnn_interface();
+            if (qnn_interface) {
+                auto error = qnn_interface->qnn_mem_de_register(&_mem_handle, 1);
+                if (error != QNN_SUCCESS) {
+                    QNN_LOG_WARN("failed to unregister shared buffer, error=%d (%s)\n",
+                                 (int) error, get_qnn_error_string(error));
+                }
+            }
+            _mem_handle = nullptr;
+        }
+    }
+
+    bool is_valid() const override { return _allocator && _allocator->is_valid() && _mem_handle != nullptr; }
+    uint8_t * get_buffer() override { return _allocator ? _allocator->base() + _offset : nullptr; }
+    size_t get_size() const override { return _size; }
+    Qnn_MemHandle_t get_mem_handle() const override { return _mem_handle; }
+
+  private:
+    size_t                                      _size       = 0;
+    uint64_t                                    _offset     = 0;
+    Qnn_MemHandle_t                             _mem_handle = nullptr;
+    std::shared_ptr<qnn_shared_buffer_allocator> _allocator;
+    qnn_instance_ptr                            _qnn_instance;
+
+    DISABLE_COPY(qnn_htp_shared_buffer);
+    DISABLE_MOVE(qnn_htp_shared_buffer);
+};
 
 /**
  * @brief A class for managing QNN RPC memory buffers.

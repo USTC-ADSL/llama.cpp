@@ -227,6 +227,7 @@ public:
 
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+    ggml_status graph_compute(ggml_cgraph * gf, const llama_ubatch & ubatch, bool batched);
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
@@ -342,6 +343,10 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    // Force the next graph build onto CPU only. Used for the AoT bootstrap
+    // correction path after seeding QNN state with the initial token.
+    bool aot_force_cpu_graph = false;
 
     // perf
     mutable int64_t t_start_us  = 0;

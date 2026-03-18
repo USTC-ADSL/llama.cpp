@@ -200,13 +200,12 @@ qnn_system_interface::qnn_system_interface(const QnnSystemInterface_t & qnn_sys_
 }
 
 qnn_system_interface::~qnn_system_interface() {
-    if (_qnn_system_handle) {
-        if (qnn_system_context_free(_qnn_system_handle) != QNN_SUCCESS) {
-            QNN_LOG_WARN("failed to free QNN system context\n");
-        }
-    } else {
-        QNN_LOG_WARN("system handle is null\n");
-    }
+    // Workflow1 keeps the QNN backend alive until process teardown to avoid repeated-init
+    // instability in AoT mode. On device we observed exit-time aborts in libQnnSystem.so
+    // when systemContextFree() runs during static destruction, likely because the library's
+    // internal mutex lifetime is already ending. Leaking this process-lifetime handle is
+    // preferable to aborting after successful decode/prefill runs.
+    _qnn_system_handle = nullptr;
 
     if (_lib_handle) {
         if (!common::dl_unload(_lib_handle)) {

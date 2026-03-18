@@ -654,6 +654,7 @@ public:
     llm_graph_input_i * add_input(llm_graph_input_ptr input);
 
     void set_params(const llm_graph_params & params);
+    void invalidate_reuse();
 
     // important graph nodes
     ggml_tensor * t_inp_tokens  = nullptr;

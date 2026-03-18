@@ -8,9 +8,194 @@
 #include "tensor.hpp"
 #include "utils.hpp"
 
+#include "ggml-cpu.h"
+
+#include <cstdlib>
 #include <memory>
 
 namespace {
+
+bool trace_aot_support_enabled() {
+    const char * value = std::getenv("GGML_QNN_AOT_TRACE_SUPPORT");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+bool aot_env_enabled() {
+    const char * value = std::getenv("GGML_QNN_AOT_CONFIG");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+bool qnn_backend_temporarily_disabled() {
+    const char * value = std::getenv("GGML_QNN_DISABLE_BACKEND");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+bool is_aot_trace_name(const char * name) {
+    if (name == nullptr) {
+        return false;
+    }
+
+    for (const char * prefix : {
+             "norm-",
+             "attn_norm-",
+             "Qcur-",
+             "Kcur-",
+             "Vcur-",
+             "attn_out-",
+             "ffn_inp-",
+             "ffn_norm-",
+             "ffn_gate-",
+             "ffn_up-",
+             "ffn_swiglu-",
+             "ffn_out-",
+             "l_out-",
+             "cache_k_l",
+             "cache_v_l",
+         }) {
+        if (std::strncmp(name, prefix, std::strlen(prefix)) == 0) {
+            return true;
+        }
+    }
+
+    return std::strcmp(name, "embd") == 0 ||
+           std::strcmp(name, "norm") == 0 ||
+           std::strcmp(name, "self_kq_mask_cnv") == 0 ||
+           std::strcmp(name, "self_kq_mask_swa_cnv") == 0 ||
+           std::strcmp(name, "result_norm") == 0 ||
+           std::strcmp(name, "result_output") == 0;
+}
+
+bool is_aot_transformer_stage_name(const char * name) {
+    if (name == nullptr) {
+        return false;
+    }
+
+    for (const char * prefix : {
+             "norm-",
+             "attn_norm-",
+             "Qcur-",
+             "Kcur-",
+             "Vcur-",
+             "attn_out-",
+             "kq-",
+             "kq_soft_max-",
+             "kqv-",
+             "kqv_out-",
+             "ffn_inp-",
+             "ffn_norm-",
+             "ffn_gate-",
+             "ffn_up-",
+             "ffn_swiglu-",
+             "ffn_out-",
+             "l_out-",
+         }) {
+        if (std::strncmp(name, prefix, std::strlen(prefix)) == 0) {
+            return true;
+        }
+    }
+
+    return std::strcmp(name, "self_kq_mask_cnv") == 0 ||
+           std::strcmp(name, "self_kq_mask_swa_cnv") == 0;
+}
+
+bool is_aot_cpu_stage_name(const char * name) {
+    if (name == nullptr) {
+        return false;
+    }
+
+    return std::strcmp(name, "inp_tokens") == 0 ||
+           std::strcmp(name, "embd") == 0;
+}
+
+bool is_aot_lm_head_stage_name(const char * name) {
+    if (name == nullptr) {
+        return false;
+    }
+
+    return std::strcmp(name, "norm") == 0 ||
+           std::strcmp(name, "result_norm") == 0 ||
+           std::strcmp(name, "result_output") == 0;
+}
+
+bool is_aot_embedding_lookup(const ggml_tensor * op) {
+    if (op == nullptr || op->op != GGML_OP_GET_ROWS || op->src[1] == nullptr) {
+        return false;
+    }
+
+    const char * src1_name = ggml_get_name(op->src[1]);
+    return src1_name != nullptr && std::strcmp(src1_name, "inp_tokens") == 0;
+}
+
+bool device_prefers_aot_preinit_cpu(const ggml_tensor * op) {
+    if (!aot_env_enabled() || op == nullptr) {
+        return false;
+    }
+
+    const char * name = ggml_get_name(op);
+    return is_aot_cpu_stage_name(name) || is_aot_embedding_lookup(op);
+}
+
+bool device_supports_aot_preinit(const ggml_tensor * op) {
+    if (!aot_env_enabled() || op == nullptr || op->op == GGML_OP_NONE) {
+        return false;
+    }
+
+    const char * name = ggml_get_name(op);
+    if (device_prefers_aot_preinit_cpu(op)) {
+        return false;
+    }
+
+    if (is_aot_transformer_stage_name(name)) {
+        return true;
+    }
+
+    if (is_aot_lm_head_stage_name(name)) {
+        return true;
+    }
+
+    bool has_aot_src = false;
+    for (size_t i = 0; i < GGML_MAX_SRC && op->src[i]; ++i) {
+        const char * src_name = ggml_get_name(op->src[i]);
+        if (is_aot_cpu_stage_name(src_name)) {
+            return false;
+        }
+        has_aot_src = has_aot_src || is_aot_transformer_stage_name(src_name) || is_aot_lm_head_stage_name(src_name);
+    }
+
+    return has_aot_src;
+}
+
+void trace_aot_support(const ggml_tensor * op, const char * decision, bool supported) {
+    if (!trace_aot_support_enabled()) {
+        return;
+    }
+
+    const char * name = ggml_get_name(op);
+    if (!is_aot_trace_name(name)) {
+        return;
+    }
+
+    std::fprintf(stderr,
+                 "[aot-support] name=%s op=%s supported=%d decision=%s\n",
+                 name ? name : "<null>",
+                 ggml_op_name(op->op),
+                 (int) supported,
+                 decision ? decision : "<null>");
+}
+
+void dump_cgraph_nodes(const ggml_cgraph * cgraph) {
+    const char * value = std::getenv("GGML_QNN_AOT_DUMP_CGRAPH");
+    if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0) {
+        return;
+    }
+
+    std::fprintf(stderr, "[aot] cgraph nodes:");
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const char * name = ggml_get_name(cgraph->nodes[i]);
+        std::fprintf(stderr, "%s%s", i == 0 ? " " : " -> ", name ? name : "<null>");
+    }
+    std::fprintf(stderr, "\n");
+}
 
 qnn::qnn_graph * get_qnn_graph_from_cache(qnn::ggml_backend_qnn_device_context * ctx, const ggml_cgraph * cgraph) {
     auto &      graph_cache = ctx->qnn_graph_cache;
@@ -383,12 +568,29 @@ namespace qnn {
 
 bool device_supports_op(qnn::ggml_backend_qnn_device_context * ctx, const ggml_tensor * op) {
     // Note that this function could be called before the device context is initialized
+    if (qnn_backend_temporarily_disabled()) {
+        trace_aot_support(op, "env-disabled", false);
+        return false;
+    }
+
     if (op->op == GGML_OP_NONE) {
+        trace_aot_support(op, "none", true);
+        return true;
+    }
+
+    if (ctx && ctx->device == QNN_BACKEND_NPU && ctx->aot_runtime == nullptr && device_prefers_aot_preinit_cpu(op)) {
+        trace_aot_support(op, "aot-preinit-prefers-cpu", false);
+        return false;
+    }
+
+    if (ctx && ctx->device == QNN_BACKEND_NPU && ctx->aot_runtime == nullptr && device_supports_aot_preinit(op)) {
+        trace_aot_support(op, "aot-preinit", true);
         return true;
     }
 
     if (ctx && ctx->aot_mode && ctx->aot_runtime) {
         if (ctx->aot_runtime->supports_op(op)) {
+            trace_aot_support(op, "aot-runtime", true);
 #ifndef NDEBUG
             ctx->supported_op_count++;
             print_tensor_info(ctx, op, true);
@@ -397,6 +599,7 @@ bool device_supports_op(qnn::ggml_backend_qnn_device_context * ctx, const ggml_t
         }
 
         if (ctx->aot_runtime->prefers_cpu_op(op)) {
+            trace_aot_support(op, "aot-prefers-cpu", false);
 #ifndef NDEBUG
             ctx->unsupported_op_count++;
             print_tensor_info(ctx, op, false);
@@ -406,6 +609,7 @@ bool device_supports_op(qnn::ggml_backend_qnn_device_context * ctx, const ggml_t
     }
 
     if (!kQnnSupportedOps[qnn::get_qnn_op_index(op)]) {
+        trace_aot_support(op, "generic-op-unsupported", false);
 #ifndef NDEBUG
         ctx->unsupported_op_count++;
         print_tensor_info(ctx, op, false);
@@ -414,6 +618,7 @@ bool device_supports_op(qnn::ggml_backend_qnn_device_context * ctx, const ggml_t
     }
 
     if (!ggnl_qnn_supports_op_tensor(ctx, op)) {
+        trace_aot_support(op, "generic-tensor-unsupported", false);
 #ifndef NDEBUG
         ctx->unsupported_op_count++;
         print_tensor_info(ctx, op, false);
@@ -473,6 +678,7 @@ bool device_supports_op(qnn::ggml_backend_qnn_device_context * ctx, const ggml_t
     print_tensor_info(ctx, op, is_op_supported);
 #endif
 
+    trace_aot_support(op, is_op_supported ? "generic-supported" : "generic-shape-unsupported", is_op_supported);
     return is_op_supported;
 }
 
@@ -488,6 +694,18 @@ bool device_compute_graph(qnn::ggml_backend_qnn_device_context * ctx, ggml_cgrap
 
         const char * first_name = cgraph->n_nodes > 0 ? ggml_get_name(cgraph->nodes[0]) : nullptr;
         const char * last_name  = cgraph->n_nodes > 0 ? ggml_get_name(cgraph->nodes[cgraph->n_nodes - 1]) : nullptr;
+        dump_cgraph_nodes(cgraph);
+        std::fprintf(stderr, "[aot] unmatched cgraph: n_nodes=%d first=%s last=%s\n",
+                     cgraph->n_nodes,
+                     first_name ? first_name : "<null>",
+                     last_name ? last_name : "<null>");
+
+        const char * allow_jit = std::getenv("GGML_QNN_AOT_ALLOW_JIT_FALLBACK");
+        if (allow_jit == nullptr || allow_jit[0] == '\0' || std::strcmp(allow_jit, "0") == 0) {
+            std::fprintf(stderr, "[aot] rejecting unmatched cgraph before JIT fallback\n");
+            return false;
+        }
+
         std::fprintf(stderr, "[aot] fallback to JIT for unmatched cgraph: n_nodes=%d first=%s last=%s\n",
                      cgraph->n_nodes,
                      first_name ? first_name : "<null>",

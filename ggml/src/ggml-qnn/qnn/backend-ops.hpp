@@ -37,10 +37,11 @@ struct ggml_backend_qnn_device_context {
     qnn::qnn_graph_cache_t                      qnn_graph_cache;
     std::shared_ptr<qnn::qnn_convert_context_t> convert_context = std::make_shared<qnn::qnn_convert_context_t>();
 
-    bool                                aot_mode = false;
-    std::string                         aot_config_path;
-    std::string                         aot_model_dir;
+    bool                                  aot_mode = false;
+    std::string                           aot_config_path;
+    std::string                           aot_model_dir;
     std::unique_ptr<qnn::qnn_aot_runtime> aot_runtime;
+    ggml_backend_t                        cpu_fallback_backend = nullptr;
 
 #ifndef NDEBUG
     std::atomic_uint32_t supported_op_count   = 0;
@@ -57,6 +58,8 @@ struct ggml_backend_qnn_device_context {
         threads(threads),
         name(name),
         supported_types(supported_types) {}
+
+    ~ggml_backend_qnn_device_context() = default;
 };
 
 bool device_supports_op(ggml_backend_qnn_device_context * ctx, const ggml_tensor * op);

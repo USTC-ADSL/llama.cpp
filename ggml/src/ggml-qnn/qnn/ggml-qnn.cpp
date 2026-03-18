@@ -1,6 +1,7 @@
 #include "backend-ops.hpp"
 #include "common.hpp"
 #include "ggml-backend-impl.h"
+#include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "logger.hpp"
 #include "tensor.hpp"
@@ -136,15 +137,11 @@ void ggml_backend_qnn_free(ggml_backend_t backend) {
     auto * device_ctx = get_device_context(backend->device);
     QNN_LOG_INFO("idx %d, name:%s\n", device_ctx->device, device_ctx->name.c_str());
 
-    auto & instance = device_ctx->instance;
-    if (instance) {
-        device_ctx->aot_runtime.reset();
-        device_ctx->aot_mode = false;
-        device_ctx->qnn_graph_cache.clear();
-        device_ctx->qnn_interface.reset();
-        instance->qnn_finalize();
-        instance.reset();
+    if (device_ctx->aot_runtime != nullptr) {
+        device_ctx->aot_runtime->reset_state();
     }
+    device_ctx->aot_mode = false;
+    device_ctx->qnn_graph_cache.clear();
 
     delete backend;
 }
@@ -270,13 +267,32 @@ ggml_backend_t ggml_backend_qnn_init_with_device_context(ggml_backend_dev_t dev,
     const auto device  = dev_ctx->device;
     QNN_LOG_DEBUG("device %s\n", qnn::get_backend_name(device));
     QNN_LOG_DEBUG("extend_lib_search_path %s\n", extend_lib_search_path);
-    auto instance = std::make_shared<qnn::qnn_instance>(extend_lib_search_path, device);
-    if (!instance->qnn_init(nullptr)) {
-        QNN_LOG_WARN("failed to init qnn backend %s\n", qnn::get_backend_name(device));
-        return nullptr;
+
+    if (!dev_ctx->instance) {
+        auto instance = std::make_shared<qnn::qnn_instance>(extend_lib_search_path, device);
+        if (!instance->qnn_init(nullptr)) {
+            QNN_LOG_WARN("failed to init qnn backend %s\n", qnn::get_backend_name(device));
+            return nullptr;
+        }
+
+        auto qnn_interface = instance->get_qnn_interface();
+        if (!qnn_interface) {
+            QNN_LOG_WARN("qnn subsystem failure\n");
+            return nullptr;
+        }
+
+        dev_ctx->instance      = std::move(instance);
+        dev_ctx->qnn_interface = std::move(qnn_interface);
+        dev_ctx->socinfo       = dev_ctx->instance->get_soc_info();
+
+        if (dev_ctx->cpu_fallback_backend == nullptr) {
+            dev_ctx->cpu_fallback_backend = ggml_backend_cpu_init();
+        }
     }
-    auto qnn_interface = instance->get_qnn_interface();
-    if (!qnn_interface) {
+
+    auto instance      = dev_ctx->instance;
+    auto qnn_interface = dev_ctx->qnn_interface;
+    if (!instance || !qnn_interface) {
         QNN_LOG_WARN("qnn subsystem failure\n");
         return nullptr;
     }
@@ -284,28 +300,45 @@ ggml_backend_t ggml_backend_qnn_init_with_device_context(ggml_backend_dev_t dev,
     std::string device_name = qnn::get_backend_name(device);
     QNN_LOG_INFO("qnn device name %s\n", device_name.c_str());
     const auto & device_caps          = qnn::get_device_caps(device);
-    dev_ctx->instance                 = instance;
-    dev_ctx->qnn_interface            = qnn_interface;
-    dev_ctx->socinfo                  = instance->get_soc_info();
+    if (dev_ctx->cpu_fallback_backend != nullptr) {
+        ggml_backend_cpu_set_n_threads(dev_ctx->cpu_fallback_backend, (int) dev_ctx->threads);
+    } else {
+        QNN_LOG_WARN("[aot] failed to initialize CPU fallback backend\n");
+    }
 
     if (device == QNN_BACKEND_NPU) {
         if (const char * aot_config = std::getenv("GGML_QNN_AOT_CONFIG"); aot_config && aot_config[0] != '\0') {
-            dev_ctx->aot_mode        = true;
-            dev_ctx->aot_config_path = aot_config;
+            const std::string aot_config_path = aot_config;
+            std::string       aot_model_dir;
 
-            if (const char * aot_model_dir = std::getenv("GGML_QNN_AOT_MODEL_DIR"); aot_model_dir && aot_model_dir[0] != '\0') {
-                dev_ctx->aot_model_dir = aot_model_dir;
+            if (const char * env_aot_model_dir = std::getenv("GGML_QNN_AOT_MODEL_DIR");
+                env_aot_model_dir && env_aot_model_dir[0] != '\0') {
+                aot_model_dir = env_aot_model_dir;
             } else {
-                dev_ctx->aot_model_dir = std::filesystem::path(dev_ctx->aot_config_path).parent_path().string();
+                aot_model_dir = std::filesystem::path(aot_config_path).parent_path().string();
             }
 
-            auto aot_runtime = std::make_unique<qnn::qnn_aot_runtime>(instance, device);
-            if (!aot_runtime->initialize(dev_ctx->aot_config_path, dev_ctx->aot_model_dir)) {
-                QNN_LOG_WARN("[aot] failed to initialize AoT runtime from %s\n", dev_ctx->aot_config_path.c_str());
-                dev_ctx->aot_mode = false;
+            dev_ctx->aot_mode        = true;
+            dev_ctx->aot_config_path = aot_config_path;
+            dev_ctx->aot_model_dir   = aot_model_dir;
+
+            const bool reuse_aot_runtime = dev_ctx->aot_runtime != nullptr &&
+                                           dev_ctx->aot_runtime->is_enabled() &&
+                                           dev_ctx->aot_runtime->config_path() == dev_ctx->aot_config_path;
+
+            if (reuse_aot_runtime) {
+                dev_ctx->aot_runtime->reset_state();
             } else {
-                dev_ctx->aot_runtime = std::move(aot_runtime);
-                QNN_LOG_INFO("[aot] enabled AoT runtime with config %s\n", dev_ctx->aot_config_path.c_str());
+                dev_ctx->aot_runtime.reset();
+
+                auto aot_runtime = std::make_unique<qnn::qnn_aot_runtime>(instance, device);
+                if (!aot_runtime->initialize(dev_ctx->aot_config_path, dev_ctx->aot_model_dir)) {
+                    QNN_LOG_WARN("[aot] failed to initialize AoT runtime from %s\n", dev_ctx->aot_config_path.c_str());
+                    dev_ctx->aot_mode = false;
+                } else {
+                    dev_ctx->aot_runtime = std::move(aot_runtime);
+                    QNN_LOG_INFO("[aot] enabled AoT runtime with config %s\n", dev_ctx->aot_config_path.c_str());
+                }
             }
         }
     }
@@ -361,7 +394,25 @@ bool ggml_backend_qnn_device_supports_op(ggml_backend_dev_t dev, const ggml_tens
 }
 
 bool ggml_backend_qnn_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    GGML_UNUSED(dev);
+    auto * device_ctx = get_device_context(dev);
+
+    if (device_ctx->device == QNN_BACKEND_NPU) {
+        const char * aot_config = std::getenv("GGML_QNN_AOT_CONFIG");
+        if (aot_config != nullptr && aot_config[0] != '\0' && std::strcmp(aot_config, "0") != 0) {
+            // Reserve-time scheduler queries can happen before the AoT runtime is fully initialized.
+            // In workflow1 the precompiled QNN context owns transformer weights, so the GGUF weight
+            // buffer types should not fragment the transformer stage while we are still assigning splits.
+            return true;
+        }
+    }
+
+    if (device_ctx->aot_mode && device_ctx->aot_runtime) {
+        // AoT transformer execution consumes the precompiled QNN context and host-visible stage inputs,
+        // not the original ggml static weights referenced by the graph. Treat all buffer types as
+        // compatible here so the scheduler does not fragment the transformer stage around unused weight buffers.
+        return true;
+    }
+
     return ggml_backend_buft_is_host(buft);
 }
 
@@ -405,6 +456,16 @@ class qnn_device_proxy : public backend_device_proxy {
             /* .threads  = */ 1,       // TODO: fix this
             /* .name     = */ qnn::get_backend_name(device),
             /* .supported_types = */ device_caps.supported_types);
+    }
+
+    ~qnn_device_proxy() override {
+        // Workflow1 keeps a process-lifetime QNN backend/device/AoT runtime to avoid
+        // repeated-init instability. On Android we also observed multiple exit-time
+        // aborts inside libQnnSystem.so while destructing these objects during static
+        // teardown. Releasing ownership here intentionally leaks the process-lifetime
+        // device context so the OS can reclaim it on exit without running the fragile
+        // QNN teardown path.
+        (void) _device_context.release();
     }
 
     const ggml_backend_device_i & get_iface() const { return ggml_backend_qnn_device_interface; }

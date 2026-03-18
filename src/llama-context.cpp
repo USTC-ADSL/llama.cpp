@@ -1181,57 +1181,96 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    auto * res = gf_res_prev.get();
-    auto * gf  = res->get_gf();
+    const auto run_graph_once = [&](llm_graph_result * res, bool allow_reuse, bool force_cpu_graph) -> ggml_status {
+        aot_force_cpu_graph = force_cpu_graph;
 
-    // the new graph parameters
-    // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+        auto restore_force_cpu = [this]() {
+            aot_force_cpu_graph = false;
+        };
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
-        //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+        auto * gf = res->get_gf();
 
-        n_reused++;
-    } else {
-        res->reset();
+        // the new graph parameters
+        // in order to correctly reuse a graph, its full topology has to be uniquely determined by these parameters
+        const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-        ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        if (!graph_reuse_disable && allow_reuse && res->can_reuse(gparams)) {
+            n_reused++;
+        } else {
+            res->reset();
 
-        //const auto t_start_us = ggml_time_us();
+            ggml_backend_sched_reset(sched.get());
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        gf = model.build_graph(gparams);
+            gf = model.build_graph(gparams);
 
-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+            if (!gf) {
+                restore_force_cpu();
+                LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
+                return GGML_STATUS_FAILED;
+            }
 
-        if (!gf) {
-            LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
-            ret = GGML_STATUS_FAILED;
-            return nullptr;
+            if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+                restore_force_cpu();
+                LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+                return GGML_STATUS_ALLOC_FAILED;
+            }
         }
-
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
-            LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
-            ret = GGML_STATUS_ALLOC_FAILED;
-            return nullptr;
-        }
-    }
-
-    // set the input data for the input tensors
-    {
-        //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
 
-        //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
-    }
+        restore_force_cpu();
+        return graph_compute(res->get_gf(), ubatch, ubatch.n_tokens > 1);
+    };
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    const bool aot_single_token_pos0 =
+        std::getenv("GGML_QNN_AOT_CONFIG") != nullptr &&
+        ubatch.n_tokens == 1 &&
+        ubatch.n_pos > 0 &&
+        ubatch.pos != nullptr &&
+        ubatch.pos[0] == 0;
+
+    auto * res = gf_res_prev.get();
+    auto status = run_graph_once(res, /* allow_reuse = */ true, /* force_cpu_graph = */ false);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    if (aot_single_token_pos0) {
+        LLAMA_LOG_INFO("%s: running AoT bootstrap CPU correction for initial decode token\n", __func__);
+
+        // Finish the seed run before rebuilding the scheduler for the correction graph.
+        ggml_backend_sched_synchronize(sched.get());
+
+        // The scheduler will be rebound to the correction graph below, so rebuild the
+        // steady-state QNN graph on the next decode rather than reusing stale splits.
+        res->invalidate_reuse();
+
+        auto * cpu_res = gf_res_reserve.get();
+        const char * prev_qnn_disable = std::getenv("GGML_QNN_DISABLE_BACKEND");
+        const bool had_prev_qnn_disable = prev_qnn_disable != nullptr;
+        const std::string prev_qnn_disable_value = had_prev_qnn_disable ? prev_qnn_disable : "";
+
+        setenv("GGML_QNN_DISABLE_BACKEND", "1", 1);
+        status = run_graph_once(cpu_res, /* allow_reuse = */ false, /* force_cpu_graph = */ true);
+
+        if (had_prev_qnn_disable) {
+            setenv("GGML_QNN_DISABLE_BACKEND", prev_qnn_disable_value.c_str(), 1);
+        } else {
+            unsetenv("GGML_QNN_DISABLE_BACKEND");
+        }
+
+        if (status != GGML_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR("%s: failed to compute bootstrap CPU correction graph, status: %d\n", __func__, status);
+            ret = status;
+            return nullptr;
+        }
+
+        ret = GGML_STATUS_SUCCESS;
+        return cpu_res;
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -2168,6 +2207,16 @@ llm_graph_params llama_context::graph_params(
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched) {
+    const llama_ubatch empty_ubatch = {};
+    return graph_compute(gf, empty_ubatch, batched);
+}
+
+ggml_status llama_context::graph_compute(
+            ggml_cgraph * gf,
+      const llama_ubatch & ubatch,
+                   bool   batched) {
+    GGML_UNUSED(ubatch);
+
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -2188,9 +2237,6 @@ ggml_status llama_context::graph_compute(
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
-
-    // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
-
     return status;
 }
 
@@ -2247,6 +2293,55 @@ llm_graph_cb llama_context::graph_get_cb() const {
         const auto has_prefix = [](const char * value, const char * prefix) {
             return value != nullptr && prefix != nullptr && std::strncmp(value, prefix, std::strlen(prefix)) == 0;
         };
+        const auto trace_assign_enabled = []() {
+            const char * value = std::getenv("GGML_QNN_AOT_TRACE_ASSIGN");
+            return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+        };
+        const auto trace_tensor = [&](const char * reason, ggml_backend_t backend, bool supported) {
+            if (!trace_assign_enabled()) {
+                return;
+            }
+
+            if (tensor_name == nullptr) {
+                return;
+            }
+
+            const bool is_stage_tensor =
+                has_prefix(tensor_name, "norm-") ||
+                has_prefix(tensor_name, "attn_norm-") ||
+                has_prefix(tensor_name, "Qcur-") ||
+                has_prefix(tensor_name, "Kcur-") ||
+                has_prefix(tensor_name, "Vcur-") ||
+                has_prefix(tensor_name, "attn_out-") ||
+                has_prefix(tensor_name, "ffn_inp-") ||
+                has_prefix(tensor_name, "ffn_norm-") ||
+                has_prefix(tensor_name, "ffn_gate-") ||
+                has_prefix(tensor_name, "ffn_up-") ||
+                has_prefix(tensor_name, "ffn_swiglu-") ||
+                has_prefix(tensor_name, "ffn_out-") ||
+                has_prefix(tensor_name, "l_out-") ||
+                std::strcmp(tensor_name, "embd") == 0 ||
+                std::strcmp(tensor_name, "norm") == 0 ||
+                std::strcmp(tensor_name, "result_norm") == 0 ||
+                std::strcmp(tensor_name, "result_output") == 0;
+
+            if (!is_stage_tensor) {
+                return;
+            }
+
+            std::fprintf(stderr,
+                         "[aot-assign] name=%s reason=%s backend=%s supported=%d\n",
+                         tensor_name,
+                         reason ? reason : "<null>",
+                         backend ? ggml_backend_name(backend) : "<null>",
+                         (int) supported);
+        };
+
+        if (aot_force_cpu_graph) {
+            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
+            trace_tensor("bootstrap-cpu", backend_cpu, true);
+            return;
+        }
 
         // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // FIXME: fix in ggml_backend_sched
@@ -2289,11 +2384,14 @@ llm_graph_cb llama_context::graph_get_cb() const {
                 has_prefix(tensor_name, "ffn_swiglu-") ||
                 has_prefix(tensor_name, "ffn_out-") ||
                 has_prefix(tensor_name, "l_out-");
-
             if (force_cpu) {
                 ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
+                trace_tensor("force-cpu", backend_cpu, true);
             } else if (aot_transformer_stage && ggml_backend_supports_op(qnn_aot_backend, cur)) {
                 ggml_backend_sched_set_tensor_backend(sched.get(), cur, qnn_aot_backend);
+                trace_tensor("aot-qnn", qnn_aot_backend, true);
+            } else if (aot_transformer_stage) {
+                trace_tensor("aot-unsupported", qnn_aot_backend, false);
             }
             return;
         }

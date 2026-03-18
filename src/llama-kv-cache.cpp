@@ -9,6 +9,8 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -1505,6 +1507,106 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
             }
         }
     }
+}
+
+bool llama_kv_cache::dump_powerserve_seed_kv(const std::string & dir, uint32_t n_tokens) const {
+    if (n_stream != 1) {
+        LLAMA_LOG_ERROR("%s: only unified KV cache export is supported (n_stream=%u)\n", __func__, n_stream);
+        return false;
+    }
+
+    if (n_tokens == 0 || n_tokens > get_size()) {
+        LLAMA_LOG_ERROR("%s: invalid seed token count %u (cache size %u)\n", __func__, n_tokens, get_size());
+        return false;
+    }
+
+    std::filesystem::create_directories(dir);
+
+    auto write_rows = [&](const std::filesystem::path & path, const std::vector<float> & rows) -> bool {
+        std::ofstream out(path, std::ios::binary);
+        if (!out.is_open()) {
+            LLAMA_LOG_ERROR("%s: failed to open %s for writing\n", __func__, path.string().c_str());
+            return false;
+        }
+
+        out.write(reinterpret_cast<const char *>(rows.data()), rows.size() * sizeof(float));
+        if (!out.good()) {
+            LLAMA_LOG_ERROR("%s: failed to write %s\n", __func__, path.string().c_str());
+            return false;
+        }
+        return true;
+    };
+
+    auto to_float = [](ggml_type type, const char * src) -> float {
+        switch (type) {
+            case GGML_TYPE_F16:
+                return ggml_fp16_to_fp32(*reinterpret_cast<const ggml_fp16_t *>(src));
+            case GGML_TYPE_F32:
+                return *reinterpret_cast<const float *>(src);
+            default:
+                GGML_ABORT("unsupported KV tensor type for PowerServe export");
+        }
+    };
+
+    for (const auto & layer : layers) {
+        const uint32_t il = layer.il;
+        const uint32_t n_head_kv = hparams.n_head_kv(il);
+        const uint32_t head_dim_k = hparams.n_embd_head_k(il);
+        const uint32_t head_dim_v = hparams.n_embd_head_v(il);
+
+        auto * k = layer.k_stream[0];
+        auto * v = layer.v_stream[0];
+        if (!k || !v) {
+            LLAMA_LOG_ERROR("%s: missing KV tensors for layer %u\n", __func__, il);
+            return false;
+        }
+
+        std::vector<uint8_t> k_buf(ggml_nbytes(k));
+        std::vector<uint8_t> v_buf(ggml_nbytes(v));
+        ggml_backend_tensor_get(k, k_buf.data(), 0, k_buf.size());
+        ggml_backend_tensor_get(v, v_buf.data(), 0, v_buf.size());
+
+        const size_t k_row_bytes = ggml_row_size(k->type, hparams.n_embd_k_gqa(il));
+        const size_t k_elem_size = ggml_type_size(k->type);
+        const size_t v_elem_size = ggml_type_size(v->type);
+        const uint32_t kv_size = get_size();
+
+        for (uint32_t head = 0; head < n_head_kv; ++head) {
+            std::vector<float> key_rows((size_t) n_tokens * head_dim_k);
+            std::vector<float> value_rows((size_t) n_tokens * head_dim_v);
+
+            for (uint32_t token = 0; token < n_tokens; ++token) {
+                const char * k_row = reinterpret_cast<const char *>(k_buf.data()) + (size_t) token * k_row_bytes;
+                for (uint32_t d = 0; d < head_dim_k; ++d) {
+                    const size_t src_idx = (size_t) head * head_dim_k + d;
+                    key_rows[(size_t) token * head_dim_k + d] = to_float(k->type, k_row + src_idx * k_elem_size);
+                }
+
+                if (!v_trans) {
+                    const size_t v_row_bytes = ggml_row_size(v->type, hparams.n_embd_v_gqa(il));
+                    const char * v_row = reinterpret_cast<const char *>(v_buf.data()) + (size_t) token * v_row_bytes;
+                    for (uint32_t d = 0; d < head_dim_v; ++d) {
+                        const size_t src_idx = (size_t) head * head_dim_v + d;
+                        value_rows[(size_t) token * head_dim_v + d] = to_float(v->type, v_row + src_idx * v_elem_size);
+                    }
+                } else {
+                    for (uint32_t d = 0; d < head_dim_v; ++d) {
+                        const size_t src_idx = ((size_t) head * head_dim_v + d) * kv_size + token;
+                        value_rows[(size_t) token * head_dim_v + d] =
+                            to_float(v->type, reinterpret_cast<const char *>(v_buf.data()) + src_idx * v_elem_size);
+                    }
+                }
+            }
+
+            const auto key_path = std::filesystem::path(dir) / ("layer_" + std::to_string(il) + "_key_" + std::to_string(head) + ".raw");
+            const auto value_path = std::filesystem::path(dir) / ("layer_" + std::to_string(il) + "_value_" + std::to_string(head) + ".raw");
+            if (!write_rows(key_path, key_rows) || !write_rows(value_path, value_rows)) {
+                return false;
+            }
+        }
+    }
+
+    return true;
 }
 
 size_t llama_kv_cache::total_size() const {

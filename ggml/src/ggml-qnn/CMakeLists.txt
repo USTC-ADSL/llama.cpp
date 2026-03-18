@@ -42,6 +42,7 @@ ggml_add_backend_library(ggml-qnn
     ../../include/ggml-qnn.h
 )
 target_link_libraries(ggml-qnn PRIVATE ${COMMON_LINK_LIBRARIES})
+target_link_libraries(ggml-qnn PRIVATE ggml-cpu)
 
 if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
     set(GGML_QNN_RUNTIME_COMMON_LINK "$<LINK_LIBRARY:WHOLE_ARCHIVE,runtime-common>")

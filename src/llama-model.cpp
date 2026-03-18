@@ -204,6 +204,11 @@ static buft_list_t make_cpu_buft_list(const std::vector<ggml_backend_dev_t> & de
     // function of the device to determine if it would benefit from being stored in a host buffer
     if (!no_host) {
         for (auto * dev : devices) {
+            const char * dev_name = ggml_backend_dev_name(dev);
+            if (dev_name != nullptr && std::strcmp(dev_name, "GPUOpenCL") == 0) {
+                continue;
+            }
+
             ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev);
             if (buft) {
                 buft_list.emplace_back(dev, buft);
