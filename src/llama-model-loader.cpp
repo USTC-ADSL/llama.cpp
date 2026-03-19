@@ -3,10 +3,12 @@
 #include "ggml-alloc.h"
 #include "ggml.h"
 #include "gguf.h"
+#include "llama-hetero-route.h"
 #include "llama-hparams.h"
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
@@ -1008,9 +1010,95 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
     return nullptr;
 }
 
+static ggml_backend_buffer_type_t select_weight_host_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t * buft_list) {
+    GGML_ASSERT(!buft_list->empty());
+    for (const auto & cur : *buft_list) {
+        ggml_backend_dev_t cur_dev = cur.first;
+        ggml_backend_buffer_type_t cur_buft = cur.second;
+        if (!ggml_backend_buft_is_host(cur_buft)) {
+            continue;
+        }
+        if (weight_buft_supported(hparams, tensor, op, cur_buft, cur_dev)) {
+            return cur_buft;
+        }
+    }
+
+    return nullptr;
+}
+
+static ggml_backend_buffer_type_t select_weight_device_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const char * device_name, bool use_host_buft) {
+    ggml_backend_dev_t dev = ggml_backend_dev_by_name(device_name);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_buffer_type_t buft = use_host_buft ? ggml_backend_dev_host_buffer_type(dev) : ggml_backend_dev_buffer_type(dev);
+    if (buft == nullptr) {
+        return nullptr;
+    }
+
+    return weight_buft_supported(hparams, tensor, op, buft, dev) ? buft : nullptr;
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+    const auto hetero_route = llama_hetero_parse_route_spec_from_env();
+    const bool hetero_cpu_opencl_mixed = llama_hetero_route_has_cpu_opencl_mix(hetero_route);
+    const int hetero_ffn_backend_kind       = llama_hetero_backend_kind(hetero_route.backend_for(llama_hetero_route_stage::FFN));
+    const int hetero_attn_proj_backend_kind = llama_hetero_backend_kind(hetero_route.backend_for(llama_hetero_route_stage::ATTN_PROJ));
+    const int hetero_attn_out_backend_kind  = llama_hetero_backend_kind(hetero_route.backend_for(llama_hetero_route_stage::ATTN_OUT));
+
+    const bool hetero_cpu_opencl_ffn_cpu_weights =
+        hetero_cpu_opencl_mixed && hetero_ffn_backend_kind == 1;
+    const bool hetero_cpu_opencl_attn_proj_cpu_weights =
+        hetero_cpu_opencl_mixed && hetero_attn_proj_backend_kind == 1;
+    const bool hetero_cpu_opencl_attn_out_cpu_weights =
+        hetero_cpu_opencl_mixed && hetero_attn_out_backend_kind == 1;
+
+    const bool hetero_cpu_opencl_ffn_opencl_weights =
+        hetero_cpu_opencl_mixed && hetero_ffn_backend_kind == 2;
+    const bool hetero_cpu_opencl_attn_proj_opencl_weights =
+        hetero_cpu_opencl_mixed && hetero_attn_proj_backend_kind == 2;
+    const bool hetero_cpu_opencl_attn_out_opencl_weights =
+        hetero_cpu_opencl_mixed && hetero_attn_out_backend_kind == 2;
+
+    static bool logged_hetero_cpu_opencl_ffn_cpu_weights = false;
+    if (hetero_cpu_opencl_ffn_cpu_weights && !logged_hetero_cpu_opencl_ffn_cpu_weights) {
+        LLAMA_LOG_INFO("%s: auto-routing FFN weights to CPU buffer types for CPU/OpenCL hetero decode\n", __func__);
+        logged_hetero_cpu_opencl_ffn_cpu_weights = true;
+    }
+
+    static bool logged_hetero_cpu_opencl_attn_proj_cpu_weights = false;
+    if (hetero_cpu_opencl_attn_proj_cpu_weights && !logged_hetero_cpu_opencl_attn_proj_cpu_weights) {
+        LLAMA_LOG_INFO("%s: auto-routing attention projection weights to CPU buffer types for CPU/OpenCL hetero decode\n", __func__);
+        logged_hetero_cpu_opencl_attn_proj_cpu_weights = true;
+    }
+
+    static bool logged_hetero_cpu_opencl_attn_out_cpu_weights = false;
+    if (hetero_cpu_opencl_attn_out_cpu_weights && !logged_hetero_cpu_opencl_attn_out_cpu_weights) {
+        LLAMA_LOG_INFO("%s: auto-routing attention output weights to CPU buffer types for CPU/OpenCL hetero decode\n", __func__);
+        logged_hetero_cpu_opencl_attn_out_cpu_weights = true;
+    }
+
+    static bool logged_hetero_cpu_opencl_ffn_opencl_weights = false;
+    if (hetero_cpu_opencl_ffn_opencl_weights && !logged_hetero_cpu_opencl_ffn_opencl_weights) {
+        LLAMA_LOG_INFO("%s: preferring OpenCL buffer types for FFN weights under CPU/OpenCL hetero decode\n", __func__);
+        logged_hetero_cpu_opencl_ffn_opencl_weights = true;
+    }
+
+    static bool logged_hetero_cpu_opencl_attn_proj_opencl_weights = false;
+    if (hetero_cpu_opencl_attn_proj_opencl_weights && !logged_hetero_cpu_opencl_attn_proj_opencl_weights) {
+        LLAMA_LOG_INFO("%s: preferring OpenCL buffer types for attention projection weights under CPU/OpenCL hetero decode\n", __func__);
+        logged_hetero_cpu_opencl_attn_proj_opencl_weights = true;
+    }
+
+    static bool logged_hetero_cpu_opencl_attn_out_opencl_weights = false;
+    if (hetero_cpu_opencl_attn_out_opencl_weights && !logged_hetero_cpu_opencl_attn_out_opencl_weights) {
+        LLAMA_LOG_INFO("%s: preferring OpenCL buffer types for attention output weights under CPU/OpenCL hetero decode\n", __func__);
+        logged_hetero_cpu_opencl_attn_out_opencl_weights = true;
+    }
+
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
@@ -1117,10 +1205,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         ggml_backend_buffer_type_t buft = nullptr;
+        const std::string tensor_name = tn.str();
 
         // check overrides
         if (tensor_buft_overrides) {
-            std::string tensor_name = tn.str();
             for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
                 std::regex pattern(overrides->pattern);
                 if (std::regex_search(tensor_name, pattern)) {
@@ -1140,6 +1228,60 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        if (!buft && info.layer == LLM_TENSOR_LAYER_REPEATING) {
+            const bool is_ffn_tensor =
+                tn_tensor == LLM_TENSOR_FFN_NORM ||
+                tn_tensor == LLM_TENSOR_FFN_GATE ||
+                tn_tensor == LLM_TENSOR_FFN_UP   ||
+                tn_tensor == LLM_TENSOR_FFN_DOWN;
+
+            const bool is_attn_proj_tensor =
+                tn_tensor == LLM_TENSOR_ATTN_NORM      ||
+                tn_tensor == LLM_TENSOR_ATTN_NORM_2    ||
+                tn_tensor == LLM_TENSOR_ATTN_POST_NORM ||
+                tn_tensor == LLM_TENSOR_ATTN_ROT_EMBD  ||
+                tn_tensor == LLM_TENSOR_ATTN_Q         ||
+                tn_tensor == LLM_TENSOR_ATTN_K         ||
+                tn_tensor == LLM_TENSOR_ATTN_V         ||
+                tn_tensor == LLM_TENSOR_ATTN_QKV       ||
+                tn_tensor == LLM_TENSOR_ATTN_Q_NORM    ||
+                tn_tensor == LLM_TENSOR_ATTN_K_NORM    ||
+                tn_tensor == LLM_TENSOR_ATTN_Q_A       ||
+                tn_tensor == LLM_TENSOR_ATTN_Q_B       ||
+                tn_tensor == LLM_TENSOR_ATTN_KV_A_MQA  ||
+                tn_tensor == LLM_TENSOR_ATTN_KV_B      ||
+                tn_tensor == LLM_TENSOR_ATTN_K_B       ||
+                tn_tensor == LLM_TENSOR_ATTN_V_B       ||
+                tn_tensor == LLM_TENSOR_ATTN_Q_A_NORM  ||
+                tn_tensor == LLM_TENSOR_ATTN_KV_A_NORM ||
+                tn_tensor == LLM_TENSOR_ATTN_SUB_NORM;
+
+            const bool is_attn_out_tensor =
+                tn_tensor == LLM_TENSOR_ATTN_OUT      ||
+                tn_tensor == LLM_TENSOR_ATTN_OUT_NORM ||
+                tn_tensor == LLM_TENSOR_ATTN_GATE;
+
+            if ((hetero_cpu_opencl_ffn_cpu_weights && is_ffn_tensor) ||
+                (hetero_cpu_opencl_attn_proj_cpu_weights && is_attn_proj_tensor) ||
+                (hetero_cpu_opencl_attn_out_cpu_weights  && is_attn_out_tensor)) {
+                buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+                if (!buft) {
+                    throw std::runtime_error(format("failed to auto-route hetero tensor %s to a CPU buffer type", tensor_name.c_str()));
+                }
+
+                const char * reason =
+                    is_ffn_tensor ? "CPU FFN stage" :
+                    is_attn_proj_tensor ? "CPU attention projection stage" :
+                    "CPU attention output stage";
+
+                LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) auto-routed to %s for %s\n",
+                        tensor_name.c_str(),
+                        ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
+                        ggml_backend_buft_name(buft),
+                        reason);
+            }
+        }
+
         if (!buft) {
             buft = select_weight_buft(hparams, t_meta, op, buft_list);
             if (!buft) {
@@ -1147,9 +1289,89 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        if (hetero_cpu_opencl_mixed && info.layer == LLM_TENSOR_LAYER_REPEATING) {
+            const bool is_ffn_tensor =
+                tn_tensor == LLM_TENSOR_FFN_NORM ||
+                tn_tensor == LLM_TENSOR_FFN_GATE ||
+                tn_tensor == LLM_TENSOR_FFN_UP   ||
+                tn_tensor == LLM_TENSOR_FFN_DOWN;
+
+            const bool is_attn_proj_tensor =
+                tn_tensor == LLM_TENSOR_ATTN_NORM      ||
+                tn_tensor == LLM_TENSOR_ATTN_NORM_2    ||
+                tn_tensor == LLM_TENSOR_ATTN_POST_NORM ||
+                tn_tensor == LLM_TENSOR_ATTN_ROT_EMBD  ||
+                tn_tensor == LLM_TENSOR_ATTN_Q         ||
+                tn_tensor == LLM_TENSOR_ATTN_K         ||
+                tn_tensor == LLM_TENSOR_ATTN_V         ||
+                tn_tensor == LLM_TENSOR_ATTN_QKV       ||
+                tn_tensor == LLM_TENSOR_ATTN_Q_NORM    ||
+                tn_tensor == LLM_TENSOR_ATTN_K_NORM    ||
+                tn_tensor == LLM_TENSOR_ATTN_Q_A       ||
+                tn_tensor == LLM_TENSOR_ATTN_Q_B       ||
+                tn_tensor == LLM_TENSOR_ATTN_KV_A_MQA  ||
+                tn_tensor == LLM_TENSOR_ATTN_KV_B      ||
+                tn_tensor == LLM_TENSOR_ATTN_K_B       ||
+                tn_tensor == LLM_TENSOR_ATTN_V_B       ||
+                tn_tensor == LLM_TENSOR_ATTN_Q_A_NORM  ||
+                tn_tensor == LLM_TENSOR_ATTN_KV_A_NORM ||
+                tn_tensor == LLM_TENSOR_ATTN_SUB_NORM;
+
+            const bool is_attn_out_tensor =
+                tn_tensor == LLM_TENSOR_ATTN_OUT      ||
+                tn_tensor == LLM_TENSOR_ATTN_OUT_NORM ||
+                tn_tensor == LLM_TENSOR_ATTN_GATE;
+
+            const bool needs_opencl_stage_buft =
+                (hetero_cpu_opencl_ffn_opencl_weights && is_ffn_tensor) ||
+                (hetero_cpu_opencl_attn_proj_opencl_weights && is_attn_proj_tensor) ||
+                (hetero_cpu_opencl_attn_out_opencl_weights && is_attn_out_tensor);
+
+            if (needs_opencl_stage_buft) {
+                ggml_backend_dev_t selected_dev = ggml_backend_buft_get_device(buft);
+                const char * selected_dev_name = selected_dev ? ggml_backend_dev_name(selected_dev) : nullptr;
+                const bool selected_is_opencl =
+                    selected_dev_name != nullptr && std::strcmp(selected_dev_name, "GPUOpenCL") == 0;
+
+                if (!selected_is_opencl) {
+                    ggml_backend_buffer_type_t opencl_buft = select_weight_device_buft(hparams, t_meta, op, "GPUOpenCL", true);
+                    if (opencl_buft == nullptr) {
+                        opencl_buft = select_weight_device_buft(hparams, t_meta, op, "GPUOpenCL", false);
+                    }
+
+                    if (opencl_buft != nullptr) {
+                        LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) remapped from %s to %s for OpenCL stage residency\n",
+                                tensor_name.c_str(),
+                                ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
+                                ggml_backend_buft_name(buft),
+                                ggml_backend_buft_name(opencl_buft));
+                        buft = opencl_buft;
+                    } else if (!ggml_backend_buft_is_host(buft)) {
+                        ggml_backend_buffer_type_t host_buft = select_weight_host_buft(hparams, t_meta, op, buft_list_cpu);
+                        if (!host_buft) {
+                            throw std::runtime_error(format("failed to find an OpenCL-capable or host-readable buffer type for hetero tensor %s", tensor_name.c_str()));
+                        }
+
+                        LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) remapped from %s to %s for OpenCL stage fallback portability\n",
+                                tensor_name.c_str(),
+                                ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
+                                ggml_backend_buft_name(buft),
+                                ggml_backend_buft_name(host_buft));
+                        buft = host_buft;
+                    }
+                }
+            }
+        }
+
         // avoid using a host buffer when using mmap
         auto * buft_dev = ggml_backend_buft_get_device(buft);
-        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+        const bool preserve_opencl_host_buft_for_hetero =
+            hetero_cpu_opencl_mixed &&
+            buft_dev != nullptr &&
+            std::strcmp(ggml_backend_dev_name(buft_dev), "GPUOpenCL") == 0 &&
+            buft == ggml_backend_dev_host_buffer_type(buft_dev);
+
+        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev) && !preserve_opencl_host_buft_for_hetero) {
             auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
             if (!cpu_dev) {
                 throw std::runtime_error("no CPU backend found");
