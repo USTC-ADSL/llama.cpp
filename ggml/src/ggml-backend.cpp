@@ -22,6 +22,8 @@
 #include <string.h>
 #include <algorithm>
 #include <atomic>
+#include <mutex>
+#include <string>
 #include <vector>
 
 #ifdef __APPLE__
@@ -48,6 +50,33 @@ static bool ggml_backend_hetero_profile_enabled(void) {
     return enabled != 0;
 }
 
+static bool ggml_backend_hetero_profile_sync_splits(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * env = getenv("GGML_HETERO_PROFILE_SYNC");
+        enabled = (env != NULL && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
+static bool ggml_backend_hetero_profile_log_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * env = getenv("GGML_HETERO_PROFILE_LOG");
+        enabled = (env != NULL && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
+static bool ggml_backend_hetero_profile_flush_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * env = getenv("GGML_HETERO_PROFILE_FLUSH");
+        enabled = (env != NULL && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
 static bool ggml_backend_hetero_trace_share_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
@@ -57,27 +86,65 @@ static bool ggml_backend_hetero_trace_share_enabled(void) {
     return enabled != 0;
 }
 
-static FILE * ggml_backend_hetero_profile_file(void) {
-    static FILE * file = NULL;
+struct ggml_backend_hetero_profile_state {
+    std::mutex mutex;
+    std::string path;
+    std::vector<std::string> rows;
+};
+
+static ggml_backend_hetero_profile_state & ggml_backend_hetero_profile_state_get(void) {
+    static ggml_backend_hetero_profile_state state;
     static bool initialized = false;
 
     if (!initialized) {
-        initialized = true;
         const char * path = getenv("GGML_HETERO_PROFILE_CSV");
         if (path != NULL && path[0] != '\0') {
-            file = fopen(path, "a+");
-            if (file != NULL) {
-                if (fseek(file, 0, SEEK_END) == 0 && ftell(file) == 0) {
-                    fprintf(file, "kind,split_id,backend,src_backend,dst_backend,tensor,nbytes,latency_us,input_count,input_bytes,node_start,node_end,node_first,node_last\n");
-                    fflush(file);
-                }
-            } else {
-                GGML_LOG_WARN("%s: failed to open hetero profile csv %s\n", __func__, path);
-            }
+            state.path = path;
         }
+        initialized = true;
     }
 
-    return file;
+    return state;
+}
+
+static void ggml_backend_hetero_profile_flush(void) {
+    auto & state = ggml_backend_hetero_profile_state_get();
+    std::lock_guard<std::mutex> guard(state.mutex);
+
+    if (state.path.empty() || state.rows.empty()) {
+        return;
+    }
+
+    FILE * file = fopen(state.path.c_str(), "a+");
+    if (file == NULL) {
+        GGML_LOG_WARN("%s: failed to open hetero profile csv %s\n", __func__, state.path.c_str());
+        return;
+    }
+
+    setvbuf(file, NULL, _IOFBF, 1 << 20);
+    if (fseek(file, 0, SEEK_END) == 0 && ftell(file) == 0) {
+        fprintf(file, "kind,split_id,backend,src_backend,dst_backend,tensor,nbytes,latency_us,input_count,input_bytes,node_start,node_end,node_first,node_last\n");
+    }
+
+    for (const std::string & row : state.rows) {
+        fputs(row.c_str(), file);
+    }
+
+    fflush(file);
+    fclose(file);
+    state.rows.clear();
+}
+
+static void ggml_backend_hetero_profile_flush_atexit(void) {
+    ggml_backend_hetero_profile_flush();
+}
+
+static void ggml_backend_hetero_profile_ensure_atexit(void) {
+    static bool registered = false;
+    if (!registered) {
+        atexit(ggml_backend_hetero_profile_flush_atexit);
+        registered = true;
+    }
 }
 
 static void ggml_backend_hetero_profile_record(
@@ -106,14 +173,27 @@ static void ggml_backend_hetero_profile_record(
     const char * first_node = first_node_name != NULL ? first_node_name : "";
     const char * last_node = last_node_name != NULL ? last_node_name : "";
 
-    GGML_LOG_INFO("ggml_hetero_profile: kind=%s split=%d backend=%s src=%s dst=%s tensor=%s nbytes=%zu latency_us=%lld inputs=%d input_bytes=%zu nodes=%d-%d first=%s last=%s\n",
-            kind, split_id, backend, src_backend, dst_backend, tensor, nbytes, (long long) latency_us, input_count, input_bytes, i_start, i_end, first_node, last_node);
-
-    FILE * file = ggml_backend_hetero_profile_file();
-    if (file != NULL) {
-        fprintf(file, "%s,%d,%s,%s,%s,%s,%zu,%lld,%d,%zu,%d,%d,%s,%s\n",
+    if (ggml_backend_hetero_profile_log_enabled()) {
+        GGML_LOG_INFO("ggml_hetero_profile: kind=%s split=%d backend=%s src=%s dst=%s tensor=%s nbytes=%zu latency_us=%lld inputs=%d input_bytes=%zu nodes=%d-%d first=%s last=%s\n",
                 kind, split_id, backend, src_backend, dst_backend, tensor, nbytes, (long long) latency_us, input_count, input_bytes, i_start, i_end, first_node, last_node);
-        fflush(file);
+    }
+
+    auto & state = ggml_backend_hetero_profile_state_get();
+    if (!state.path.empty()) {
+        char row[1024];
+        snprintf(row, sizeof(row), "%s,%d,%s,%s,%s,%s,%zu,%lld,%d,%zu,%d,%d,%s,%s\n",
+                kind, split_id, backend, src_backend, dst_backend, tensor, nbytes, (long long) latency_us, input_count, input_bytes, i_start, i_end, first_node, last_node);
+
+        ggml_backend_hetero_profile_ensure_atexit();
+
+        {
+            std::lock_guard<std::mutex> guard(state.mutex);
+            state.rows.emplace_back(row);
+        }
+
+        if (ggml_backend_hetero_profile_flush_enabled()) {
+            ggml_backend_hetero_profile_flush();
+        }
     }
 }
 
@@ -1568,6 +1648,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
     const bool hetero_profile = ggml_backend_hetero_profile_enabled();
+    const bool hetero_profile_sync_splits = hetero_profile && ggml_backend_hetero_profile_sync_splits();
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
@@ -1777,6 +1858,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 return ec;
             }
             if (hetero_profile) {
+                const int64_t split_enqueue_us = ggml_time_us() - split_start_us;
+                ggml_backend_hetero_profile_record(
+                        "split_enqueue",
+                        split_id,
+                        split_backend_name,
+                        NULL,
+                        NULL,
+                        NULL,
+                        0,
+                        split_enqueue_us,
+                        split->n_inputs,
+                        split_input_bytes,
+                        split->i_start,
+                        split->i_end,
+                        split_first_name,
+                        split_last_name);
+            }
+            if (hetero_profile_sync_splits) {
                 ggml_backend_synchronize(split_backend);
                 ggml_backend_hetero_profile_record(
                         "split_compute",
