@@ -265,3 +265,17 @@ static inline bool llama_hetero_route_has_cpu_opencl_mix(const llama_hetero_rout
 
     return has_cpu && has_opencl;
 }
+
+static inline bool llama_hetero_route_has_cpu_opencl_attn_kv_boundary(const llama_hetero_route_spec & spec) {
+    const int attn_proj_kind = llama_hetero_backend_kind(spec.backend_for(llama_hetero_route_stage::ATTN_PROJ));
+    const int attn_core_kind = llama_hetero_backend_kind(spec.backend_for(llama_hetero_route_stage::ATTN_CORE));
+
+    if (attn_proj_kind == 0 || attn_core_kind == 0 || attn_proj_kind == attn_core_kind) {
+        return false;
+    }
+
+    const bool proj_cpu_core_opencl = attn_proj_kind == 1 && attn_core_kind == 2;
+    const bool proj_opencl_core_cpu = attn_proj_kind == 2 && attn_core_kind == 1;
+
+    return proj_cpu_core_opencl || proj_opencl_core_cpu;
+}
