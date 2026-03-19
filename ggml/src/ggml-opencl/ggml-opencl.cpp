@@ -822,6 +822,10 @@ struct ggml_backend_opencl_context {
     }
 };
 
+struct ggml_backend_opencl_event_context {
+    cl_event event = nullptr;
+};
+
 // All registered devices with a default device in the front.
 static std::vector<ggml_backend_device> g_ggml_backend_opencl_devices;
 
@@ -3541,6 +3545,34 @@ static bool ggml_backend_opencl_cpy_tensor_async(ggml_backend_t backend_src, ggm
     return true;
 }
 
+static void ggml_backend_opencl_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+    GGML_ASSERT(event != nullptr);
+
+    auto * backend_ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
+    auto * event_ctx   = static_cast<ggml_backend_opencl_event_context *>(event->context);
+
+    if (event_ctx->event != nullptr) {
+        CL_CHECK(clReleaseEvent(event_ctx->event));
+        event_ctx->event = nullptr;
+    }
+
+    CL_CHECK(clEnqueueMarkerWithWaitList(backend_ctx->queue, 0, nullptr, &event_ctx->event));
+    CL_CHECK(clFlush(backend_ctx->queue));
+}
+
+static void ggml_backend_opencl_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+    GGML_ASSERT(event != nullptr);
+
+    auto * backend_ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
+    auto * event_ctx   = static_cast<ggml_backend_opencl_event_context *>(event->context);
+
+    if (event_ctx->event == nullptr) {
+        return;
+    }
+
+    CL_CHECK(clEnqueueBarrierWithWaitList(backend_ctx->queue, 1, &event_ctx->event, nullptr));
+}
+
 static void ggml_backend_opencl_synchronize(ggml_backend_t backend) {
     auto * backend_ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
 
@@ -3996,8 +4028,8 @@ static ggml_backend_i ggml_backend_opencl_i = {
     /* .graph_plan_update       = */ NULL,
     /* .graph_plan_compute      = */ NULL,
     /* .graph_compute           = */ ggml_backend_opencl_graph_compute,
-    /* .event_record            = */ NULL,
-    /* .event_wait              = */ NULL,
+    /* .event_record            = */ ggml_backend_opencl_event_record,
+    /* .event_wait              = */ ggml_backend_opencl_event_wait,
     /* .graph_optimize          = */ NULL,
 };
 
@@ -5754,6 +5786,47 @@ static bool ggml_backend_opencl_device_supports_buft(ggml_backend_dev_t dev, ggm
     return backend_ctx0->context == backend_ctx1->context;
 }
 
+static ggml_backend_event_t ggml_backend_opencl_device_event_new(ggml_backend_dev_t dev) {
+    return new ggml_backend_event {
+        /* .device  = */ dev,
+        /* .context = */ new ggml_backend_opencl_event_context(),
+    };
+}
+
+static void ggml_backend_opencl_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    GGML_UNUSED(dev);
+
+    if (event == nullptr) {
+        return;
+    }
+
+    auto * event_ctx = static_cast<ggml_backend_opencl_event_context *>(event->context);
+    if (event_ctx != nullptr) {
+        if (event_ctx->event != nullptr) {
+            CL_CHECK(clReleaseEvent(event_ctx->event));
+            event_ctx->event = nullptr;
+        }
+        delete event_ctx;
+    }
+
+    delete event;
+}
+
+static void ggml_backend_opencl_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    GGML_UNUSED(dev);
+
+    if (event == nullptr) {
+        return;
+    }
+
+    auto * event_ctx = static_cast<ggml_backend_opencl_event_context *>(event->context);
+    if (event_ctx == nullptr || event_ctx->event == nullptr) {
+        return;
+    }
+
+    CL_CHECK(clWaitForEvents(1, &event_ctx->event));
+}
+
 namespace /* anonymous */ {
 struct ggml_backend_device_i ggml_backend_opencl_device_i = {
     /* .get_name             = */ ggml_backend_opencl_device_get_name,
@@ -5768,9 +5841,9 @@ struct ggml_backend_device_i ggml_backend_opencl_device_i = {
     /* .supports_op          = */ ggml_backend_opencl_device_supports_op,
     /* .supports_buft        = */ ggml_backend_opencl_device_supports_buft,
     /* .offload_op           = */ NULL,
-    /* .event_new            = */ NULL,
-    /* .event_free           = */ NULL,
-    /* .event_synchronize    = */ NULL,
+    /* .event_new            = */ ggml_backend_opencl_device_event_new,
+    /* .event_free           = */ ggml_backend_opencl_device_event_free,
+    /* .event_synchronize    = */ ggml_backend_opencl_device_event_synchronize,
 };
 }
 

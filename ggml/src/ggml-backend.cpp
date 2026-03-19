@@ -1894,7 +1894,15 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
 
-        if (sched->n_copies > 1) {
+        const bool supports_events =
+                backends[b]->iface.event_record != NULL &&
+                backends[b]->iface.event_wait   != NULL &&
+                backends[b]->device             != NULL &&
+                backends[b]->device->iface.event_new         != NULL &&
+                backends[b]->device->iface.event_free        != NULL &&
+                backends[b]->device->iface.event_synchronize != NULL;
+
+        if (supports_events) {
             for (int c = 0; c < sched->n_copies; c++) {
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
             }
