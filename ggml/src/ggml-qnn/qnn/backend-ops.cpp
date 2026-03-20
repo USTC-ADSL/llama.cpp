@@ -38,6 +38,10 @@ bool env_flag_enabled(const char * name) {
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
+bool allow_aot_jit_fallback() {
+    return env_flag_enabled("GGML_QNN_AOT_ALLOW_JIT_FALLBACK");
+}
+
 bool normalized_backend_is_qnn(const char * value) {
     if (value == nullptr || value[0] == '\0') {
         return false;
@@ -106,7 +110,9 @@ bool is_aot_trace_name(const char * name) {
              "attn_norm-",
              "__fattn__-",
              "Qcur-",
+             "Qcur_normed-",
              "Kcur-",
+             "Kcur_normed-",
              "Vcur-",
              "attn_out-",
              "ffn_inp-",
@@ -142,7 +148,9 @@ bool is_aot_transformer_stage_name(const char * name) {
              "attn_norm-",
              "__fattn__-",
              "Qcur-",
+             "Qcur_normed-",
              "Kcur-",
+             "Kcur_normed-",
              "Vcur-",
              "attn_out-",
              "kq-",
@@ -259,12 +267,88 @@ void dump_cgraph_nodes(const ggml_cgraph * cgraph) {
 
     std::fprintf(stderr, "[aot] cgraph nodes:");
     for (int i = 0; i < cgraph->n_nodes; ++i) {
-        const char * name = ggml_get_name(cgraph->nodes[i]);
-        std::fprintf(stderr, "%s%s", i == 0 ? " " : " -> ", name ? name : "<null>");
+        const ggml_tensor * node = cgraph->nodes[i];
+        const char *        name = ggml_get_name(node);
+
+        std::fprintf(stderr,
+                     "%s%s{%s",
+                     i == 0 ? " " : " -> ",
+                     name ? name : "<null>",
+                     ggml_op_name(node->op));
+
+        bool printed_src = false;
+        for (size_t j = 0; j < GGML_MAX_SRC && node->src[j]; ++j) {
+            const char * src_name = ggml_get_name(node->src[j]);
+            std::fprintf(stderr,
+                         "%s%s",
+                         printed_src ? "," : " src=",
+                         src_name ? src_name : "<null>");
+            printed_src = true;
+        }
+
+        std::fprintf(stderr, "}");
     }
     std::fprintf(stderr, "\n");
 }
 
+bool should_cpu_fallback_unmatched_aot_cgraph(const ggml_cgraph * cgraph) {
+    // workflow2 can currently expose cross-boundary decode residuals that are still
+    // much smaller than a full transformer graph, but larger than the old 16-node
+    // heuristic. Keep the stopgap bounded while allowing these fragments to run.
+    constexpr int kResidualCpuFallbackMaxNodes = 64;
+
+    if (cgraph == nullptr || cgraph->n_nodes <= 0 || cgraph->n_nodes > kResidualCpuFallbackMaxNodes) {
+        return false;
+    }
+
+    bool seen_stage         = false;
+    bool seen_embd          = false;
+    bool seen_result_output = false;
+    bool all_tiny_tail_ops  = true;
+
+    auto note_name = [&](const char * name) {
+        seen_stage = seen_stage || is_aot_transformer_stage_name(name) || is_aot_lm_head_stage_name(name);
+        seen_embd = seen_embd || (name != nullptr && std::strcmp(name, "embd") == 0);
+        seen_result_output = seen_result_output || (name != nullptr && std::strcmp(name, "result_output") == 0);
+    };
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        note_name(ggml_get_name(node));
+
+        // workflow2 may leave scheduler-generated nodes unnamed even when their inputs are
+        // still clearly attached to transformer-stage outputs (for example kqv_out-*).
+        // Use source names as additional evidence that this tiny residual belongs on the
+        // CPU fallback path rather than dropping into the QNN JIT path.
+        for (size_t j = 0; j < GGML_MAX_SRC && node->src[j]; ++j) {
+            note_name(ggml_get_name(node->src[j]));
+        }
+
+        switch (node->op) {
+            case GGML_OP_GET_ROWS:
+            case GGML_OP_GET_ROWS_BACK:
+            case GGML_OP_VIEW:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_CONT:
+            case GGML_OP_CPY:
+            case GGML_OP_MUL_MAT:
+                break;
+            default:
+                all_tiny_tail_ops = false;
+                break;
+        }
+    }
+
+    // workflow2 keeps more residual nodes explicitly named (for example cache_k/cache_v/Qcur views),
+    // so the older "must contain anonymous scheduler nodes" heuristic is no longer reliable.
+    // Treat any small unmatched decode residual as CPU-fallback eligible to preserve runnability.
+    if ((seen_stage || seen_result_output) && !seen_embd) {
+        return true;
+    }
+
+    return !seen_embd && cgraph->n_nodes <= 4 && all_tiny_tail_ops;
+}
 qnn::qnn_graph * get_qnn_graph_from_cache(qnn::ggml_backend_qnn_device_context * ctx, const ggml_cgraph * cgraph) {
     auto &      graph_cache = ctx->qnn_graph_cache;
     std::string graph_key;
@@ -781,8 +865,24 @@ bool device_compute_graph(qnn::ggml_backend_qnn_device_context * ctx, ggml_cgrap
                      first_name ? first_name : "<null>",
                      last_name ? last_name : "<null>");
 
-        const char * allow_jit = std::getenv("GGML_QNN_AOT_ALLOW_JIT_FALLBACK");
-        if (allow_jit == nullptr || allow_jit[0] == '\0' || std::strcmp(allow_jit, "0") == 0) {
+        if (!allow_aot_jit_fallback() &&
+            should_cpu_fallback_unmatched_aot_cgraph(cgraph) &&
+            ctx->cpu_fallback_backend != nullptr) {
+            std::fprintf(stderr, "[aot] cpu fallback for unmatched residual cgraph: n_nodes=%d first=%s last=%s\n",
+                         cgraph->n_nodes,
+                         first_name ? first_name : "<null>",
+                         last_name ? last_name : "<null>");
+
+            const ggml_status cpu_status = ggml_backend_graph_compute(ctx->cpu_fallback_backend, cgraph);
+            if (cpu_status == GGML_STATUS_SUCCESS) {
+                return true;
+            }
+
+            std::fprintf(stderr, "[aot] cpu fallback failed: %s\n", ggml_status_to_string(cpu_status));
+            return false;
+        }
+
+        if (!allow_aot_jit_fallback()) {
             std::fprintf(stderr, "[aot] rejecting unmatched cgraph before JIT fallback\n");
             return false;
         }

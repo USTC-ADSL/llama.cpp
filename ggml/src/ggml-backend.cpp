@@ -2188,6 +2188,17 @@ void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct gg
     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
     const size_t node_id = hash_id(node);
     tensor_backend_id(node) = backend_index;
+    sched->hv_tensor_backend_pinned[node_id] = false;
+    SET_CAUSE(node, "usr");
+    sched->is_reset = false;
+}
+
+void ggml_backend_sched_set_tensor_backend_pinned(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {
+    GGML_ASSERT(sched);
+    int backend_index = ggml_backend_sched_backend_id(sched, backend);
+    GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
+    const size_t node_id = hash_id(node);
+    tensor_backend_id(node) = backend_index;
     sched->hv_tensor_backend_pinned[node_id] = true;
     SET_CAUSE(node, "usr");
     sched->is_reset = false;
