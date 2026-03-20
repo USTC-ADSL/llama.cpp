@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <string>
@@ -54,6 +55,7 @@ struct qnn_aot_config {
     size_t               n_hvx_threads = 4;
 
     std::vector<qnn_aot_graph_config> transformer_graphs;
+    std::vector<qnn_aot_graph_config> ffn_graphs;
     std::vector<qnn_aot_graph_config> lm_head_graphs;
 
     bool load(const std::string & config_path);
@@ -131,6 +133,9 @@ class qnn_aot_runtime {
     const std::string & config_path() const { return _config_path; }
 
   private:
+    using graph_bucket = std::vector<std::unique_ptr<qnn_aot_graph>>;
+    using graph_family = std::map<size_t, graph_bucket>;
+
     struct rope_embedding {
         std::vector<float> cos_values;
         std::vector<float> sin_values;
@@ -138,26 +143,35 @@ class qnn_aot_runtime {
 
     struct aot_match_result {
         ggml_tensor * embd = nullptr;
+        ggml_tensor * aux  = nullptr;
         ggml_tensor * out  = nullptr;
         size_t        n_tokens = 0;
         size_t        inferred_pos = 0;
+        size_t        layer_id = std::numeric_limits<size_t>::max();
         bool          is_transformer = false;
+        bool          is_ffn         = false;
         bool          is_lm_head     = false;
     };
 
     static bool has_prefix(const char * name, const char * prefix);
     static bool is_transformer_stage_name(const char * name);
+    static bool is_ffn_stage_name(const char * name);
     static bool is_cpu_stage_name(const char * name);
     static bool is_lm_head_stage_name(const char * name);
     static bool is_embedding_lookup(const ggml_tensor * op);
+    static size_t parse_layer_id_from_name(const char * name);
     bool is_transformer_output_candidate(const ggml_tensor * tensor) const;
 
     aot_match_result match_transformer_graph(ggml_cgraph * cgraph) const;
+    aot_match_result match_ffn_graph(ggml_cgraph * cgraph) const;
     aot_match_result match_lm_head_graph(ggml_cgraph * cgraph) const;
     bool execute_transformer(ggml_cgraph * cgraph, const aot_match_result & match);
+    bool execute_ffn(ggml_cgraph * cgraph, const aot_match_result & match);
     bool execute_lm_head(ggml_cgraph * cgraph, const aot_match_result & match);
     qnn_aot_graph * select_transformer_graph(size_t n_tokens) const;
+    qnn_aot_graph * select_ffn_graph(size_t n_tokens, size_t layer_id) const;
     qnn_aot_graph * select_lm_head_graph(size_t n_tokens) const;
+    qnn_aot_graph * select_graph(const graph_family & family, size_t n_tokens, size_t layer_id) const;
 
     void compute_rope_embeds();
     void fill_rope_embeds(qnn_aot_graph & graph, size_t start_pos, size_t n_tokens);
@@ -179,8 +193,9 @@ class qnn_aot_runtime {
 
     qnn_aot_config _config;
     std::vector<rope_embedding> _rope_embeds;
-    std::map<size_t, std::unique_ptr<qnn_aot_graph>> _transformer_graphs;
-    std::map<size_t, std::unique_ptr<qnn_aot_graph>> _lm_head_graphs;
+    graph_family _transformer_graphs;
+    graph_family _ffn_graphs;
+    graph_family _lm_head_graphs;
     std::unordered_map<std::string, std::shared_ptr<qnn_aot_context>> _contexts;
 
     size_t _kv_position = 0;
