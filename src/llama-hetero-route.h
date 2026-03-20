@@ -17,6 +17,24 @@ enum class llama_hetero_route_stage {
     OUTPUT,
 };
 
+enum class llama_hetero_kv_layout_kind {
+    LEGACY,
+    STAGE_SHARED,
+};
+
+enum class llama_hetero_kv_transfer_mode {
+    NONE,
+    CPU_OPENCL_ZERO_COPY,
+    QNN_RPCMEM,
+};
+
+enum class llama_hetero_kv_contract_policy {
+    AUTO,
+    LEGACY,
+    CPU_OPENCL_SHARED,
+    QNN_RPCMEM,
+};
+
 struct llama_hetero_route_spec {
     std::string attn;
     std::string attn_proj;
@@ -57,6 +75,44 @@ struct llama_hetero_route_spec {
         }
 
         return {};
+    }
+};
+
+struct llama_hetero_kv_contract {
+    llama_hetero_route_stage producer_stage = llama_hetero_route_stage::ATTN_PROJ;
+    llama_hetero_route_stage consumer_stage = llama_hetero_route_stage::ATTN_CORE;
+
+    std::string producer_backend;
+    std::string consumer_backend;
+    std::string storage_backend;
+
+    llama_hetero_kv_layout_kind   layout   = llama_hetero_kv_layout_kind::LEGACY;
+    llama_hetero_kv_transfer_mode transfer = llama_hetero_kv_transfer_mode::NONE;
+
+    bool shared_buffer_required = false;
+    bool implemented           = true;
+    bool buffer_available      = true;
+    bool zero_copy             = false;
+
+    std::string reason;
+
+    bool stage_boundary_active() const {
+        return !producer_backend.empty() &&
+               !consumer_backend.empty() &&
+               producer_backend != consumer_backend;
+    }
+
+    bool is_split_safe() const {
+        return !stage_boundary_active() || (!shared_buffer_required && implemented) || (implemented && buffer_available && zero_copy);
+    }
+};
+
+struct llama_hetero_execution_plan {
+    llama_hetero_route_spec route;
+    llama_hetero_kv_contract attn_kv;
+
+    bool has_any_route() const {
+        return route.has_any_route();
     }
 };
 
@@ -119,6 +175,89 @@ static inline int llama_hetero_backend_kind(const std::string & value) {
         return 2;
     }
     return 3;
+}
+
+static inline bool llama_hetero_is_cpu_backend(const std::string & value) {
+    return llama_hetero_canonical_backend(value) == "cpu";
+}
+
+static inline bool llama_hetero_is_opencl_backend(const std::string & value) {
+    return llama_hetero_canonical_backend(value) == "opencl";
+}
+
+static inline bool llama_hetero_is_qnn_backend(const std::string & value) {
+    const std::string normalized = llama_hetero_canonical_backend(value);
+    return normalized == "qnn-npu" ||
+           normalized == "qnn-gpu" ||
+           normalized == "qnn-cpu";
+}
+
+static inline const char * llama_hetero_kv_layout_name(llama_hetero_kv_layout_kind layout) {
+    switch (layout) {
+        case llama_hetero_kv_layout_kind::LEGACY:
+            return "legacy";
+        case llama_hetero_kv_layout_kind::STAGE_SHARED:
+            return "stage-shared";
+    }
+
+    return "unknown";
+}
+
+static inline const char * llama_hetero_kv_transfer_mode_name(llama_hetero_kv_transfer_mode transfer) {
+    switch (transfer) {
+        case llama_hetero_kv_transfer_mode::NONE:
+            return "none";
+        case llama_hetero_kv_transfer_mode::CPU_OPENCL_ZERO_COPY:
+            return "cpu-opencl-zero-copy";
+        case llama_hetero_kv_transfer_mode::QNN_RPCMEM:
+            return "qnn-rpcmem";
+    }
+
+    return "unknown";
+}
+
+static inline const char * llama_hetero_kv_contract_env_value() {
+    const char * value = std::getenv("GGML_HETERO_KV_LAYOUT");
+    if (value != nullptr && value[0] != '\0') {
+        return value;
+    }
+
+    value = std::getenv("GGML_HETERO_KV_CONTRACT");
+    if (value != nullptr && value[0] != '\0') {
+        return value;
+    }
+
+    return nullptr;
+}
+
+static inline llama_hetero_kv_contract_policy llama_hetero_parse_kv_contract_policy(const char * value) {
+    if (value == nullptr) {
+        return llama_hetero_kv_contract_policy::AUTO;
+    }
+
+    const std::string normalized = llama_hetero_to_lower(llama_hetero_trim(value));
+    if (normalized.empty() || normalized == "auto") {
+        return llama_hetero_kv_contract_policy::AUTO;
+    }
+    if (normalized == "legacy" || normalized == "off" || normalized == "disabled") {
+        return llama_hetero_kv_contract_policy::LEGACY;
+    }
+    if (normalized == "share" ||
+        normalized == "shared" ||
+        normalized == "stage-shared" ||
+        normalized == "cpu-opencl" ||
+        normalized == "cpu-opencl-zero-copy") {
+        return llama_hetero_kv_contract_policy::CPU_OPENCL_SHARED;
+    }
+    if (normalized == "qnn" || normalized == "qnn-rpcmem") {
+        return llama_hetero_kv_contract_policy::QNN_RPCMEM;
+    }
+
+    return llama_hetero_kv_contract_policy::AUTO;
+}
+
+static inline llama_hetero_kv_contract_policy llama_hetero_parse_kv_contract_policy_from_env() {
+    return llama_hetero_parse_kv_contract_policy(llama_hetero_kv_contract_env_value());
 }
 
 static inline bool llama_hetero_name_has_prefix(const char * value, const char * prefix) {
@@ -186,6 +325,42 @@ static inline void llama_hetero_set_route_field(llama_hetero_route_spec & spec, 
     }
 }
 
+static inline std::string llama_hetero_format_route_spec(const llama_hetero_route_spec & spec) {
+    std::string result;
+
+    const auto append = [&](const char * key, const std::string & value) {
+        if (value.empty()) {
+            return;
+        }
+
+        if (!result.empty()) {
+            result += ",";
+        }
+
+        result += key;
+        result += "=";
+        result += value;
+    };
+
+    append("attn",      spec.attn);
+    append("attn_proj", spec.attn_proj);
+    append("attn_core", spec.attn_core);
+    append("attn_out",  spec.attn_out);
+    append("ffn",       spec.ffn);
+    append("output",    spec.output);
+
+    return result;
+}
+
+static inline bool llama_hetero_route_spec_equals(const llama_hetero_route_spec & lhs, const llama_hetero_route_spec & rhs) {
+    return lhs.attn      == rhs.attn &&
+           lhs.attn_proj == rhs.attn_proj &&
+           lhs.attn_core == rhs.attn_core &&
+           lhs.attn_out  == rhs.attn_out &&
+           lhs.ffn       == rhs.ffn &&
+           lhs.output    == rhs.output;
+}
+
 static inline const char * llama_hetero_route_env_value() {
     const char * value = std::getenv("GGML_HETERO_STAGE_ROUTE");
     if (value != nullptr && value[0] != '\0') {
@@ -200,12 +375,11 @@ static inline const char * llama_hetero_route_env_value() {
     return nullptr;
 }
 
-static inline llama_hetero_route_spec llama_hetero_parse_route_spec_from_env() {
+static inline llama_hetero_route_spec llama_hetero_parse_route_spec(const char * route_value) {
     llama_hetero_route_spec spec;
 
-    const char * route_env = llama_hetero_route_env_value();
-    if (route_env != nullptr) {
-        std::string route(route_env);
+    if (route_value != nullptr && route_value[0] != '\0') {
+        std::string route(route_value);
         size_t begin = 0;
 
         while (begin < route.size()) {
@@ -233,12 +407,20 @@ static inline llama_hetero_route_spec llama_hetero_parse_route_spec_from_env() {
             begin = end + 1;
         }
 
-        return spec;
     }
 
+    return spec;
+}
+
+static inline llama_hetero_route_spec llama_hetero_parse_route_spec_from_env() {
+    const char * route_env = llama_hetero_route_env_value();
+    if (route_env != nullptr) {
+        return llama_hetero_parse_route_spec(route_env);
+    }
+
+    llama_hetero_route_spec spec;
     spec.attn = llama_hetero_canonical_backend(std::getenv("GGML_HETERO_ATTN_BACKEND") ? std::getenv("GGML_HETERO_ATTN_BACKEND") : "");
     spec.ffn  = llama_hetero_canonical_backend(std::getenv("GGML_HETERO_FFN_BACKEND")  ? std::getenv("GGML_HETERO_FFN_BACKEND")  : "");
-
     return spec;
 }
 
@@ -278,4 +460,153 @@ static inline bool llama_hetero_route_has_cpu_opencl_attn_kv_boundary(const llam
     const bool proj_opencl_core_cpu = attn_proj_kind == 2 && attn_core_kind == 1;
 
     return proj_cpu_core_opencl || proj_opencl_core_cpu;
+}
+
+static inline llama_hetero_kv_contract llama_hetero_build_attn_kv_contract(
+        const llama_hetero_route_spec & spec,
+        llama_hetero_kv_contract_policy policy) {
+    llama_hetero_kv_contract contract;
+    contract.producer_backend = spec.backend_for(llama_hetero_route_stage::ATTN_PROJ);
+    contract.consumer_backend = spec.backend_for(llama_hetero_route_stage::ATTN_CORE);
+
+    if (!contract.stage_boundary_active()) {
+        contract.reason = "same-backend";
+        return contract;
+    }
+
+    const bool cpu_opencl_boundary = llama_hetero_route_has_cpu_opencl_attn_kv_boundary(spec);
+    const bool qnn_boundary = llama_hetero_is_qnn_backend(contract.producer_backend) ||
+                              llama_hetero_is_qnn_backend(contract.consumer_backend);
+
+    if (policy == llama_hetero_kv_contract_policy::LEGACY) {
+        contract.reason = "forced-legacy";
+        return contract;
+    }
+
+    if ((policy == llama_hetero_kv_contract_policy::AUTO && cpu_opencl_boundary) ||
+        (policy == llama_hetero_kv_contract_policy::CPU_OPENCL_SHARED && cpu_opencl_boundary)) {
+        contract.layout = llama_hetero_kv_layout_kind::STAGE_SHARED;
+        contract.transfer = llama_hetero_kv_transfer_mode::CPU_OPENCL_ZERO_COPY;
+        contract.storage_backend = "opencl-host";
+        contract.shared_buffer_required = true;
+        contract.implemented = true;
+        contract.buffer_available = false;
+        contract.zero_copy = false;
+        contract.reason = "cpu-opencl-stage-shared";
+        return contract;
+    }
+
+    if ((policy == llama_hetero_kv_contract_policy::AUTO && qnn_boundary) ||
+        policy == llama_hetero_kv_contract_policy::QNN_RPCMEM) {
+        contract.layout = llama_hetero_kv_layout_kind::STAGE_SHARED;
+        contract.transfer = llama_hetero_kv_transfer_mode::QNN_RPCMEM;
+        contract.storage_backend = "qnn-rpcmem";
+        contract.shared_buffer_required = true;
+        contract.implemented = false;
+        contract.buffer_available = false;
+        contract.zero_copy = false;
+        contract.reason = "qnn-stage-shared-reserved";
+        return contract;
+    }
+
+    if (policy == llama_hetero_kv_contract_policy::CPU_OPENCL_SHARED) {
+        contract.layout = llama_hetero_kv_layout_kind::STAGE_SHARED;
+        contract.transfer = llama_hetero_kv_transfer_mode::CPU_OPENCL_ZERO_COPY;
+        contract.storage_backend = "opencl-host";
+        contract.shared_buffer_required = true;
+        contract.implemented = false;
+        contract.buffer_available = false;
+        contract.zero_copy = false;
+        contract.reason = "requested-cpu-opencl-shared-on-unsupported-boundary";
+        return contract;
+    }
+
+    contract.reason = "legacy-copy-boundary";
+    return contract;
+}
+
+static inline llama_hetero_kv_contract llama_hetero_build_attn_kv_contract(const llama_hetero_route_spec & spec) {
+    return llama_hetero_build_attn_kv_contract(spec, llama_hetero_parse_kv_contract_policy_from_env());
+}
+
+static inline llama_hetero_kv_contract llama_hetero_finalize_kv_contract(
+        llama_hetero_kv_contract contract,
+        bool cpu_opencl_host_buffer_available) {
+    switch (contract.transfer) {
+        case llama_hetero_kv_transfer_mode::NONE:
+            contract.buffer_available = true;
+            contract.zero_copy = false;
+            return contract;
+        case llama_hetero_kv_transfer_mode::CPU_OPENCL_ZERO_COPY:
+            contract.buffer_available = cpu_opencl_host_buffer_available;
+            contract.zero_copy = contract.implemented && contract.buffer_available;
+            if (!contract.buffer_available && contract.reason == "cpu-opencl-stage-shared") {
+                contract.reason = "opencl-host-buffer-unavailable";
+            }
+            return contract;
+        case llama_hetero_kv_transfer_mode::QNN_RPCMEM:
+            contract.buffer_available = false;
+            contract.zero_copy = false;
+            return contract;
+    }
+
+    return contract;
+}
+
+static inline bool llama_hetero_kv_contract_needs_shared_buft(const llama_hetero_kv_contract & contract) {
+    return contract.shared_buffer_required && contract.implemented && contract.buffer_available && contract.zero_copy;
+}
+
+static inline bool llama_hetero_kv_contract_can_satisfy(
+        const llama_hetero_kv_contract & allocated,
+        const llama_hetero_kv_contract & requested) {
+    if (!requested.stage_boundary_active() || requested.transfer == llama_hetero_kv_transfer_mode::NONE) {
+        return true;
+    }
+
+    if (!allocated.implemented || !allocated.buffer_available) {
+        return false;
+    }
+
+    switch (requested.transfer) {
+        case llama_hetero_kv_transfer_mode::NONE:
+            return true;
+        case llama_hetero_kv_transfer_mode::CPU_OPENCL_ZERO_COPY:
+            return allocated.transfer == llama_hetero_kv_transfer_mode::CPU_OPENCL_ZERO_COPY &&
+                   allocated.zero_copy;
+        case llama_hetero_kv_transfer_mode::QNN_RPCMEM:
+            return allocated.transfer == llama_hetero_kv_transfer_mode::QNN_RPCMEM &&
+                   allocated.zero_copy;
+    }
+
+    return false;
+}
+
+static inline bool llama_hetero_execution_plan_equals(
+        const llama_hetero_execution_plan & lhs,
+        const llama_hetero_execution_plan & rhs) {
+    return llama_hetero_route_spec_equals(lhs.route, rhs.route) &&
+           lhs.attn_kv.producer_backend       == rhs.attn_kv.producer_backend &&
+           lhs.attn_kv.consumer_backend       == rhs.attn_kv.consumer_backend &&
+           lhs.attn_kv.storage_backend        == rhs.attn_kv.storage_backend &&
+           lhs.attn_kv.layout                 == rhs.attn_kv.layout &&
+           lhs.attn_kv.transfer               == rhs.attn_kv.transfer &&
+           lhs.attn_kv.shared_buffer_required == rhs.attn_kv.shared_buffer_required &&
+           lhs.attn_kv.implemented            == rhs.attn_kv.implemented &&
+           lhs.attn_kv.buffer_available       == rhs.attn_kv.buffer_available &&
+           lhs.attn_kv.zero_copy              == rhs.attn_kv.zero_copy &&
+           lhs.attn_kv.reason                 == rhs.attn_kv.reason;
+}
+
+static inline llama_hetero_execution_plan llama_hetero_build_execution_plan(
+        const char * route_value,
+        const char * kv_layout_value) {
+    llama_hetero_execution_plan plan;
+    plan.route   = llama_hetero_parse_route_spec(route_value);
+    plan.attn_kv = llama_hetero_build_attn_kv_contract(plan.route, llama_hetero_parse_kv_contract_policy(kv_layout_value));
+    return plan;
+}
+
+static inline llama_hetero_execution_plan llama_hetero_build_execution_plan_from_env() {
+    return llama_hetero_build_execution_plan(llama_hetero_route_env_value(), llama_hetero_kv_contract_env_value());
 }

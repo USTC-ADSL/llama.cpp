@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
+#include "llama-hetero-route.h"
 #include "llama-hparams.h"
 #include "llama-memory.h"
 #include "llama-vocab.h"
@@ -527,6 +528,10 @@ struct llama_model {
     // list of devices used in this model
     std::vector<ggml_backend_dev_t> devices;
 
+    // workflow2 stage-level hetero execution plan chosen at model-load time.
+    // Tensor residency and later context routing should share this source of truth.
+    llama_hetero_execution_plan hetero_plan;
+
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 
@@ -570,6 +575,7 @@ struct llama_model {
     ggml_backend_buffer_type_t select_buft(int il) const;
 
     bool has_tensor_overrides() const;
+    const llama_hetero_execution_plan & get_hetero_plan() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 

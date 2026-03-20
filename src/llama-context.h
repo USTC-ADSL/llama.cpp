@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include "llama-cparams.h"
+#include "llama-hetero-route.h"
 #include "llama-graph.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
@@ -235,6 +236,13 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // Internal workflow2 / dynamic-stage-scheduling hook.
+    // The current implementation only updates routing plans that are compatible
+    // with the already-allocated KV contract; incompatible plans require
+    // context rebuild or future KV migration support.
+    bool set_hetero_plan(llama_hetero_execution_plan plan);
+    const llama_hetero_execution_plan & get_hetero_plan() const;
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -347,6 +355,9 @@ private:
     // Force the next graph build onto CPU only. Used for the AoT bootstrap
     // correction path after seeding QNN state with the initial token.
     bool aot_force_cpu_graph = false;
+
+    llama_hetero_execution_plan hetero_plan;
+    llama_hetero_kv_contract    hetero_kv_contract_allocated;
 
     // perf
     mutable int64_t t_start_us  = 0;

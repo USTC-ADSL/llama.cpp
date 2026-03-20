@@ -4,6 +4,7 @@
 
 #include "llama-impl.h"
 #include "llama-arch.h"
+#include "llama-hetero-route.h"
 #include "llama-hparams.h"
 #include "llama-mmap.h"
 
@@ -103,6 +104,8 @@ struct llama_model_loader {
     size_t size_data = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
 
+    llama_hetero_execution_plan hetero_plan;
+
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
         bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
@@ -130,7 +133,8 @@ struct llama_model_loader {
         bool check_tensors,
         bool no_alloc,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        llama_hetero_execution_plan hetero_plan);
 
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type

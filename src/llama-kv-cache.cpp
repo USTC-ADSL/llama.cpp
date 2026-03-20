@@ -31,10 +31,12 @@ llama_kv_cache::llama_kv_cache(
                  uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
+    const llama_hetero_kv_contract & kv_contract,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse) :
     model(model), hparams(model.hparams), v_trans(v_trans),
-    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
+    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa),
+    kv_contract(kv_contract), swa_type(swa_type) {
 
     GGML_ASSERT(kv_size % n_pad == 0);
 
@@ -99,6 +101,39 @@ llama_kv_cache::llama_kv_cache(
                 __func__, hparams.n_embd_v_gqa_max());
     }
 
+    ggml_backend_buffer_type_t shared_kv_buft = nullptr;
+    if (llama_hetero_kv_contract_needs_shared_buft(this->kv_contract)) {
+        switch (this->kv_contract.transfer) {
+            case llama_hetero_kv_transfer_mode::CPU_OPENCL_ZERO_COPY: {
+                ggml_backend_dev_t opencl_dev = ggml_backend_dev_by_name("GPUOpenCL");
+                if (opencl_dev != nullptr) {
+                    shared_kv_buft = ggml_backend_dev_host_buffer_type(opencl_dev);
+                }
+                if (shared_kv_buft != nullptr) {
+                    LLAMA_LOG_INFO("%s: attn KV contract layout=%s transfer=%s producer=%s consumer=%s storage=%s buft=%s\n",
+                            __func__,
+                            llama_hetero_kv_layout_name(this->kv_contract.layout),
+                            llama_hetero_kv_transfer_mode_name(this->kv_contract.transfer),
+                            this->kv_contract.producer_backend.c_str(),
+                            this->kv_contract.consumer_backend.c_str(),
+                            this->kv_contract.storage_backend.empty() ? "<unset>" : this->kv_contract.storage_backend.c_str(),
+                            ggml_backend_buft_name(shared_kv_buft));
+                } else {
+                    LLAMA_LOG_WARN("%s: attn KV contract requested %s but OpenCL host buffer type is unavailable; falling back to legacy per-layer KV placement\n",
+                            __func__,
+                            llama_hetero_kv_transfer_mode_name(this->kv_contract.transfer));
+                }
+            } break;
+            case llama_hetero_kv_transfer_mode::QNN_RPCMEM:
+                LLAMA_LOG_WARN("%s: attn KV contract requested %s, but workflow2 only implements CPU<->OpenCL shared KV buffers today; keeping legacy per-layer KV placement until QNN sharing is added\n",
+                        __func__,
+                        llama_hetero_kv_transfer_mode_name(this->kv_contract.transfer));
+                break;
+            case llama_hetero_kv_transfer_mode::NONE:
+                break;
+        }
+    }
+
     const bool is_mla = hparams.is_mla();
 
     for (uint32_t il = 0; il < hparams.n_layer; il++) {
@@ -120,7 +155,10 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
-        if (offload) {
+        if (shared_kv_buft != nullptr) {
+            buft = shared_kv_buft;
+            dev_name = ggml_backend_buft_name(shared_kv_buft);
+        } else if (offload) {
             auto * dev = model.dev_layer(il);
             buft = ggml_backend_dev_buffer_type(dev);
 

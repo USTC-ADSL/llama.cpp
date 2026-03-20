@@ -308,6 +308,19 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // [EXPERIMENTAL]
+        // workflow2 hetero decode route, for example:
+        //   "attn_proj=cpu,attn_core=opencl,attn_out=cpu,ffn=cpu,output=cpu"
+        // Set this before model load if you want weight placement / residency to
+        // follow the same stage routing plan.
+        const char * hetero_stage_route;
+
+        // [EXPERIMENTAL]
+        // workflow2 attention KV layout / transfer policy, for example:
+        //   "auto", "legacy", "cpu-opencl-zero-copy", "qnn-rpcmem"
+        // QNN values currently reserve the interface only.
+        const char * hetero_kv_layout;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool use_mmap;        // use mmap if possible
@@ -360,6 +373,18 @@ extern "C" {
         // currently works only with CPU execution
         ggml_abort_callback abort_callback;
         void *              abort_callback_data;
+
+        // [EXPERIMENTAL]
+        // workflow2 hetero decode route. This controls graph-side stage routing
+        // for the context. For the lowest overhead, prefer setting the same plan
+        // in llama_model_params before model load as well.
+        const char * hetero_stage_route;
+
+        // [EXPERIMENTAL]
+        // workflow2 attention KV layout / transfer policy. This can request
+        // stage-shared CPU/OpenCL zero-copy KV placement and reserve future
+        // QNN/RPCMEM integration paths.
+        const char * hetero_kv_layout;
 
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)
@@ -970,6 +995,34 @@ extern "C" {
 
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
+
+    // [EXPERIMENTAL]
+    // Update workflow2 hetero decode routing for an existing context using the
+    // same grammar as llama_model_params::hetero_stage_route.
+    // Returns false if the requested route requires a KV layout / transport
+    // contract that the current context cannot satisfy without rebuild/migration.
+    LLAMA_API bool llama_set_hetero_stage_route(
+            struct llama_context * ctx,
+            const char * route_spec,
+            const char * kv_layout);
+
+    // [EXPERIMENTAL]
+    // Serialize the current workflow2 hetero stage route into buf and return the
+    // number of characters that would have been written (excluding the NUL), as
+    // with snprintf().
+    LLAMA_API int32_t llama_get_hetero_stage_route(
+            const struct llama_context * ctx,
+            char * buf,
+            size_t buf_size);
+
+    // [EXPERIMENTAL]
+    // Serialize the current workflow2 KV layout / transfer policy into buf and
+    // return the number of characters that would have been written (excluding
+    // the NUL), as with snprintf().
+    LLAMA_API int32_t llama_get_hetero_kv_layout(
+            const struct llama_context * ctx,
+            char * buf,
+            size_t buf_size);
 
     // Wait until all computations are finished
     // This is automatically done when using one of the functions below to obtain the computation results

@@ -2,6 +2,7 @@
 
 #include "llama-batch.h"
 #include "llama-graph.h"
+#include "llama-hetero-route.h"
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
@@ -106,6 +107,7 @@ public:
                      uint32_t   n_pad,
                      uint32_t   n_swa,
                llama_swa_type   swa_type,
+        const llama_hetero_kv_contract & kv_contract,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse);
 
@@ -231,6 +233,8 @@ private:
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
+
+    const llama_hetero_kv_contract kv_contract;
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama.h"
+#include "llama-hetero-route.h"
 
 #include <map>
 #include <memory>
@@ -20,6 +21,12 @@ struct llama_memory_params {
 
     // use full-size SWA cache
     bool swa_full;
+
+    // stage-level KV layout / transport contract used by workflow2 hetero routing.
+    // This is intentionally carried through memory creation so future dynamic
+    // schedulers (including QNN) can update routing logic without hard-coding
+    // backend-specific KV allocation in each memory implementation.
+    llama_hetero_kv_contract kv_contract;
 };
 
 enum llama_memory_status {

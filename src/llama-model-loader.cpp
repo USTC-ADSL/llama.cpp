@@ -14,6 +14,7 @@
 #include <cstring>
 #include <future>
 #include <regex>
+#include <utility>
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -518,8 +519,9 @@ llama_model_loader::llama_model_loader(
         bool check_tensors,
         bool no_alloc,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
-        : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        llama_hetero_execution_plan hetero_plan)
+        : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud), hetero_plan(std::move(hetero_plan)) {
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
         trace = atoi(getenv("LLAMA_TRACE"));
@@ -1043,7 +1045,7 @@ static ggml_backend_buffer_type_t select_weight_device_buft(const llama_hparams 
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
-    const auto hetero_route = llama_hetero_parse_route_spec_from_env();
+    const auto & hetero_route = hetero_plan.route;
     const bool hetero_cpu_opencl_mixed = llama_hetero_route_has_cpu_opencl_mix(hetero_route);
     const int hetero_ffn_backend_kind       = llama_hetero_backend_kind(hetero_route.backend_for(llama_hetero_route_stage::FFN));
     const int hetero_attn_proj_backend_kind = llama_hetero_backend_kind(hetero_route.backend_for(llama_hetero_route_stage::ATTN_PROJ));

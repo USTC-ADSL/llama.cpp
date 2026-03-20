@@ -329,6 +329,9 @@ struct llama_model::impl {
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
+    hetero_plan = (params.hetero_stage_route != nullptr || params.hetero_kv_layout != nullptr)
+        ? llama_hetero_build_execution_plan(params.hetero_stage_route, params.hetero_kv_layout)
+        : llama_hetero_build_execution_plan_from_env();
 }
 
 llama_model::~llama_model() {
@@ -7984,6 +7987,10 @@ bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }
 
+const llama_hetero_execution_plan & llama_model::get_hetero_plan() const {
+    return hetero_plan;
+}
+
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
             [name](const std::pair<std::string, ggml_tensor *> & it) {
@@ -8089,6 +8096,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
+                            /* kv_contract       */ params.kv_contract,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
                     } else {
@@ -8107,6 +8115,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
+                            /* kv_contract       */ params.kv_contract,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
                     }
@@ -8138,6 +8147,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 cparams.n_seq_max,
                                 cparams.n_ubatch,
                                 1,
+                                params.kv_contract,
                                 nullptr,
                                 reuse);
                     } else {
@@ -8155,6 +8165,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 1,
                                 hparams.n_swa,
                                 hparams.swa_type,
+                                params.kv_contract,
                                 nullptr,
                                 nullptr);
                     }
@@ -8700,6 +8711,8 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.hetero_stage_route          =*/ nullptr,
+        /*.hetero_kv_layout            =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_direct_io               =*/ false,

@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
@@ -220,7 +221,23 @@ llama_context::llama_context(
                 __func__, cparams.n_ctx_seq, hparams.n_ctx_train);
     }
 
-    const auto hetero_route = llama_hetero_parse_route_spec_from_env();
+    const bool hetero_plan_from_params =
+        params.hetero_stage_route != nullptr || params.hetero_kv_layout != nullptr;
+
+    hetero_plan = hetero_plan_from_params
+        ? llama_hetero_build_execution_plan(params.hetero_stage_route, params.hetero_kv_layout)
+        : model.get_hetero_plan();
+
+    if (hetero_plan_from_params && !llama_hetero_execution_plan_equals(hetero_plan, model.get_hetero_plan())) {
+        const std::string ctx_route = llama_hetero_format_route_spec(hetero_plan.route);
+        const std::string model_route = llama_hetero_format_route_spec(model.get_hetero_plan().route);
+        LLAMA_LOG_WARN("%s: context hetero route overrides the model-load plan. Graph routing will use route=%s, but tensor residency was chosen with model route=%s. For lower switching / staging overhead and future QNN integration, prefer setting llama_model_params.hetero_stage_route / hetero_kv_layout before model load.\n",
+                __func__,
+                ctx_route.empty() ? "<default>" : ctx_route.c_str(),
+                model_route.empty() ? "<default>" : model_route.c_str());
+    }
+
+    const auto & hetero_route = hetero_plan.route;
     const bool hetero_cpu_opencl_zero_copy = llama_hetero_route_has_cpu_opencl_mix(hetero_route);
 
     if (!hparams.vocab_only) {
@@ -306,6 +323,39 @@ llama_context::llama_context(
         }
         backends.emplace_back(backend_cpu);
 
+        const auto find_opencl_host_buft = [&]() -> ggml_backend_buffer_type_t {
+            for (const auto & backend : backends) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+                if (dev != nullptr && std::strcmp(ggml_backend_dev_name(dev), "GPUOpenCL") == 0) {
+                    return ggml_backend_dev_host_buffer_type(dev);
+                }
+            }
+
+            return nullptr;
+        };
+
+        hetero_kv_contract_allocated = llama_hetero_finalize_kv_contract(
+                hetero_plan.attn_kv,
+                find_opencl_host_buft() != nullptr);
+
+        if (hetero_plan.attn_kv.stage_boundary_active()) {
+            LLAMA_LOG_INFO("%s: hetero attn KV contract requested layout=%s transfer=%s producer=%s consumer=%s storage=%s reason=%s\n",
+                    __func__,
+                    llama_hetero_kv_layout_name(hetero_plan.attn_kv.layout),
+                    llama_hetero_kv_transfer_mode_name(hetero_plan.attn_kv.transfer),
+                    hetero_plan.attn_kv.producer_backend.c_str(),
+                    hetero_plan.attn_kv.consumer_backend.c_str(),
+                    hetero_plan.attn_kv.storage_backend.empty() ? "<unset>" : hetero_plan.attn_kv.storage_backend.c_str(),
+                    hetero_plan.attn_kv.reason.empty() ? "<none>" : hetero_plan.attn_kv.reason.c_str());
+            LLAMA_LOG_INFO("%s: hetero attn KV contract allocated layout=%s transfer=%s zero_copy=%s available=%s reason=%s\n",
+                    __func__,
+                    llama_hetero_kv_layout_name(hetero_kv_contract_allocated.layout),
+                    llama_hetero_kv_transfer_mode_name(hetero_kv_contract_allocated.transfer),
+                    hetero_kv_contract_allocated.zero_copy ? "true" : "false",
+                    hetero_kv_contract_allocated.buffer_available ? "true" : "false",
+                    hetero_kv_contract_allocated.reason.empty() ? "<none>" : hetero_kv_contract_allocated.reason.c_str());
+        }
+
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
@@ -338,6 +388,7 @@ llama_context::llama_context(
             /*.type_k   =*/ params.type_k,
             /*.type_v   =*/ params.type_v,
             /*.swa_full =*/ params.swa_full,
+            /*.kv_contract =*/ hetero_kv_contract_allocated,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -1226,6 +1277,38 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     sched_need_reserve = true;
 
     return true;
+}
+
+bool llama_context::set_hetero_plan(llama_hetero_execution_plan plan) {
+    if (!llama_hetero_kv_contract_can_satisfy(hetero_kv_contract_allocated, plan.attn_kv)) {
+        LLAMA_LOG_WARN("%s: rejecting hetero plan update: requested attn KV contract layout=%s transfer=%s producer=%s consumer=%s, but the current context was allocated with layout=%s transfer=%s zero_copy=%s. Rebuild the context or add KV migration for this transition.\n",
+                __func__,
+                llama_hetero_kv_layout_name(plan.attn_kv.layout),
+                llama_hetero_kv_transfer_mode_name(plan.attn_kv.transfer),
+                plan.attn_kv.producer_backend.empty() ? "<unset>" : plan.attn_kv.producer_backend.c_str(),
+                plan.attn_kv.consumer_backend.empty() ? "<unset>" : plan.attn_kv.consumer_backend.c_str(),
+                llama_hetero_kv_layout_name(hetero_kv_contract_allocated.layout),
+                llama_hetero_kv_transfer_mode_name(hetero_kv_contract_allocated.transfer),
+                hetero_kv_contract_allocated.zero_copy ? "true" : "false");
+        return false;
+    }
+
+    hetero_plan = std::move(plan);
+    sched_need_reserve = true;
+
+    LLAMA_LOG_INFO("%s: updated hetero plan: attn_proj=%s attn_core=%s attn_out=%s ffn=%s output=%s\n",
+            __func__,
+            hetero_plan.route.backend_for(llama_hetero_route_stage::ATTN_PROJ).c_str(),
+            hetero_plan.route.backend_for(llama_hetero_route_stage::ATTN_CORE).c_str(),
+            hetero_plan.route.backend_for(llama_hetero_route_stage::ATTN_OUT ).c_str(),
+            hetero_plan.route.backend_for(llama_hetero_route_stage::FFN      ).c_str(),
+            hetero_plan.route.backend_for(llama_hetero_route_stage::OUTPUT   ).c_str());
+
+    return true;
+}
+
+const llama_hetero_execution_plan & llama_context::get_hetero_plan() const {
+    return hetero_plan;
 }
 
 void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
@@ -2402,7 +2485,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
         return nullptr;
     };
 
-    const auto hetero_route = llama_hetero_parse_route_spec_from_env();
+    const auto & hetero_route = hetero_plan.route;
     const ggml_backend_t hetero_attn_proj_backend = parse_hetero_backend(hetero_route.backend_for(llama_hetero_route_stage::ATTN_PROJ));
     const ggml_backend_t hetero_attn_core_backend = parse_hetero_backend(hetero_route.backend_for(llama_hetero_route_stage::ATTN_CORE));
     const ggml_backend_t hetero_attn_out_backend  = parse_hetero_backend(hetero_route.backend_for(llama_hetero_route_stage::ATTN_OUT));
@@ -2436,9 +2519,27 @@ llm_graph_cb llama_context::graph_get_cb() const {
             logged_hetero_output_route = true;
         }
         static bool warned_hetero_attn_kv_boundary = false;
-        if (llama_hetero_route_has_cpu_opencl_attn_kv_boundary(hetero_route) && !warned_hetero_attn_kv_boundary) {
-            LLAMA_LOG_WARN("%s: attn_proj and attn_core are split across CPU/OpenCL; current workflow2 may materialize KV cache views across the boundary and trigger extra tensor copies. Keep attn_proj and attn_core on the same backend unless the KV layout/kernel contract is redesigned.\n",
-                    __func__);
+        static bool logged_hetero_attn_kv_contract = false;
+        if (hetero_plan.attn_kv.stage_boundary_active() && !logged_hetero_attn_kv_contract) {
+            LLAMA_LOG_INFO("%s: attn KV contract layout=%s transfer=%s zero_copy=%s available=%s reason=%s\n",
+                    __func__,
+                    llama_hetero_kv_layout_name(hetero_kv_contract_allocated.layout),
+                    llama_hetero_kv_transfer_mode_name(hetero_kv_contract_allocated.transfer),
+                    hetero_kv_contract_allocated.zero_copy ? "true" : "false",
+                    hetero_kv_contract_allocated.buffer_available ? "true" : "false",
+                    hetero_kv_contract_allocated.reason.empty() ? "<none>" : hetero_kv_contract_allocated.reason.c_str());
+            logged_hetero_attn_kv_contract = true;
+        }
+        if (hetero_plan.attn_kv.stage_boundary_active() &&
+            !hetero_kv_contract_allocated.is_split_safe() &&
+            !warned_hetero_attn_kv_boundary) {
+            LLAMA_LOG_WARN("%s: attn_proj and attn_core are split across %s -> %s, but the allocated KV contract is not zero-copy safe (layout=%s transfer=%s reason=%s). Keep attn_proj and attn_core on the same backend or rebuild the context with a compatible shared KV contract.\n",
+                    __func__,
+                    hetero_plan.attn_kv.producer_backend.c_str(),
+                    hetero_plan.attn_kv.consumer_backend.c_str(),
+                    llama_hetero_kv_layout_name(hetero_kv_contract_allocated.layout),
+                    llama_hetero_kv_transfer_mode_name(hetero_kv_contract_allocated.transfer),
+                    hetero_kv_contract_allocated.reason.empty() ? "<none>" : hetero_kv_contract_allocated.reason.c_str());
             warned_hetero_attn_kv_boundary = true;
         }
     }
@@ -3307,6 +3408,8 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
+        /*.hetero_stage_route          =*/ nullptr,
+        /*.hetero_kv_layout            =*/ nullptr,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,
@@ -3451,6 +3554,69 @@ int32_t llama_n_threads_batch(llama_context * ctx) {
 
 void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void * data), void * abort_callback_data) {
     ctx->set_abort_callback(abort_callback, abort_callback_data);
+}
+
+bool llama_set_hetero_stage_route(
+        llama_context * ctx,
+        const char * route_spec,
+        const char * kv_layout) {
+    if (ctx == nullptr) {
+        LLAMA_LOG_ERROR("%s: ctx cannot be NULL\n", __func__);
+        return false;
+    }
+
+    return ctx->set_hetero_plan(llama_hetero_build_execution_plan(route_spec, kv_layout));
+}
+
+int32_t llama_get_hetero_stage_route(
+        const llama_context * ctx,
+        char * buf,
+        size_t buf_size) {
+    if (ctx == nullptr) {
+        if (buf != nullptr && buf_size > 0) {
+            buf[0] = '\0';
+        }
+        return -1;
+    }
+
+    const std::string route = llama_hetero_format_route_spec(ctx->get_hetero_plan().route);
+    const char * value = route.empty() ? "<default>" : route.c_str();
+    if (buf == nullptr) {
+        return int32_t(std::strlen(value));
+    }
+    return snprintf(buf, buf_size, "%s", value);
+}
+
+int32_t llama_get_hetero_kv_layout(
+        const llama_context * ctx,
+        char * buf,
+        size_t buf_size) {
+    if (ctx == nullptr) {
+        if (buf != nullptr && buf_size > 0) {
+            buf[0] = '\0';
+        }
+        return -1;
+    }
+
+    const auto & contract = ctx->get_hetero_plan().attn_kv;
+    const char * value = nullptr;
+    switch (contract.transfer) {
+        case llama_hetero_kv_transfer_mode::NONE:
+            value = contract.layout == llama_hetero_kv_layout_kind::LEGACY ? "legacy" : "stage-shared";
+            break;
+        case llama_hetero_kv_transfer_mode::CPU_OPENCL_ZERO_COPY:
+            value = "cpu-opencl-zero-copy";
+            break;
+        case llama_hetero_kv_transfer_mode::QNN_RPCMEM:
+            value = "qnn-rpcmem";
+            break;
+    }
+
+    value = value != nullptr ? value : "unknown";
+    if (buf == nullptr) {
+        return int32_t(std::strlen(value));
+    }
+    return snprintf(buf, buf_size, "%s", value);
 }
 
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {
