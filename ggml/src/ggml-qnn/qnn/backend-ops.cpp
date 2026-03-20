@@ -229,7 +229,10 @@ void dump_cgraph_nodes(const ggml_cgraph * cgraph) {
 }
 
 bool should_cpu_fallback_unmatched_aot_cgraph(const ggml_cgraph * cgraph) {
-    constexpr int kResidualCpuFallbackMaxNodes = 16;
+    // workflow2 can currently expose cross-boundary decode residuals that are still
+    // much smaller than a full transformer graph, but larger than the old 16-node
+    // heuristic. Keep the stopgap bounded while allowing these fragments to run.
+    constexpr int kResidualCpuFallbackMaxNodes = 64;
 
     if (cgraph == nullptr || cgraph->n_nodes <= 0 || cgraph->n_nodes > kResidualCpuFallbackMaxNodes) {
         return false;
@@ -238,21 +241,50 @@ bool should_cpu_fallback_unmatched_aot_cgraph(const ggml_cgraph * cgraph) {
     bool seen_stage         = false;
     bool seen_embd          = false;
     bool seen_result_output = false;
-    int  anonymous_nodes    = 0;
+    bool all_tiny_tail_ops  = true;
 
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
-        const char * name = ggml_get_name(cgraph->nodes[i]);
-
+    auto note_name = [&](const char * name) {
         seen_stage = seen_stage || is_aot_transformer_stage_name(name) || is_aot_lm_head_stage_name(name);
         seen_embd = seen_embd || (name != nullptr && std::strcmp(name, "embd") == 0);
         seen_result_output = seen_result_output || (name != nullptr && std::strcmp(name, "result_output") == 0);
+    };
 
-        if (is_anonymous_or_scheduler_name(name)) {
-            anonymous_nodes++;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        note_name(ggml_get_name(node));
+
+        // workflow2 may leave scheduler-generated nodes unnamed even when their inputs are
+        // still clearly attached to transformer-stage outputs (for example kqv_out-*).
+        // Use source names as additional evidence that this tiny residual belongs on the
+        // CPU fallback path rather than dropping into the QNN JIT path.
+        for (size_t j = 0; j < GGML_MAX_SRC && node->src[j]; ++j) {
+            note_name(ggml_get_name(node->src[j]));
+        }
+
+        switch (node->op) {
+            case GGML_OP_GET_ROWS:
+            case GGML_OP_GET_ROWS_BACK:
+            case GGML_OP_VIEW:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_CONT:
+            case GGML_OP_CPY:
+            case GGML_OP_MUL_MAT:
+                break;
+            default:
+                all_tiny_tail_ops = false;
+                break;
         }
     }
 
-    return (seen_stage || seen_result_output) && anonymous_nodes > 0 && !seen_embd;
+    // workflow2 keeps more residual nodes explicitly named (for example cache_k/cache_v/Qcur views),
+    // so the older "must contain anonymous scheduler nodes" heuristic is no longer reliable.
+    // Treat any small unmatched decode residual as CPU-fallback eligible to preserve runnability.
+    if ((seen_stage || seen_result_output) && !seen_embd) {
+        return true;
+    }
+
+    return !seen_embd && cgraph->n_nodes <= 4 && all_tiny_tail_ops;
 }
 
 qnn::qnn_graph * get_qnn_graph_from_cache(qnn::ggml_backend_qnn_device_context * ctx, const ggml_cgraph * cgraph) {

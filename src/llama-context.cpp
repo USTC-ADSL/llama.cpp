@@ -2578,9 +2578,16 @@ llm_graph_cb llama_context::graph_get_cb() const {
                          backend ? ggml_backend_name(backend) : "<null>",
                          (int) supported);
         };
+        const auto set_tensor_backend = [&](ggml_backend_t backend, bool pinned) {
+            if (pinned) {
+                ggml_backend_sched_set_tensor_backend_pinned(sched.get(), cur, backend);
+            } else {
+                ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend);
+            }
+        };
 
         if (aot_force_cpu_graph) {
-            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
+            set_tensor_backend(backend_cpu, false);
             trace_tensor("bootstrap-cpu", backend_cpu, true);
             return;
         }
@@ -2594,7 +2601,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {
                         if (ggml_backend_supports_op(backend.get(), cur)) {
-                            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                            set_tensor_backend(backend.get(), false);
                         }
                     }
                 }
@@ -2639,6 +2646,11 @@ llm_graph_cb llama_context::graph_get_cb() const {
             std::strcmp(tensor_name, "norm") == 0 ||
             std::strcmp(tensor_name, "result_norm") == 0 ||
             std::strcmp(tensor_name, "result_output") == 0);
+        const bool explicit_hetero_stage = route_output_to_backend ||
+            (attn_out_stage  && hetero_attn_out_backend  != nullptr) ||
+            (attn_core_stage && hetero_attn_core_backend != nullptr) ||
+            (attn_proj_stage && hetero_attn_proj_backend != nullptr) ||
+            (ffn_stage       && hetero_ffn_backend       != nullptr);
 
         auto resolve_stage_backend = [&]() -> ggml_backend_t {
             if (route_output_to_backend) {
@@ -2675,7 +2687,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
 
         if (qnn_aot_enabled && qnn_aot_backend != nullptr) {
             if (qnn_force_cpu) {
-                ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
+                set_tensor_backend(backend_cpu, explicit_hetero_stage);
                 trace_tensor("force-cpu", backend_cpu, true);
                 return;
             }
@@ -2684,7 +2696,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
             if (target_backend != nullptr) {
                 const bool supported = ggml_backend_supports_op(target_backend, cur);
                 if (supported) {
-                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, target_backend);
+                    set_tensor_backend(target_backend, explicit_hetero_stage);
                     trace_tensor(target_backend == qnn_aot_backend ? "aot-qnn" : "hetero-stage", target_backend, true);
                 } else {
                     trace_tensor(target_backend == qnn_aot_backend ? "aot-unsupported" : "hetero-unsupported", target_backend, false);
@@ -2700,7 +2712,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
         }
 
         if (hetero_force_cpu) {
-            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
+            set_tensor_backend(backend_cpu, true);
             trace_tensor("hetero-force-cpu", backend_cpu, true);
             return;
         }
@@ -2709,7 +2721,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
         if (target_backend != nullptr) {
             const bool supported = ggml_backend_supports_op(target_backend, cur);
             if (supported) {
-                ggml_backend_sched_set_tensor_backend(sched.get(), cur, target_backend);
+                set_tensor_backend(target_backend, true);
                 trace_tensor("hetero-stage", target_backend, true);
             } else {
                 trace_tensor("hetero-unsupported", target_backend, false);
