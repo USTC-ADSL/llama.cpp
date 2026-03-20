@@ -12,6 +12,7 @@
 #include "llama-ext.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cinttypes>
 #include <cstdio>
@@ -20,6 +21,31 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+
+namespace {
+
+const char * canonicalize_hetero_backend_device_name(const char * value) {
+    const std::string normalized = llama_hetero_canonical_backend(value != nullptr ? value : "");
+    if (normalized.empty() || normalized == "cpu") {
+        return nullptr;
+    }
+    if (normalized == "opencl") {
+        return "GPUOpenCL";
+    }
+    if (normalized == "qnn-npu") {
+        return "qnn-npu";
+    }
+    if (normalized == "qnn-gpu") {
+        return "qnn-gpu";
+    }
+    if (normalized == "qnn-cpu") {
+        return "qnn-cpu";
+    }
+
+    return value;
+}
+
+} // namespace
 
 //
 // llama_context
@@ -227,6 +253,8 @@ llama_context::llama_context(
     hetero_plan = hetero_plan_from_params
         ? llama_hetero_build_execution_plan(params.hetero_stage_route, params.hetero_kv_layout)
         : model.get_hetero_plan();
+    hetero_plan_base   = hetero_plan;
+    dynamic_route_config = llama_dynamic_route_config_from_env();
 
     if (hetero_plan_from_params && !llama_hetero_execution_plan_equals(hetero_plan, model.get_hetero_plan())) {
         const std::string ctx_route = llama_hetero_format_route_spec(hetero_plan.route);
@@ -238,7 +266,13 @@ llama_context::llama_context(
     }
 
     const auto & hetero_route = hetero_plan.route;
-    const bool hetero_cpu_opencl_zero_copy = llama_hetero_route_has_cpu_opencl_mix(hetero_route);
+    const bool dynamic_cpu_opencl_zero_copy =
+        llama_hetero_route_has_cpu_opencl_mix(dynamic_route_config.prefill.plan.route) ||
+        llama_hetero_route_has_cpu_opencl_mix(dynamic_route_config.decode.plan.route) ||
+        llama_hetero_route_has_cpu_opencl_mix(dynamic_route_config.fallback.plan.route);
+    const bool hetero_cpu_opencl_zero_copy =
+        llama_hetero_route_has_cpu_opencl_mix(hetero_route) ||
+        dynamic_cpu_opencl_zero_copy;
 
     if (!hparams.vocab_only) {
         // GPU backends
@@ -249,60 +283,6 @@ llama_context::llama_context(
             }
             backends.emplace_back(backend);
         }
-
-        const auto canonicalize_hetero_backend_device = [](const char * value) -> const char * {
-            const std::string normalized = llama_hetero_canonical_backend(value != nullptr ? value : "");
-            if (normalized.empty() || normalized == "cpu") {
-                return nullptr;
-            }
-            if (normalized == "opencl") {
-                return "GPUOpenCL";
-            }
-            if (normalized == "qnn-npu") {
-                return "qnn-npu";
-            }
-            if (normalized == "qnn-gpu") {
-                return "qnn-gpu";
-            }
-            if (normalized == "qnn-cpu") {
-                return "qnn-cpu";
-            }
-            return value;
-        };
-
-        const auto init_aux_backend_if_needed = [&](const char * requested_backend, const char * route_name) {
-            const char * requested_device_name = canonicalize_hetero_backend_device(requested_backend);
-            if (requested_device_name == nullptr) {
-                return;
-            }
-
-            for (const auto & backend : backends) {
-                ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
-                if (dev != nullptr && std::strcmp(ggml_backend_dev_name(dev), requested_device_name) == 0) {
-                    return;
-                }
-            }
-
-            ggml_backend_dev_t dev = ggml_backend_dev_by_name(requested_device_name);
-            if (dev == nullptr) {
-                LLAMA_LOG_WARN("%s: requested hetero backend %s via %s is unavailable\n", __func__, requested_device_name, route_name);
-                return;
-            }
-
-            ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-            if (backend == nullptr) {
-                throw std::runtime_error(format("failed to initialize auxiliary hetero backend %s", requested_device_name));
-            }
-
-            LLAMA_LOG_INFO("%s: initialized auxiliary hetero backend %s via %s\n", __func__, requested_device_name, route_name);
-            backends.emplace_back(backend);
-        };
-
-        init_aux_backend_if_needed(hetero_route.backend_for(llama_hetero_route_stage::ATTN_PROJ).c_str(), "hetero.attn_proj");
-        init_aux_backend_if_needed(hetero_route.backend_for(llama_hetero_route_stage::ATTN_CORE).c_str(), "hetero.attn_core");
-        init_aux_backend_if_needed(hetero_route.backend_for(llama_hetero_route_stage::ATTN_OUT ).c_str(), "hetero.attn_out");
-        init_aux_backend_if_needed(hetero_route.backend_for(llama_hetero_route_stage::FFN      ).c_str(), "hetero.ffn");
-        init_aux_backend_if_needed(hetero_route.backend_for(llama_hetero_route_stage::OUTPUT   ).c_str(), "hetero.output");
 
         // add ACCEL backends (such as BLAS)
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
@@ -323,6 +303,9 @@ llama_context::llama_context(
         }
         backends.emplace_back(backend_cpu);
 
+        ensure_hetero_backends_for_route(hetero_route, "hetero");
+        ensure_dynamic_route_backends_ready(dynamic_route_config);
+
         const auto find_opencl_host_buft = [&]() -> ggml_backend_buffer_type_t {
             for (const auto & backend : backends) {
                 ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
@@ -334,9 +317,44 @@ llama_context::llama_context(
             return nullptr;
         };
 
+        const bool opencl_host_buffer_available = find_opencl_host_buft() != nullptr;
+
         hetero_kv_contract_allocated = llama_hetero_finalize_kv_contract(
                 hetero_plan.attn_kv,
-                find_opencl_host_buft() != nullptr);
+                opencl_host_buffer_available);
+
+        const auto maybe_promote_allocated_kv = [&](const llama_dynamic_route_candidate & candidate) {
+            if (!candidate.configured ||
+                llama_hetero_kv_contract_can_satisfy(hetero_kv_contract_allocated, candidate.plan.attn_kv)) {
+                return;
+            }
+
+            llama_hetero_kv_contract upgraded = llama_hetero_finalize_kv_contract(
+                    candidate.plan.attn_kv,
+                    opencl_host_buffer_available);
+
+            if (llama_hetero_kv_contract_can_satisfy(upgraded, hetero_kv_contract_allocated)) {
+                LLAMA_LOG_INFO("%s: promoting allocated attn KV contract for %s to layout=%s transfer=%s\n",
+                        __func__,
+                        candidate.label.empty() ? "<unnamed>" : candidate.label.c_str(),
+                        llama_hetero_kv_layout_name(upgraded.layout),
+                        llama_hetero_kv_transfer_mode_name(upgraded.transfer));
+                hetero_kv_contract_allocated = std::move(upgraded);
+                return;
+            }
+
+            LLAMA_LOG_WARN("%s: dynamic route %s requests attn KV contract layout=%s transfer=%s, which is incompatible with the current allocated contract layout=%s transfer=%s. This candidate will remain runtime-rejected until the context is rebuilt with a compatible contract.\n",
+                    __func__,
+                    candidate.label.empty() ? "<unnamed>" : candidate.label.c_str(),
+                    llama_hetero_kv_layout_name(candidate.plan.attn_kv.layout),
+                    llama_hetero_kv_transfer_mode_name(candidate.plan.attn_kv.transfer),
+                    llama_hetero_kv_layout_name(hetero_kv_contract_allocated.layout),
+                    llama_hetero_kv_transfer_mode_name(hetero_kv_contract_allocated.transfer));
+        };
+
+        maybe_promote_allocated_kv(dynamic_route_config.prefill);
+        maybe_promote_allocated_kv(dynamic_route_config.decode);
+        maybe_promote_allocated_kv(dynamic_route_config.fallback);
 
         if (hetero_plan.attn_kv.stage_boundary_active()) {
             LLAMA_LOG_INFO("%s: hetero attn KV contract requested layout=%s transfer=%s producer=%s consumer=%s storage=%s reason=%s\n",
@@ -354,6 +372,22 @@ llama_context::llama_context(
                     hetero_kv_contract_allocated.zero_copy ? "true" : "false",
                     hetero_kv_contract_allocated.buffer_available ? "true" : "false",
                     hetero_kv_contract_allocated.reason.empty() ? "<none>" : hetero_kv_contract_allocated.reason.c_str());
+        }
+
+        if (dynamic_route_config.enabled()) {
+            const auto route_string_or = [](const llama_dynamic_route_candidate & candidate) {
+                const std::string route = llama_hetero_format_route_spec(candidate.plan.route);
+                return route.empty() ? std::string("<unset>") : route;
+            };
+
+            LLAMA_LOG_INFO("%s: dynamic route mode=%s prefill=%s decode=%s fallback=%s slo_us=%" PRId64 " allow_qnn=%s\n",
+                    __func__,
+                    llama_dynamic_route_mode_name(dynamic_route_config.mode),
+                    route_string_or(dynamic_route_config.prefill).c_str(),
+                    route_string_or(dynamic_route_config.decode).c_str(),
+                    route_string_or(dynamic_route_config.fallback).c_str(),
+                    dynamic_route_config.slo_us,
+                    dynamic_route_config.allow_qnn ? "true" : "false");
         }
 
         // create a list of the set_n_threads functions in the backends
@@ -535,6 +569,217 @@ llama_context::llama_context(
         for (int i = 0; i < n_vocab; ++i) {
             sampling.token_ids_full_vocab[i] = i;
         }
+    }
+}
+
+bool llama_context::ensure_hetero_backend_ready(const std::string & backend_name, const char * route_name) {
+    const char * requested_device_name = canonicalize_hetero_backend_device_name(backend_name.c_str());
+    if (requested_device_name == nullptr) {
+        return true;
+    }
+
+    for (const auto & backend : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+        if (dev != nullptr && std::strcmp(ggml_backend_dev_name(dev), requested_device_name) == 0) {
+            return true;
+        }
+    }
+
+    ggml_backend_dev_t dev = ggml_backend_dev_by_name(requested_device_name);
+    if (dev == nullptr) {
+        LLAMA_LOG_WARN("%s: requested hetero backend %s via %s is unavailable\n",
+                __func__,
+                requested_device_name,
+                route_name != nullptr ? route_name : "<unknown>");
+        return false;
+    }
+
+    if (!backend_ptrs.empty()) {
+        LLAMA_LOG_WARN("%s: backend %s via %s was not initialized at context creation time. Rebuild the context (or preload it via model/context hetero routes or GGML_HETERO_DYNAMIC_* env) so scheduler buffers can include it.\n",
+                __func__,
+                requested_device_name,
+                route_name != nullptr ? route_name : "<unknown>");
+        return false;
+    }
+
+    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+    if (backend == nullptr) {
+        throw std::runtime_error(format("failed to initialize auxiliary hetero backend %s", requested_device_name));
+    }
+
+    LLAMA_LOG_INFO("%s: initialized auxiliary hetero backend %s via %s\n",
+            __func__,
+            requested_device_name,
+            route_name != nullptr ? route_name : "<unknown>");
+    backends.emplace_back(backend);
+    return true;
+}
+
+bool llama_context::ensure_hetero_backends_for_route(const llama_hetero_route_spec & route, const char * label_prefix) {
+    static constexpr std::array<std::pair<llama_hetero_route_stage, const char *>, 5> kStages = {{
+        { llama_hetero_route_stage::ATTN_PROJ, "attn_proj" },
+        { llama_hetero_route_stage::ATTN_CORE, "attn_core" },
+        { llama_hetero_route_stage::ATTN_OUT,  "attn_out"  },
+        { llama_hetero_route_stage::FFN,       "ffn"       },
+        { llama_hetero_route_stage::OUTPUT,    "output"    },
+    }};
+
+    bool ok = true;
+    for (const auto & [stage, suffix] : kStages) {
+        const std::string route_name = format("%s.%s",
+                label_prefix != nullptr ? label_prefix : "hetero",
+                suffix);
+        ok = ensure_hetero_backend_ready(route.backend_for(stage), route_name.c_str()) && ok;
+    }
+
+    return ok;
+}
+
+bool llama_context::ensure_dynamic_route_backends_ready(const llama_dynamic_route_runtime_config & config) {
+    bool ok = true;
+    if (config.prefill.configured) {
+        ok = ensure_hetero_backends_for_route(config.prefill.plan.route, "dynamic.prefill") && ok;
+    }
+    if (config.decode.configured) {
+        ok = ensure_hetero_backends_for_route(config.decode.plan.route, "dynamic.decode") && ok;
+    }
+    if (config.fallback.configured) {
+        ok = ensure_hetero_backends_for_route(config.fallback.plan.route, "dynamic.fallback") && ok;
+    }
+
+    return ok;
+}
+
+bool llama_context::backend_available_for_route(const std::string & backend_name) const {
+    const std::string canonical = llama_hetero_canonical_backend(backend_name);
+    if (canonical.empty()) {
+        return true;
+    }
+    if (canonical == "cpu") {
+        return backend_cpu != nullptr;
+    }
+
+    const char * requested_device_name = canonicalize_hetero_backend_device_name(canonical.c_str());
+    if (requested_device_name == nullptr) {
+        return false;
+    }
+
+    for (const auto & backend : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+        if (dev != nullptr && std::strcmp(ggml_backend_dev_name(dev), requested_device_name) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool llama_context::apply_hetero_plan(llama_hetero_execution_plan plan, bool update_base_plan, const char * source) {
+    if (!llama_hetero_kv_contract_can_satisfy(hetero_kv_contract_allocated, plan.attn_kv)) {
+        LLAMA_LOG_WARN("%s: rejecting hetero plan update from %s: requested attn KV contract layout=%s transfer=%s producer=%s consumer=%s, but the current context was allocated with layout=%s transfer=%s zero_copy=%s. Rebuild the context or add KV migration for this transition.\n",
+                __func__,
+                source != nullptr ? source : "unknown",
+                llama_hetero_kv_layout_name(plan.attn_kv.layout),
+                llama_hetero_kv_transfer_mode_name(plan.attn_kv.transfer),
+                plan.attn_kv.producer_backend.empty() ? "<unset>" : plan.attn_kv.producer_backend.c_str(),
+                plan.attn_kv.consumer_backend.empty() ? "<unset>" : plan.attn_kv.consumer_backend.c_str(),
+                llama_hetero_kv_layout_name(hetero_kv_contract_allocated.layout),
+                llama_hetero_kv_transfer_mode_name(hetero_kv_contract_allocated.transfer),
+                hetero_kv_contract_allocated.zero_copy ? "true" : "false");
+        return false;
+    }
+
+    hetero_plan = std::move(plan);
+    if (update_base_plan) {
+        hetero_plan_base = hetero_plan;
+    }
+    sched_need_reserve = true;
+
+    LLAMA_LOG_INFO("%s: updated hetero plan via %s: attn_proj=%s attn_core=%s attn_out=%s ffn=%s output=%s\n",
+            __func__,
+            source != nullptr ? source : "unknown",
+            hetero_plan.route.backend_for(llama_hetero_route_stage::ATTN_PROJ).c_str(),
+            hetero_plan.route.backend_for(llama_hetero_route_stage::ATTN_CORE).c_str(),
+            hetero_plan.route.backend_for(llama_hetero_route_stage::ATTN_OUT ).c_str(),
+            hetero_plan.route.backend_for(llama_hetero_route_stage::FFN      ).c_str(),
+            hetero_plan.route.backend_for(llama_hetero_route_stage::OUTPUT   ).c_str());
+
+    return true;
+}
+
+bool llama_context::set_dynamic_route_config(const llama_dynamic_route_config & config) {
+    llama_dynamic_route_runtime_config runtime_config;
+    std::string error;
+    if (!llama_dynamic_route_build_runtime_config(config, runtime_config, &error)) {
+        LLAMA_LOG_WARN("%s: failed to parse dynamic route config: %s\n",
+                __func__,
+                error.empty() ? "<unknown>" : error.c_str());
+        return false;
+    }
+
+    if (!ensure_dynamic_route_backends_ready(runtime_config)) {
+        return false;
+    }
+    dynamic_route_config = std::move(runtime_config);
+
+    const std::string prefill_route  = llama_hetero_format_route_spec(dynamic_route_config.prefill.plan.route);
+    const std::string decode_route   = llama_hetero_format_route_spec(dynamic_route_config.decode.plan.route);
+    const std::string fallback_route = llama_hetero_format_route_spec(dynamic_route_config.fallback.plan.route);
+
+    LLAMA_LOG_INFO("%s: dynamic route mode=%s prefill=%s decode=%s fallback=%s slo_us=%" PRId64 " allow_qnn=%s\n",
+            __func__,
+            llama_dynamic_route_mode_name(dynamic_route_config.mode),
+            prefill_route.empty()  ? "<unset>" : prefill_route.c_str(),
+            decode_route.empty()   ? "<unset>" : decode_route.c_str(),
+            fallback_route.empty() ? "<unset>" : fallback_route.c_str(),
+            dynamic_route_config.slo_us,
+            dynamic_route_config.allow_qnn ? "true" : "false");
+
+    return true;
+}
+
+std::string llama_context::get_dynamic_route_mode() const {
+    return llama_dynamic_route_mode_name(dynamic_route_config.mode);
+}
+
+void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
+    if (n_tokens > 1) {
+        dynamic_route_state.prefill_calls++;
+    } else {
+        dynamic_route_state.decode_calls++;
+    }
+
+    if (!dynamic_route_config.enabled()) {
+        return;
+    }
+
+    const bool qnn_available =
+        backend_available_for_route("qnn-npu") ||
+        backend_available_for_route("qnn-gpu") ||
+        backend_available_for_route("qnn-cpu");
+
+    const llama_dynamic_route_request request = {
+        /*.n_tokens =*/ n_tokens,
+        /*.opencl_backend_available =*/ backend_available_for_route("opencl"),
+        /*.qnn_backend_available =*/ qnn_available,
+        /*.current_plan =*/ &hetero_plan,
+        /*.base_plan =*/ &hetero_plan_base,
+        /*.allocated_kv_contract =*/ &hetero_kv_contract_allocated,
+    };
+
+    llama_dynamic_route_decision decision = llama_dynamic_route_decide(dynamic_route_config, request);
+    if (!decision.should_apply) {
+        if (dynamic_route_config.trace_enabled) {
+            LLAMA_LOG_INFO("%s: dynamic route skip phase=%s reason=%s\n",
+                    __func__,
+                    n_tokens > 1 ? "prefill" : "decode",
+                    decision.reason.empty() ? "<none>" : decision.reason.c_str());
+        }
+        return;
+    }
+
+    if (apply_hetero_plan(std::move(decision.plan), /* update_base_plan = */ false, decision.plan_label.c_str())) {
+        dynamic_route_state.route_switches++;
     }
 }
 
@@ -1280,31 +1525,10 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 }
 
 bool llama_context::set_hetero_plan(llama_hetero_execution_plan plan) {
-    if (!llama_hetero_kv_contract_can_satisfy(hetero_kv_contract_allocated, plan.attn_kv)) {
-        LLAMA_LOG_WARN("%s: rejecting hetero plan update: requested attn KV contract layout=%s transfer=%s producer=%s consumer=%s, but the current context was allocated with layout=%s transfer=%s zero_copy=%s. Rebuild the context or add KV migration for this transition.\n",
-                __func__,
-                llama_hetero_kv_layout_name(plan.attn_kv.layout),
-                llama_hetero_kv_transfer_mode_name(plan.attn_kv.transfer),
-                plan.attn_kv.producer_backend.empty() ? "<unset>" : plan.attn_kv.producer_backend.c_str(),
-                plan.attn_kv.consumer_backend.empty() ? "<unset>" : plan.attn_kv.consumer_backend.c_str(),
-                llama_hetero_kv_layout_name(hetero_kv_contract_allocated.layout),
-                llama_hetero_kv_transfer_mode_name(hetero_kv_contract_allocated.transfer),
-                hetero_kv_contract_allocated.zero_copy ? "true" : "false");
+    if (!ensure_hetero_backends_for_route(plan.route, "manual")) {
         return false;
     }
-
-    hetero_plan = std::move(plan);
-    sched_need_reserve = true;
-
-    LLAMA_LOG_INFO("%s: updated hetero plan: attn_proj=%s attn_core=%s attn_out=%s ffn=%s output=%s\n",
-            __func__,
-            hetero_plan.route.backend_for(llama_hetero_route_stage::ATTN_PROJ).c_str(),
-            hetero_plan.route.backend_for(llama_hetero_route_stage::ATTN_CORE).c_str(),
-            hetero_plan.route.backend_for(llama_hetero_route_stage::ATTN_OUT ).c_str(),
-            hetero_plan.route.backend_for(llama_hetero_route_stage::FFN      ).c_str(),
-            hetero_plan.route.backend_for(llama_hetero_route_stage::OUTPUT   ).c_str());
-
-    return true;
+    return apply_hetero_plan(std::move(plan), /* update_base_plan = */ true, "manual");
 }
 
 const llama_hetero_execution_plan & llama_context::get_hetero_plan() const {
@@ -1843,6 +2067,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     embd_seq.clear();
     output_swaps.clear();
 
+    maybe_apply_dynamic_route(n_tokens_all);
     sched_reserve();
 
     bool did_optimize = false;
@@ -3435,6 +3660,22 @@ llama_context_params llama_context_default_params() {
     return result;
 }
 
+llama_dynamic_route_config llama_dynamic_route_default_config() {
+    llama_dynamic_route_config result = {
+        /*.mode               =*/ "disabled",
+        /*.prefill_route      =*/ nullptr,
+        /*.prefill_kv_layout  =*/ nullptr,
+        /*.decode_route       =*/ nullptr,
+        /*.decode_kv_layout   =*/ nullptr,
+        /*.fallback_route     =*/ nullptr,
+        /*.fallback_kv_layout =*/ nullptr,
+        /*.slo_us             =*/ 0,
+        /*.allow_qnn          =*/ true,
+    };
+
+    return result;
+}
+
 llama_context * llama_init_from_model(
                  llama_model * model,
         llama_context_params   params) {
@@ -3629,6 +3870,35 @@ int32_t llama_get_hetero_kv_layout(
         return int32_t(std::strlen(value));
     }
     return snprintf(buf, buf_size, "%s", value);
+}
+
+bool llama_set_dynamic_route_config(
+        llama_context * ctx,
+        llama_dynamic_route_config config) {
+    if (ctx == nullptr) {
+        LLAMA_LOG_ERROR("%s: ctx cannot be NULL\n", __func__);
+        return false;
+    }
+
+    return ctx->set_dynamic_route_config(config);
+}
+
+int32_t llama_get_dynamic_route_mode(
+        const llama_context * ctx,
+        char * buf,
+        size_t buf_size) {
+    if (ctx == nullptr) {
+        if (buf != nullptr && buf_size > 0) {
+            buf[0] = '\0';
+        }
+        return -1;
+    }
+
+    const std::string mode = ctx->get_dynamic_route_mode();
+    if (buf == nullptr) {
+        return int32_t(mode.size());
+    }
+    return snprintf(buf, buf_size, "%s", mode.c_str());
 }
 
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {

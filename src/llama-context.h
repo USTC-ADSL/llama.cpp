@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include "llama-cparams.h"
+#include "llama-dyn-route.h"
 #include "llama-hetero-route.h"
 #include "llama-graph.h"
 #include "llama-adapter.h"
@@ -242,6 +243,8 @@ public:
     // context rebuild or future KV migration support.
     bool set_hetero_plan(llama_hetero_execution_plan plan);
     const llama_hetero_execution_plan & get_hetero_plan() const;
+    bool set_dynamic_route_config(const llama_dynamic_route_config & config);
+    std::string get_dynamic_route_mode() const;
 
 private:
     llm_graph_params graph_params(
@@ -258,6 +261,13 @@ private:
 
     size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
     size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
+
+    bool apply_hetero_plan(llama_hetero_execution_plan plan, bool update_base_plan, const char * source);
+    bool ensure_hetero_backend_ready(const std::string & backend_name, const char * route_name);
+    bool ensure_hetero_backends_for_route(const llama_hetero_route_spec & route, const char * label_prefix);
+    bool ensure_dynamic_route_backends_ready(const llama_dynamic_route_runtime_config & config);
+    bool backend_available_for_route(const std::string & backend_name) const;
+    void maybe_apply_dynamic_route(uint32_t n_tokens);
 
     //
     // members
@@ -357,7 +367,10 @@ private:
     bool aot_force_cpu_graph = false;
 
     llama_hetero_execution_plan hetero_plan;
+    llama_hetero_execution_plan hetero_plan_base;
     llama_hetero_kv_contract    hetero_kv_contract_allocated;
+    llama_dynamic_route_runtime_config dynamic_route_config;
+    llama_dynamic_route_runtime_state  dynamic_route_state;
 
     // perf
     mutable int64_t t_start_us  = 0;

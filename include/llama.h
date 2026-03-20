@@ -337,6 +337,43 @@ extern "C" {
         struct llama_sampler * sampler;
     };
 
+    struct llama_dynamic_route_config {
+        // [EXPERIMENTAL]
+        // "disabled" keeps the current static route.
+        // "phase-heuristic" switches between prefill/decode candidate routes.
+        // "cost-model" is reserved for future SLO-aware routing.
+        const char * mode;
+
+        // [EXPERIMENTAL]
+        // Candidate route used when llama_decode() receives a prefill batch
+        // (typically n_tokens > 1).
+        const char * prefill_route;
+        const char * prefill_kv_layout;
+
+        // [EXPERIMENTAL]
+        // Candidate route used when llama_decode() receives a decode batch
+        // (typically n_tokens == 1).
+        const char * decode_route;
+        const char * decode_kv_layout;
+
+        // [EXPERIMENTAL]
+        // Optional fallback route tried after phase-specific route rejection
+        // (for example because of backend availability or KV contract limits).
+        // If unset, the context falls back to its static/manual base route.
+        const char * fallback_route;
+        const char * fallback_kv_layout;
+
+        // [EXPERIMENTAL]
+        // Reserved for future SLO-aware / cost-model routing.
+        int64_t slo_us;
+
+        // [EXPERIMENTAL]
+        // If false, candidates that mention QNN backends are skipped. This
+        // reserves a clean interface for future dynamic QNN stage scheduling
+        // without forcing it on current CPU/OpenCL-only experiments.
+        bool allow_qnn;
+    };
+
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
     //       https://github.com/ggml-org/llama.cpp/pull/7544
     struct llama_context_params {
@@ -445,6 +482,7 @@ extern "C" {
     // TODO: update API to start accepting pointers to params structs (https://github.com/ggml-org/llama.cpp/discussions/9172)
     LLAMA_API struct llama_model_params          llama_model_default_params(void);
     LLAMA_API struct llama_context_params        llama_context_default_params(void);
+    LLAMA_API struct llama_dynamic_route_config  llama_dynamic_route_default_config(void);
     LLAMA_API struct llama_sampler_chain_params  llama_sampler_chain_default_params(void);
     LLAMA_API struct llama_model_quantize_params llama_model_quantize_default_params(void);
 
@@ -1020,6 +1058,25 @@ extern "C" {
     // return the number of characters that would have been written (excluding
     // the NUL), as with snprintf().
     LLAMA_API int32_t llama_get_hetero_kv_layout(
+            const struct llama_context * ctx,
+            char * buf,
+            size_t buf_size);
+
+    // [EXPERIMENTAL]
+    // Configure a dynamic route decider skeleton for workflow2. The current
+    // implementation is phase-aware: it can choose one candidate route for
+    // prefill (n_tokens > 1), one for decode (n_tokens == 1), and optionally a
+    // fallback route. Route changes are applied only when the requested plan is
+    // compatible with the context's already-allocated KV contract.
+    LLAMA_API bool llama_set_dynamic_route_config(
+            struct llama_context * ctx,
+            struct llama_dynamic_route_config config);
+
+    // [EXPERIMENTAL]
+    // Serialize the configured dynamic route mode into buf and return the
+    // number of characters that would have been written (excluding the NUL), as
+    // with snprintf().
+    LLAMA_API int32_t llama_get_dynamic_route_mode(
             const struct llama_context * ctx,
             char * buf,
             size_t buf_size);
