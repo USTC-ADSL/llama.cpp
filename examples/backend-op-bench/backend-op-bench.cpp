@@ -77,7 +77,7 @@ static void print_usage(const char * argv0) {
     std::printf("  Supported types: fp32/f32, fp16/f16, q8_0/int8/i8\n");
     std::printf("Other options:\n");
     std::printf("  --threads T  - Number of threads for CPU backend (default: 4)\n");
-    std::printf("Defaults: --op mul_mat --backend HTP0 --backend OpenCL0 --m 2048 --k 2048 --n 1 --runs 50 --threads 4 --wtype q8_0 --itype f32\n");
+    std::printf("Defaults: --op mul_mat --backend HTP0 --backend GPUOpenCL --backend CPU --m 2048 --k 2048 --n 1 --runs 50 --threads 4 --wtype q8_0 --itype f32\n");
     std::printf("Examples:\n");
     std::printf("  %s --op mul_mat --wtype fp16 --itype fp16\n", argv0);
     std::printf("  %s --op mul_mat --wtype q8_0 --itype f32 --backend HTP0\n", argv0);
@@ -115,11 +115,30 @@ static std::unique_ptr<OpInterface> create_operator(const options& opt) {
     return std::make_unique<OpMulMat>(opt.m, opt.k, opt.n, opt.weight_type, opt.input_type);  // default
 }
 
+static std::string canonical_backend_name(std::string backend_name) {
+    std::transform(backend_name.begin(), backend_name.end(), backend_name.begin(), [](unsigned char c) {
+        return (char) std::tolower(c);
+    });
+
+    if (backend_name == "htp0" || backend_name == "htp" || backend_name == "npu" || backend_name == "qnn" || backend_name == "qnn-npu") {
+        return "qnn-npu";
+    }
+    if (backend_name == "opencl0" || backend_name == "opencl" || backend_name == "gpuopencl" || backend_name == "gpu") {
+        return "GPUOpenCL";
+    }
+    if (backend_name == "cpu") {
+        return "CPU";
+    }
+
+    return backend_name;
+}
+
 static bench_result run_once(const options & opt, const std::string & backend_name) {
     bench_result r;
     r.backend = backend_name;
 
-    ggml_backend_dev_t dev = ggml_backend_dev_by_name(backend_name.c_str());
+    const std::string canonical_backend = canonical_backend_name(backend_name);
+    ggml_backend_dev_t dev = ggml_backend_dev_by_name(canonical_backend.c_str());
     if (!dev) {
         r.note = "device not found";
         return r;
@@ -172,10 +191,22 @@ static bench_result run_once(const options & opt, const std::string & backend_na
     }
 
     // ggml_backend_sched_new requires CPU backend as last element
-    ggml_backend_t cpu_backend = ggml_backend_cpu_init();
-    ggml_backend_t backends[] = {guard.backend, cpu_backend};
-    guard.sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, /*parallel=*/false, /*op_offload=*/true);
-    ggml_backend_free(cpu_backend);
+    ggml_backend_t backends[2] = { nullptr, nullptr };
+    int n_backends = 0;
+
+    if (ggml_backend_is_cpu(guard.backend)) {
+        backends[n_backends++] = guard.backend;
+    } else {
+        guard.cpu_backend = ggml_backend_cpu_init();
+        if (!guard.cpu_backend) {
+            r.note = "cpu backend init failed";
+            return r;
+        }
+        backends[n_backends++] = guard.backend;
+        backends[n_backends++] = guard.cpu_backend;
+    }
+
+    guard.sched = ggml_backend_sched_new(backends, nullptr, n_backends, GGML_DEFAULT_GRAPH_SIZE, /*parallel=*/false, /*op_offload=*/true);
 
     if (!ggml_backend_sched_alloc_graph(guard.sched, graph)) {
         r.note = "allocation failed";
@@ -184,12 +215,6 @@ static bench_result run_once(const options & opt, const std::string & backend_na
 
     // Fill input tensors
     op->fill_inputs();
-
-    // warmup
-    if (ggml_backend_sched_graph_compute(guard.sched, graph) != GGML_STATUS_SUCCESS) {
-        r.note = "warmup failed";
-        return r;
-    }
 
     // Measure first run (cold start)
     ggml_time_init();
@@ -208,19 +233,31 @@ static bench_result run_once(const options & opt, const std::string & backend_na
     }
 
     // Measure stable state (remaining runs)
-    t0 = ggml_time_us();
+    double total_us = 0.0;
+    int stable_runs = 0;
+
     for (int i = 1; i < opt.runs; ++i) {
+        t0 = ggml_time_us();
         if (ggml_backend_sched_graph_compute(guard.sched, graph) != GGML_STATUS_SUCCESS) {
             r.note = "compute failed";
             return r;
         }
         int64_t ti = ggml_time_us();
         double elapsed = double(ti - t0);
+        total_us += elapsed;
+        stable_runs++;
         r.min_us = std::min(r.min_us, elapsed);
         r.max_us = std::max(r.max_us, elapsed);
-        t0 = ti;
     }
-    r.avg_us = (r.min_us + r.max_us) / 2.0;
+
+    if (stable_runs > 0) {
+        r.avg_us = total_us / stable_runs;
+    } else {
+        r.avg_us = r.first_us;
+        r.min_us = r.first_us;
+        r.max_us = r.first_us;
+    }
+
     r.ok = true;
 
     return r;
@@ -288,7 +325,7 @@ static options parse(int argc, char ** argv) {
     }
 
     if (opt.backends.empty()) {
-        opt.backends = {"HTP0", "OpenCL0"};
+        opt.backends = {"HTP0", "GPUOpenCL", "CPU"};
     }
     return opt;
 }
@@ -300,7 +337,7 @@ int main(int argc, char ** argv) {
     std::printf("%s (threads=%d, wtype=%s, itype=%s)\n",
                 op->description().c_str(), opt.n_threads,
                 type_name(opt.weight_type), type_name(opt.input_type));
-    std::printf("%-12s %-12s %-12s %-12s %-12s %s\n", "backend", "first us", "avg us", "min us", "max us", "note");
+    std::printf("%-12s %-12s %-12s %-12s %-12s %s\n", "backend", "cold us", "avg us", "min us", "max us", "note");
 
     for (const auto & name : opt.backends) {
         auto r = run_once(opt, name);

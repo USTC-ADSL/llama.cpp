@@ -26,7 +26,7 @@ struct OpFFN : public OpInterface {
         : m(m_), k(k_), n(n_), down_m(down_m_) {}
 
     const char* name() const override {
-        return "swiglu";
+        return "ffn";
     }
 
     void create_tensors(ggml_context* ctx) override {
@@ -125,7 +125,7 @@ struct OpFFN : public OpInterface {
     }
 
     std::string description() const override {
-        return std::string("swiglu: W_down * (SiLU(W1*x) ⊗ (W2*x)), W1,W2: ") + std::to_string(m) + "x" + std::to_string(k) +
+        return std::string("ffn: W_down * (SiLU(W1*x) ⊗ (W2*x)), W1,W2: ") + std::to_string(m) + "x" + std::to_string(k) +
                ", W_down: " + std::to_string(down_m) + "x" + std::to_string(m) +
                ", x: " + std::to_string(k) + "x" + std::to_string(n) + ", dtype=Q8_0xF32";
     }

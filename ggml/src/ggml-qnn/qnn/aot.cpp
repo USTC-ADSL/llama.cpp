@@ -7,6 +7,7 @@
 #include <HTP/QnnHtpGraph.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
@@ -268,6 +269,57 @@ void replace_all(std::string & text, const char * needle, const std::string & re
     }
 }
 
+std::string normalize_graph_type(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return (char) std::tolower(ch);
+    });
+    return value;
+}
+
+bool env_flag_enabled(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+bool aot_trace_match_enabled() {
+    return env_flag_enabled("GGML_QNN_AOT_TRACE_MATCH");
+}
+
+bool graph_type_is_transformer(const std::string & graph_type) {
+    return graph_type == "transformer" ||
+           graph_type == "transformers" ||
+           graph_type == "decoder" ||
+           graph_type == "decode";
+}
+
+bool graph_type_is_attention(const std::string & graph_type) {
+    return graph_type == "attention" ||
+           graph_type == "attn" ||
+           graph_type == "attention_only" ||
+           graph_type == "attn_only";
+}
+
+bool parse_stage_layer_id(const char * name, size_t & layer_id) {
+    if (name == nullptr) {
+        return false;
+    }
+
+    const char * dash = std::strrchr(name, '-');
+    if (dash == nullptr || dash[1] == '\0') {
+        return false;
+    }
+
+    char * end = nullptr;
+    errno      = 0;
+    const auto parsed = std::strtoll(dash + 1, &end, 10);
+    if (errno != 0 || end == nullptr || *end != '\0' || parsed < 0) {
+        return false;
+    }
+
+    layer_id = static_cast<size_t>(parsed);
+    return true;
+}
+
 }  // namespace
 
 namespace qnn {
@@ -288,6 +340,10 @@ bool qnn_aot_config::load(const std::string & config_path) {
     }
 
     try {
+        transformer_graphs.clear();
+        attention_graphs.clear();
+        lm_head_graphs.clear();
+
         const auto & model_json = json.at("model_parameters");
         model_json.at("n_layers").get_to(model.n_layers);
         model_json.at("vocab_size").get_to(model.vocab_size);
@@ -307,10 +363,17 @@ bool qnn_aot_config::load(const std::string & config_path) {
             }
         }
 
-        if (json.contains("graphs")) {
-            for (const auto & graph_json : json.at("graphs")) {
+        auto load_decode_graphs = [&](const nlohmann::json & graphs_json, const char * fallback_type) {
+            for (const auto & graph_json : graphs_json) {
                 qnn_aot_graph_config graph;
-                graph_json.at("type").get_to(graph.type);
+
+                if (graph_json.contains("type")) {
+                    graph_json.at("type").get_to(graph.type);
+                } else if (fallback_type != nullptr) {
+                    graph.type = fallback_type;
+                }
+                graph.type = normalize_graph_type(graph.type);
+
                 graph_json.at("graph_name").get_to(graph.graph_name);
                 graph_json.at("model_path").get_to(graph.model_path);
                 graph_json.at("x_name").get_to(graph.x_name);
@@ -324,14 +387,26 @@ bool qnn_aot_config::load(const std::string & config_path) {
                 if (graph_json.contains("kv_path_format")) {
                     graph_json.at("kv_path_format").get_to(graph.kv_path_format);
                 }
-                if (graph.type == "transformers") {
-                    transformer_graphs.push_back(std::move(graph));
-                }
-            }
-        }
 
-        if (json.contains("embeddings")) {
-            for (const auto & graph_json : json.at("embeddings")) {
+                if (graph_type_is_transformer(graph.type)) {
+                    transformer_graphs.push_back(std::move(graph));
+                    continue;
+                }
+
+                if (graph_type_is_attention(graph.type)) {
+                    attention_graphs.push_back(std::move(graph));
+                    continue;
+                }
+
+                QNN_LOG_WARN("[aot] unsupported decode graph type '%s' in %s, skip graph %s\n",
+                             graph.type.c_str(),
+                             config_path.c_str(),
+                             graph.graph_name.c_str());
+            }
+        };
+
+        auto load_lm_head_graphs = [&](const nlohmann::json & graphs_json) {
+            for (const auto & graph_json : graphs_json) {
                 qnn_aot_graph_config graph;
                 graph.type = "lm_head";
                 graph_json.at("graph_name").get_to(graph.graph_name);
@@ -341,13 +416,30 @@ bool qnn_aot_config::load(const std::string & config_path) {
                 graph_json.at("batch_size").get_to(graph.batch_size);
                 lm_head_graphs.push_back(std::move(graph));
             }
+        };
+
+        if (json.contains("graphs")) {
+            load_decode_graphs(json.at("graphs"), nullptr);
+        }
+        if (json.contains("transformer_graphs")) {
+            load_decode_graphs(json.at("transformer_graphs"), "transformer");
+        }
+        if (json.contains("attention_graphs")) {
+            load_decode_graphs(json.at("attention_graphs"), "attention");
+        }
+
+        if (json.contains("embeddings")) {
+            load_lm_head_graphs(json.at("embeddings"));
+        }
+        if (json.contains("lm_head_graphs")) {
+            load_lm_head_graphs(json.at("lm_head_graphs"));
         }
     } catch (const std::exception & e) {
         QNN_LOG_WARN("[aot] invalid config schema in %s: %s\n", config_path.c_str(), e.what());
         return false;
     }
 
-    return !transformer_graphs.empty();
+    return !transformer_graphs.empty() || !attention_graphs.empty();
 }
 
 qnn_aot_context::qnn_aot_context(qnn_instance_ptr instance, const std::string & binary_path) :
@@ -777,20 +869,26 @@ qnn_aot_runtime::qnn_aot_runtime(qnn_instance_ptr instance, backend_index_type d
 qnn_aot_runtime::~qnn_aot_runtime() {
     // Destroy graphs before contexts so buffer/memhandle deregistration still sees a live QNN context.
     _transformer_graphs.clear();
+    _attention_graphs.clear();
     _lm_head_graphs.clear();
     _contexts.clear();
 }
 
 bool qnn_aot_runtime::initialize(const std::string & config_path, const std::string & model_dir) {
+    _enabled = false;
     _config_path = config_path;
     _model_dir   = model_dir;
+    _transformer_graphs.clear();
+    _attention_graphs.clear();
+    _lm_head_graphs.clear();
+    _contexts.clear();
 
     if (!_config.load(config_path)) {
         return false;
     }
 
-    if (_config.transformer_graphs.empty()) {
-        QNN_LOG_WARN("[aot] no transformer graphs defined in %s\n", config_path.c_str());
+    if (_config.transformer_graphs.empty() && _config.attention_graphs.empty()) {
+        QNN_LOG_WARN("[aot] no executable decode graphs defined in %s\n", config_path.c_str());
         return false;
     }
 
@@ -844,7 +942,88 @@ bool qnn_aot_runtime::initialize(const std::string & config_path, const std::str
         return true;
     };
 
-    if (!load_graph_family(_config.transformer_graphs, _transformer_graphs, "transformer")) {
+    auto load_stage_family = [this](std::vector<qnn_aot_graph_config> graph_configs,
+                                    std::vector<std::unique_ptr<qnn_aot_graph>> & graphs,
+                                    const char * family_name) -> bool {
+        std::sort(graph_configs.begin(), graph_configs.end(), [](const qnn_aot_graph_config & lhs, const qnn_aot_graph_config & rhs) {
+            if (lhs.start_layer_id != rhs.start_layer_id) {
+                return lhs.start_layer_id < rhs.start_layer_id;
+            }
+            if (lhs.end_layer_id != rhs.end_layer_id) {
+                return lhs.end_layer_id < rhs.end_layer_id;
+            }
+            if (lhs.batch_size != rhs.batch_size) {
+                return lhs.batch_size > rhs.batch_size;
+            }
+            return lhs.graph_name < rhs.graph_name;
+        });
+
+        for (auto graph_config : graph_configs) {
+            graph_config.n_hvx_threads = _config.n_hvx_threads;
+
+            const bool duplicate = std::any_of(graphs.begin(), graphs.end(), [&graph_config](const auto & existing_graph) {
+                if (!existing_graph) {
+                    return false;
+                }
+                const auto & existing = existing_graph->config();
+                return existing.start_layer_id == graph_config.start_layer_id &&
+                       existing.end_layer_id == graph_config.end_layer_id &&
+                       existing.batch_size == graph_config.batch_size;
+            });
+            if (duplicate) {
+                QNN_LOG_WARN("[aot] duplicate %s graph range [%zu, %zu) batch %zu, skip graph %s\n",
+                             family_name,
+                             graph_config.start_layer_id,
+                             graph_config.end_layer_id,
+                             graph_config.batch_size,
+                             graph_config.graph_name.c_str());
+                continue;
+            }
+
+            const auto model_path = (std::filesystem::path(_model_dir) / graph_config.model_path).string();
+            auto context_it = _contexts.find(model_path);
+            if (context_it == _contexts.end()) {
+                auto context = std::make_shared<qnn_aot_context>(_instance, model_path);
+                if (!context->is_valid()) {
+                    return false;
+                }
+                context_it = _contexts.emplace(model_path, std::move(context)).first;
+            }
+
+            const qnn_aot_graph * sibling = nullptr;
+            for (auto existing_graph = graphs.rbegin(); existing_graph != graphs.rend(); ++existing_graph) {
+                if (*existing_graph &&
+                    (*existing_graph)->config().model_path == graph_config.model_path) {
+                    sibling = existing_graph->get();
+                    break;
+                }
+            }
+
+            auto graph = std::make_unique<qnn_aot_graph>(_instance, context_it->second, graph_config, sibling);
+            if (!graph->is_valid()) {
+                return false;
+            }
+
+            QNN_LOG_INFO("[aot] initialized %s graph %s (layers=[%zu,%zu), batch=%zu) from %s\n",
+                         family_name,
+                         graph_config.graph_name.c_str(),
+                         graph_config.start_layer_id,
+                         graph_config.end_layer_id,
+                         graph_config.batch_size,
+                         model_path.c_str());
+            graphs.push_back(std::move(graph));
+        }
+
+        return true;
+    };
+
+    if (!_config.transformer_graphs.empty() &&
+        !load_graph_family(_config.transformer_graphs, _transformer_graphs, "transformer")) {
+        return false;
+    }
+
+    if (!_config.attention_graphs.empty() &&
+        !load_stage_family(_config.attention_graphs, _attention_graphs, "attention")) {
         return false;
     }
 
@@ -852,27 +1031,41 @@ bool qnn_aot_runtime::initialize(const std::string & config_path, const std::str
         return false;
     }
 
-    if (_transformer_graphs.empty()) {
-        QNN_LOG_WARN("[aot] failed to initialize any transformer graph from %s\n", config_path.c_str());
+    if (_transformer_graphs.empty() && _attention_graphs.empty()) {
+        QNN_LOG_WARN("[aot] failed to initialize any executable decode graph from %s\n", config_path.c_str());
         return false;
     }
 
     _seed_kv_size = 0;
-    for (const auto & graph_config : _config.transformer_graphs) {
+    auto visit_stateful_graph_config = [this](const auto & fn) {
+        for (const auto & graph_config : _config.transformer_graphs) {
+            fn(graph_config);
+        }
+        for (const auto & graph_config : _config.attention_graphs) {
+            fn(graph_config);
+        }
+    };
+
+    visit_stateful_graph_config([&](const qnn_aot_graph_config & graph_config) {
         if (graph_config.kv_size == 0) {
-            continue;
+            return;
         }
 
         if (_seed_kv_size == 0) {
             _seed_kv_size = graph_config.kv_size;
-            continue;
+            return;
         }
 
         if (_seed_kv_size != graph_config.kv_size) {
             QNN_LOG_WARN("[aot] inconsistent seed KV sizes in %s: %zu vs %zu\n",
                          config_path.c_str(), _seed_kv_size, graph_config.kv_size);
-            return false;
+            _seed_kv_size = std::numeric_limits<size_t>::max();
+            return;
         }
+    });
+
+    if (_seed_kv_size == std::numeric_limits<size_t>::max()) {
+        return false;
     }
 
     compute_rope_embeds();
@@ -888,19 +1081,30 @@ bool qnn_aot_runtime::has_prefix(const char * name, const char * prefix) {
     return std::strncmp(name, prefix, std::strlen(prefix)) == 0;
 }
 
-bool qnn_aot_runtime::is_transformer_stage_name(const char * name) {
+bool qnn_aot_runtime::is_attention_stage_name(const char * name) {
     if (name == nullptr) {
         return false;
     }
 
-    return has_prefix(name, "norm-") || has_prefix(name, "attn_norm-") || has_prefix(name, "attn_out-") || has_prefix(name, "Qcur-") ||
-           has_prefix(name, "Qcur_normed-") || has_prefix(name, "Kcur-") || has_prefix(name, "Kcur_normed-") ||
-           has_prefix(name, "Vcur-") || has_prefix(name, "cache_k_l") || has_prefix(name, "cache_v_l") ||
+    return has_prefix(name, "norm-") || has_prefix(name, "attn_norm-") || has_prefix(name, "__fattn__-") || has_prefix(name, "attn_out-") || has_prefix(name, "Qcur-") ||
+           has_prefix(name, "Kcur-") || has_prefix(name, "Vcur-") || has_prefix(name, "cache_k_l") || has_prefix(name, "cache_v_l") ||
            has_prefix(name, "kq-") || has_prefix(name, "kq_soft_max-") || has_prefix(name, "kqv-") || has_prefix(name, "kqv_out-") ||
-           has_prefix(name, "ffn_inp-") || has_prefix(name, "ffn_norm-") || has_prefix(name, "ffn_gate-") ||
-           has_prefix(name, "ffn_up-") || has_prefix(name, "ffn_swiglu-") || has_prefix(name, "ffn_out-") ||
-           has_prefix(name, "l_out-") || std::strcmp(name, "self_kq_mask_cnv") == 0 ||
+           std::strcmp(name, "self_kq_mask_cnv") == 0 ||
            std::strcmp(name, "self_kq_mask_swa_cnv") == 0;
+}
+
+bool qnn_aot_runtime::is_ffn_stage_name(const char * name) {
+    if (name == nullptr) {
+        return false;
+    }
+
+    return has_prefix(name, "ffn_inp-") || has_prefix(name, "ffn_norm-") || has_prefix(name, "ffn_gate-") ||
+           has_prefix(name, "ffn_up-") || has_prefix(name, "ffn_swiglu-") || has_prefix(name, "ffn_out-") ||
+           has_prefix(name, "l_out-");
+}
+
+bool qnn_aot_runtime::is_transformer_stage_name(const char * name) {
+    return is_attention_stage_name(name) || is_ffn_stage_name(name);
 }
 
 bool qnn_aot_runtime::is_cpu_stage_name(const char * name) {
@@ -950,12 +1154,18 @@ bool qnn_aot_runtime::supports_op(const ggml_tensor * op) const {
     }
 
     const char * name = ggml_get_name(op);
+    const bool has_transformer_graphs = !_transformer_graphs.empty();
+    const bool has_attention_graphs   = !_attention_graphs.empty();
     if (prefers_cpu_op(op)) {
         return false;
     }
 
-    if (is_transformer_stage_name(name)) {
-        return true;
+    if (is_attention_stage_name(name)) {
+        return has_transformer_graphs || has_attention_graphs;
+    }
+
+    if (is_ffn_stage_name(name)) {
+        return has_transformer_graphs;
     }
 
     if (!_lm_head_graphs.empty() && is_lm_head_stage_name(name)) {
@@ -968,15 +1178,161 @@ bool qnn_aot_runtime::supports_op(const ggml_tensor * op) const {
         if (is_cpu_stage_name(src_name)) {
             return false;
         }
-        has_aot_src = has_aot_src || is_transformer_stage_name(src_name) || is_lm_head_stage_name(src_name);
+        has_aot_src = has_aot_src ||
+                      ((has_transformer_graphs || has_attention_graphs) && is_attention_stage_name(src_name)) ||
+                      (has_transformer_graphs && is_ffn_stage_name(src_name)) ||
+                      (!_lm_head_graphs.empty() && is_lm_head_stage_name(src_name));
     }
 
     return has_aot_src;
 }
 
+bool qnn_aot_runtime::supports_fragment_op(const ggml_tensor * op) const {
+    if (!_enabled || op == nullptr || op->op == GGML_OP_NONE) {
+        return false;
+    }
+
+    if (_attention_graphs.empty()) {
+        return false;
+    }
+
+    const char * name = ggml_get_name(op);
+    if (prefers_cpu_op(op) || is_ffn_stage_name(name) || is_lm_head_stage_name(name)) {
+        return false;
+    }
+
+    if (is_attention_stage_name(name)) {
+        return true;
+    }
+
+    bool has_attention_src = false;
+    for (size_t i = 0; i < GGML_MAX_SRC && op->src[i]; ++i) {
+        const char * src_name = ggml_get_name(op->src[i]);
+        if (is_cpu_stage_name(src_name) || is_ffn_stage_name(src_name) || is_lm_head_stage_name(src_name)) {
+            return false;
+        }
+        has_attention_src = has_attention_src || is_attention_stage_name(src_name);
+    }
+
+    return has_attention_src;
+}
+
+qnn_aot_runtime::aot_match_result qnn_aot_runtime::match_attention_graph(ggml_cgraph * cgraph) const {
+    aot_match_result result;
+    if (!_enabled || _attention_graphs.empty() || cgraph == nullptr || cgraph->n_nodes == 0) {
+        return result;
+    }
+    const bool trace_match = aot_trace_match_enabled();
+
+    auto is_activation_input = [this](const ggml_tensor * tensor) {
+        if (tensor == nullptr || (tensor->flags & GGML_TENSOR_FLAG_PARAM) != 0) {
+            return false;
+        }
+
+        const char * name = ggml_get_name(tensor);
+        if (name && (std::strcmp(name, "embd") == 0 ||
+                     has_prefix(name, "l_out-") ||
+                     has_prefix(name, "ffn_inp-"))) {
+            return true;
+        }
+
+        return tensor->type == GGML_TYPE_F32 &&
+               static_cast<size_t>(tensor->ne[0]) == _config.model.embed_dim &&
+               tensor->ne[1] > 0;
+    };
+
+    auto is_attention_output_name = [this](const char * name) {
+        return has_prefix(name, "__fattn__-") ||
+               has_prefix(name, "attn_out-") ||
+               has_prefix(name, "kqv_out-");
+    };
+
+    bool   seen_attention = false;
+    bool   seen_ffn       = false;
+    size_t min_layer_id   = std::numeric_limits<size_t>::max();
+    size_t max_layer_id   = 0;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        auto *       node = cgraph->nodes[i];
+        const char * name = ggml_get_name(node);
+        seen_attention = seen_attention || is_attention_stage_name(name);
+        seen_ffn       = seen_ffn || is_ffn_stage_name(name);
+
+        size_t layer_id = 0;
+        if (is_attention_stage_name(name) && parse_stage_layer_id(name, layer_id)) {
+            min_layer_id = std::min(min_layer_id, layer_id);
+            max_layer_id = std::max(max_layer_id, layer_id);
+        }
+    }
+
+    if (!seen_attention || seen_ffn || min_layer_id == std::numeric_limits<size_t>::max()) {
+        if (trace_match) {
+            const char * first_name = cgraph->n_nodes > 0 ? ggml_get_name(cgraph->nodes[0]) : nullptr;
+            const char * last_name  = cgraph->n_nodes > 0 ? ggml_get_name(cgraph->nodes[cgraph->n_nodes - 1]) : nullptr;
+            std::fprintf(stderr,
+                         "[aot-match] attention reject: seen_attention=%d seen_ffn=%d has_layer_range=%d n_nodes=%d first=%s last=%s\n",
+                         (int) seen_attention,
+                         (int) seen_ffn,
+                         (int) (min_layer_id != std::numeric_limits<size_t>::max()),
+                         cgraph->n_nodes,
+                         first_name ? first_name : "<null>",
+                         last_name ? last_name : "<null>");
+        }
+        return result;
+    }
+
+    const auto io = get_io_tensors_from_graph(cgraph);
+    for (auto * input : io.inputs) {
+        if (is_activation_input(input)) {
+            result.embd = input;
+            break;
+        }
+    }
+
+    for (auto * output : io.outputs) {
+        const char * name = ggml_get_name(output);
+        if (is_attention_output_name(name)) {
+            result.out = output;
+            break;
+        }
+    }
+
+    if (result.out == nullptr) {
+        for (auto * output : io.outputs) {
+            const char * name = ggml_get_name(output);
+            if (is_attention_stage_name(name) &&
+                output->type == GGML_TYPE_F32 &&
+                static_cast<size_t>(output->ne[0]) == _config.model.embed_dim) {
+                result.out = output;
+                break;
+            }
+        }
+    }
+
+    if (!result.embd || !result.out) {
+        if (trace_match) {
+            std::fprintf(stderr,
+                         "[aot-match] attention IO mismatch: embd=%s out=%s inputs=%zu outputs=%zu layers=[%zu,%zu)\n",
+                         result.embd ? (ggml_get_name(result.embd) ? ggml_get_name(result.embd) : "<unnamed>") : "<null>",
+                         result.out ? (ggml_get_name(result.out) ? ggml_get_name(result.out) : "<unnamed>") : "<null>",
+                         io.inputs.size(),
+                         io.outputs.size(),
+                         min_layer_id,
+                         max_layer_id + 1);
+        }
+        return result;
+    }
+
+    result.n_tokens       = static_cast<size_t>(result.embd->ne[1]);
+    result.inferred_pos   = infer_start_pos(io.inputs, result.n_tokens);
+    result.start_layer_id = min_layer_id;
+    result.end_layer_id   = max_layer_id + 1;
+    result.is_attention   = result.n_tokens > 0;
+    return result;
+}
+
 qnn_aot_runtime::aot_match_result qnn_aot_runtime::match_transformer_graph(ggml_cgraph * cgraph) const {
     aot_match_result result;
-    if (!_enabled || cgraph == nullptr || cgraph->n_nodes == 0) {
+    if (!_enabled || _transformer_graphs.empty() || cgraph == nullptr || cgraph->n_nodes == 0) {
         return result;
     }
 
@@ -1021,16 +1377,6 @@ qnn_aot_runtime::aot_match_result qnn_aot_runtime::match_transformer_graph(ggml_
             const char * name = ggml_get_name(output);
             if (is_transformer_stage_name(name) && has_prefix(name, "l_out-")) {
                 result.out = output;
-            }
-        }
-    }
-
-    if (result.out == nullptr) {
-        for (int i = cgraph->n_nodes - 1; i >= 0; --i) {
-            auto * node = cgraph->nodes[i];
-            if (is_transformer_output_candidate(node)) {
-                result.out = node;
-                break;
             }
         }
     }
@@ -1140,6 +1486,40 @@ qnn_aot_runtime::aot_match_result qnn_aot_runtime::match_lm_head_graph(ggml_cgra
     return result;
 }
 
+qnn_aot_graph * qnn_aot_runtime::select_attention_graph(size_t start_layer_id, size_t end_layer_id, size_t n_tokens) const {
+    if (_attention_graphs.empty()) {
+        return nullptr;
+    }
+
+    qnn_aot_graph * best_ge = nullptr;
+    qnn_aot_graph * best_lt = nullptr;
+    const size_t    target_tokens = std::max<size_t>(1, n_tokens);
+
+    for (const auto & graph_ptr : _attention_graphs) {
+        if (!graph_ptr) {
+            continue;
+        }
+
+        const auto & config = graph_ptr->config();
+        if (config.start_layer_id != start_layer_id || config.end_layer_id != end_layer_id) {
+            continue;
+        }
+
+        if (graph_ptr->batch_size() >= target_tokens) {
+            if (best_ge == nullptr || graph_ptr->batch_size() < best_ge->batch_size()) {
+                best_ge = graph_ptr.get();
+            }
+            continue;
+        }
+
+        if (best_lt == nullptr || graph_ptr->batch_size() > best_lt->batch_size()) {
+            best_lt = graph_ptr.get();
+        }
+    }
+
+    return best_ge != nullptr ? best_ge : best_lt;
+}
+
 qnn_aot_graph * qnn_aot_runtime::select_transformer_graph(size_t n_tokens) const {
     if (_transformer_graphs.empty()) {
         return nullptr;
@@ -1179,6 +1559,9 @@ void qnn_aot_runtime::compute_rope_embeds() {
 
     size_t max_positions = 0;
     for (const auto & graph : _config.transformer_graphs) {
+        max_positions = std::max(max_positions, graph.context_size);
+    }
+    for (const auto & graph : _config.attention_graphs) {
         max_positions = std::max(max_positions, graph.context_size);
     }
     if (max_positions == 0) {
@@ -1352,11 +1735,10 @@ bool qnn_aot_runtime::load_seed_kv() {
         }
     };
 
-    for (const auto & graph_it : _transformer_graphs) {
-        auto & graph = *graph_it.second;
+    auto load_graph_seed_kv = [&](qnn_aot_graph & graph) -> bool {
         const auto & graph_config = graph.config();
         if (graph_config.kv_size == 0) {
-            continue;
+            return true;
         }
 
         for (size_t layer = graph_config.start_layer_id; layer < graph_config.end_layer_id; ++layer) {
@@ -1427,6 +1809,20 @@ bool qnn_aot_runtime::load_seed_kv() {
                 }
             }
         }
+
+        return true;
+    };
+
+    for (const auto & graph_it : _transformer_graphs) {
+        if (!load_graph_seed_kv(*graph_it.second)) {
+            return false;
+        }
+    }
+
+    for (const auto & graph_ptr : _attention_graphs) {
+        if (graph_ptr && !load_graph_seed_kv(*graph_ptr)) {
+            return false;
+        }
     }
 
     _seed_kv_loaded = true;
@@ -1434,8 +1830,7 @@ bool qnn_aot_runtime::load_seed_kv() {
 }
 
 void qnn_aot_runtime::zero_transformer_state() {
-    for (auto & kv : _transformer_graphs) {
-        auto & graph = *kv.second;
+    auto zero_graph_state = [this](qnn_aot_graph & graph) {
         for (const char * tensor_name : { "x", "attn_bias", "rope_embed_cos", "rope_embed_sin", "out" }) {
             if (graph.has_buffer(tensor_name)) {
                 std::memset(graph.buffer_data(tensor_name), 0, graph.buffer_size(tensor_name));
@@ -1454,6 +1849,16 @@ void qnn_aot_runtime::zero_transformer_state() {
                     std::memset(graph.buffer_data(value_cache_name), 0, graph.buffer_size(value_cache_name));
                 }
             }
+        }
+    };
+
+    for (auto & kv : _transformer_graphs) {
+        zero_graph_state(*kv.second);
+    }
+
+    for (auto & graph_ptr : _attention_graphs) {
+        if (graph_ptr) {
+            zero_graph_state(*graph_ptr);
         }
     }
 }
@@ -1483,24 +1888,93 @@ size_t qnn_aot_runtime::infer_start_pos(const std::vector<ggml_tensor *> & input
     return inferred;
 }
 
-bool qnn_aot_runtime::is_transformer_output_candidate(const ggml_tensor * tensor) const {
-    if (tensor == nullptr || (tensor->flags & GGML_TENSOR_FLAG_PARAM) != 0) {
+bool qnn_aot_runtime::execute_attention(ggml_cgraph * cgraph, const aot_match_result & match) {
+    GGML_UNUSED(cgraph);
+    auto * graph = select_attention_graph(match.start_layer_id, match.end_layer_id, match.n_tokens);
+    if (!graph) {
+        if (aot_trace_match_enabled()) {
+            std::fprintf(stderr,
+                         "[aot-match] no attention graph for layers=[%zu,%zu) tokens=%zu (loaded=%zu)\n",
+                         match.start_layer_id,
+                         match.end_layer_id,
+                         match.n_tokens,
+                         _attention_graphs.size());
+            for (const auto & graph_ptr : _attention_graphs) {
+                if (!graph_ptr) {
+                    continue;
+                }
+                const auto & config = graph_ptr->config();
+                std::fprintf(stderr,
+                             "[aot-match] loaded attention graph: name=%s layers=[%zu,%zu) batch=%zu\n",
+                             config.graph_name.c_str(),
+                             config.start_layer_id,
+                             config.end_layer_id,
+                             config.batch_size);
+            }
+        }
         return false;
     }
 
-    if (tensor->type != GGML_TYPE_F32 || ggml_n_dims(tensor) < 1) {
+    if (!match.embd || !match.out) {
         return false;
     }
 
-    if (static_cast<size_t>(tensor->ne[0]) != _config.model.embed_dim) {
+    if ((match.inferred_pos == 0 && _kv_position != 0) ||
+        (_kv_position + match.n_tokens > graph->config().cache_size && match.inferred_pos == 0)) {
+        reset_state();
+    }
+
+    if (match.embd->type != GGML_TYPE_F32 || match.out->type != GGML_TYPE_F32) {
+        QNN_LOG_WARN("[aot] attention IO expects F32 tensors, got %s -> %s\n",
+                     ggml_type_name(match.embd->type),
+                     ggml_type_name(match.out->type));
         return false;
     }
 
-    if (ggml_n_dims(tensor) == 1) {
-        return true;
+    const size_t embed_dim = _config.model.embed_dim;
+    if (static_cast<size_t>(match.embd->ne[0]) != embed_dim ||
+        static_cast<size_t>(match.out->ne[0]) != embed_dim) {
+        QNN_LOG_WARN("[aot] attention IO dim mismatch, expected %zu, got %lld -> %lld\n",
+                     embed_dim,
+                     (long long) match.embd->ne[0],
+                     (long long) match.out->ne[0]);
+        return false;
     }
 
-    return tensor->ne[1] > 0;
+    auto * x_buffer   = static_cast<float *>(graph->buffer_data(graph->config().x_name));
+    auto * out_buffer = static_cast<float *>(graph->buffer_data(graph->config().out_name));
+    if (!x_buffer || !out_buffer) {
+        QNN_LOG_WARN("[aot] missing attention x/out buffers for layers=[%zu,%zu)\n",
+                     match.start_layer_id,
+                     match.end_layer_id);
+        return false;
+    }
+
+    size_t offset = 0;
+    while (offset < match.n_tokens) {
+        const size_t step = std::min(match.n_tokens - offset, graph->batch_size());
+
+        if (step < graph->batch_size()) {
+            std::memset(x_buffer, 0, graph->buffer_size(graph->config().x_name));
+        }
+
+        copy_ggml_rows_to_contiguous(match.embd, offset, step, embed_dim, x_buffer);
+
+        fill_rope_embeds(*graph, _kv_position, step);
+        fill_attention_bias(*graph, step);
+
+        if (!graph->execute()) {
+            return false;
+        }
+
+        copy_contiguous_rows_to_ggml(match.out, offset, step, embed_dim, out_buffer);
+        save_kv(*graph, step);
+
+        _kv_position += step;
+        offset += step;
+    }
+
+    return true;
 }
 
 bool qnn_aot_runtime::execute_transformer(ggml_cgraph * cgraph, const aot_match_result & match) {
@@ -1623,7 +2097,7 @@ bool qnn_aot_runtime::maybe_execute(ggml_cgraph * cgraph) {
 
     auto match_combined_graph = [this](ggml_cgraph * graph) -> combined_match_result {
         combined_match_result combined;
-        if (!_enabled || _lm_head_graphs.empty() || graph == nullptr || graph->n_nodes == 0) {
+        if (!_enabled || _transformer_graphs.empty() || _lm_head_graphs.empty() || graph == nullptr || graph->n_nodes == 0) {
             return combined;
         }
 
@@ -1766,8 +2240,13 @@ bool qnn_aot_runtime::maybe_execute(ggml_cgraph * cgraph) {
         return execute_lm_head(cgraph, lm_head_match);
     }
 
+    const auto attention_match   = match_attention_graph(cgraph);
     const auto transformer_match = match_transformer_graph(cgraph);
     const auto lm_head_match     = match_lm_head_graph(cgraph);
+
+    if (attention_match.is_attention) {
+        return execute_attention(cgraph, attention_match);
+    }
 
     if (transformer_match.is_transformer) {
         return execute_transformer(cgraph, transformer_match);

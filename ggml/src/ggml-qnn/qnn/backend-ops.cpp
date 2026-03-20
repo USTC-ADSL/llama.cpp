@@ -10,8 +10,11 @@
 
 #include "ggml-cpu.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <memory>
+#include <string>
 
 namespace {
 
@@ -30,9 +33,67 @@ bool qnn_backend_temporarily_disabled() {
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
-bool allow_aot_jit_fallback() {
-    const char * value = std::getenv("GGML_QNN_AOT_ALLOW_JIT_FALLBACK");
+bool env_flag_enabled(const char * name) {
+    const char * value = std::getenv(name);
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+bool normalized_backend_is_qnn(const char * value) {
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+
+    std::string normalized(value);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char ch) {
+        return (char) std::tolower(ch);
+    });
+
+    return normalized == "qnn" ||
+           normalized == "qnn-npu" ||
+           normalized == "npu" ||
+           normalized == "htp" ||
+           normalized == "htp0";
+}
+
+bool hetero_mixed_stage_requested() {
+    const char * attn = std::getenv("GGML_HETERO_ATTN_BACKEND");
+    const char * ffn  = std::getenv("GGML_HETERO_FFN_BACKEND");
+
+    const bool attn_set = attn != nullptr && attn[0] != '\0';
+    const bool ffn_set  = ffn  != nullptr && ffn[0]  != '\0';
+
+    if (!attn_set && !ffn_set) {
+        return false;
+    }
+
+    const bool attn_qnn = normalized_backend_is_qnn(attn);
+    const bool ffn_qnn  = normalized_backend_is_qnn(ffn);
+
+    if (attn_set && ffn_set) {
+        if (attn_qnn && ffn_qnn) {
+            return false;
+        }
+        return true;
+    }
+
+    return (attn_set && !attn_qnn) || (ffn_set && !ffn_qnn);
+}
+
+bool aot_mixed_stage_guard_enabled() {
+    return !env_flag_enabled("GGML_QNN_AOT_ALLOW_MIXED_STAGE_JIT");
+}
+
+void warn_mixed_stage_aot_guard_once() {
+    static bool warned = false;
+    if (warned) {
+        return;
+    }
+
+    warned = true;
+    std::fprintf(stderr,
+                 "[aot] mixed-stage QNN AoT graphs are unavailable in this config; "
+                 "skip assigning transformer fragments to QNN to avoid unmatched/JIT fallback. "
+                 "Set GGML_QNN_AOT_ALLOW_MIXED_STAGE_JIT=1 to restore the old experimental behavior.\n");
 }
 
 bool is_aot_trace_name(const char * name) {
@@ -43,10 +104,9 @@ bool is_aot_trace_name(const char * name) {
     for (const char * prefix : {
              "norm-",
              "attn_norm-",
+             "__fattn__-",
              "Qcur-",
-             "Qcur_normed-",
              "Kcur-",
-             "Kcur_normed-",
              "Vcur-",
              "attn_out-",
              "ffn_inp-",
@@ -72,10 +132,6 @@ bool is_aot_trace_name(const char * name) {
            std::strcmp(name, "result_output") == 0;
 }
 
-bool is_anonymous_or_scheduler_name(const char * name) {
-    return name == nullptr || name[0] == '\0' || std::strncmp(name, "node_", std::strlen("node_")) == 0;
-}
-
 bool is_aot_transformer_stage_name(const char * name) {
     if (name == nullptr) {
         return false;
@@ -84,10 +140,9 @@ bool is_aot_transformer_stage_name(const char * name) {
     for (const char * prefix : {
              "norm-",
              "attn_norm-",
+             "__fattn__-",
              "Qcur-",
-             "Qcur_normed-",
              "Kcur-",
-             "Kcur_normed-",
              "Vcur-",
              "attn_out-",
              "kq-",
@@ -204,55 +259,10 @@ void dump_cgraph_nodes(const ggml_cgraph * cgraph) {
 
     std::fprintf(stderr, "[aot] cgraph nodes:");
     for (int i = 0; i < cgraph->n_nodes; ++i) {
-        const ggml_tensor * node = cgraph->nodes[i];
-        const char *        name = ggml_get_name(node);
-
-        std::fprintf(stderr,
-                     "%s%s{%s",
-                     i == 0 ? " " : " -> ",
-                     name ? name : "<null>",
-                     ggml_op_name(node->op));
-
-        bool printed_src = false;
-        for (size_t j = 0; j < GGML_MAX_SRC && node->src[j]; ++j) {
-            const char * src_name = ggml_get_name(node->src[j]);
-            std::fprintf(stderr,
-                         "%s%s",
-                         printed_src ? "," : " src=",
-                         src_name ? src_name : "<null>");
-            printed_src = true;
-        }
-
-        std::fprintf(stderr, "}");
+        const char * name = ggml_get_name(cgraph->nodes[i]);
+        std::fprintf(stderr, "%s%s", i == 0 ? " " : " -> ", name ? name : "<null>");
     }
     std::fprintf(stderr, "\n");
-}
-
-bool should_cpu_fallback_unmatched_aot_cgraph(const ggml_cgraph * cgraph) {
-    constexpr int kResidualCpuFallbackMaxNodes = 16;
-
-    if (cgraph == nullptr || cgraph->n_nodes <= 0 || cgraph->n_nodes > kResidualCpuFallbackMaxNodes) {
-        return false;
-    }
-
-    bool seen_stage         = false;
-    bool seen_embd          = false;
-    bool seen_result_output = false;
-    int  anonymous_nodes    = 0;
-
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
-        const char * name = ggml_get_name(cgraph->nodes[i]);
-
-        seen_stage = seen_stage || is_aot_transformer_stage_name(name) || is_aot_lm_head_stage_name(name);
-        seen_embd = seen_embd || (name != nullptr && std::strcmp(name, "embd") == 0);
-        seen_result_output = seen_result_output || (name != nullptr && std::strcmp(name, "result_output") == 0);
-
-        if (is_anonymous_or_scheduler_name(name)) {
-            anonymous_nodes++;
-        }
-    }
-
-    return (seen_stage || seen_result_output) && anonymous_nodes > 0 && !seen_embd;
 }
 
 qnn::qnn_graph * get_qnn_graph_from_cache(qnn::ggml_backend_qnn_device_context * ctx, const ggml_cgraph * cgraph) {
@@ -646,6 +656,19 @@ bool device_supports_op(qnn::ggml_backend_qnn_device_context * ctx, const ggml_t
         return true;
     }
 
+    if (ctx && ctx->device == QNN_BACKEND_NPU && ctx->aot_mode &&
+        hetero_mixed_stage_requested() && aot_mixed_stage_guard_enabled() &&
+        is_aot_transformer_stage_name(ggml_get_name(op)) &&
+        (!ctx->aot_runtime || !ctx->aot_runtime->supports_fragment_op(op))) {
+        warn_mixed_stage_aot_guard_once();
+        trace_aot_support(op, "aot-mixed-stage-guard", false);
+#ifndef NDEBUG
+        ctx->unsupported_op_count++;
+        print_tensor_info(ctx, op, false);
+#endif
+        return false;
+    }
+
     if (ctx && ctx->aot_mode && ctx->aot_runtime) {
         if (ctx->aot_runtime->supports_op(op)) {
             trace_aot_support(op, "aot-runtime", true);
@@ -758,24 +781,8 @@ bool device_compute_graph(qnn::ggml_backend_qnn_device_context * ctx, ggml_cgrap
                      first_name ? first_name : "<null>",
                      last_name ? last_name : "<null>");
 
-        if (!allow_aot_jit_fallback() &&
-            should_cpu_fallback_unmatched_aot_cgraph(cgraph) &&
-            ctx->cpu_fallback_backend != nullptr) {
-            std::fprintf(stderr, "[aot] cpu fallback for unmatched residual cgraph: n_nodes=%d first=%s last=%s\n",
-                         cgraph->n_nodes,
-                         first_name ? first_name : "<null>",
-                         last_name ? last_name : "<null>");
-
-            const ggml_status cpu_status = ggml_backend_graph_compute(ctx->cpu_fallback_backend, cgraph);
-            if (cpu_status == GGML_STATUS_SUCCESS) {
-                return true;
-            }
-
-            std::fprintf(stderr, "[aot] cpu fallback failed: %s\n", ggml_status_to_string(cpu_status));
-            return false;
-        }
-
-        if (!allow_aot_jit_fallback()) {
+        const char * allow_jit = std::getenv("GGML_QNN_AOT_ALLOW_JIT_FALLBACK");
+        if (allow_jit == nullptr || allow_jit[0] == '\0' || std::strcmp(allow_jit, "0") == 0) {
             std::fprintf(stderr, "[aot] rejecting unmatched cgraph before JIT fallback\n");
             return false;
         }

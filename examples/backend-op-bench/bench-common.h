@@ -10,11 +10,13 @@ struct ResourceGuard {
     ggml_backend_sched_t sched = nullptr;
     ggml_context * ctx = nullptr;
     ggml_backend_t backend = nullptr;
+    ggml_backend_t cpu_backend = nullptr;
 
     ~ResourceGuard() {
         if (sched) ggml_backend_sched_free(sched);
         if (ctx) ggml_free(ctx);
         if (backend) ggml_backend_free(backend);
+        if (cpu_backend) ggml_backend_free(cpu_backend);
     }
 };
 

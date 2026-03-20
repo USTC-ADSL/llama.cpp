@@ -1,13 +1,13 @@
 ## backend-op-bench
 
-用于在不同后端（HTP0 / OpenCL0 / CPU 等）上快速测量单个算子的执行时间。支持多种算子，每个算子独立配置维度和数据类型。
+用于在不同后端（HTP0 / GPUOpenCL / CPU 等）上快速测量单个算子的执行时间。支持多种算子，每个算子独立配置维度和数据类型。
 
 ### 特性
 
 - ✅ **多算子支持**：MUL_MAT、RMS_NORM、SILU、FFN
 - ✅ **灵活的维度配置**：每个算子支持不同的维度参数
-- ✅ **多后端对比**：同时测试 HTP0、OpenCL0、CPU 等
-- ✅ **精确的时间测量**：分离冷启动和稳定状态
+- ✅ **多后端对比**：同时测试 HTP0、GPUOpenCL、CPU 等
+- ✅ **精确的时间测量**：分离冷启动和稳定状态，稳定态统计使用真实均值
 - ✅ **结果验证**：自动检测 NaN/Inf
 - ✅ **模块化架构**：易于添加新算子
 
@@ -41,7 +41,7 @@ cmake --build build --target backend-op-bench
 #### 测试 SILU（纯 SiLU 激活函数）
 ```bash
 # 默认配置：2048×1 输入
-./backend-op-bench --op swiglu --backend HTP0 --backend OpenCL0 --runs 20
+./backend-op-bench --op swiglu --backend HTP0 --backend GPUOpenCL --runs 20
 
 # 自定义维度
 ./backend-op-bench --op swiglu --m 4096 --n 4 --runs 50
@@ -62,7 +62,7 @@ output = x * sigmoid(x)  [d, n]  (SiLU 激活函数)
 #### 测试 FFN（完整 FFN 层）
 ```bash
 # 默认配置：双 2048×2048 权重 × 2048×1 输入
-./backend-op-bench --op ffn --backend HTP0 --backend OpenCL0 --runs 20
+./backend-op-bench --op ffn --backend HTP0 --backend GPUOpenCL --runs 20
 
 # 自定义维度
 ./backend-op-bench --op ffn --m 2048 --k 2048 --n 1 --runs 30
@@ -82,15 +82,15 @@ output = W_down × swiglu [down_m, n]  (下投影)
 
 ```
 mul_mat: 2048x2048 * 2048x1, dtype=Q8_0xF32
-backend       first us     avg us       min us       max us       note
+backend       cold us      avg us       min us       max us       note
 HTP0          1234.56      1100.23      1095.12      1105.34
-OpenCL0       980.44       950.12       945.67       955.89
+GPUOpenCL     980.44       950.12       945.67       955.89
 CPU           2345.67      2200.34      2195.12      2205.56
 ```
 
 **输出字段说明**：
-- `first us`：首次运行时间（冷启动）
-- `avg us`：平均运行时间（min 和 max 的平均值）
+- `cold us`：首次运行时间（冷启动）
+- `avg us`：稳定状态运行时间的算术平均值
 - `min us`：稳定状态最小时间
 - `max us`：稳定状态最大时间
 - `note`：错误信息（如果有）
@@ -108,7 +108,7 @@ Operators:
 
 Options:
   --op NAME       算子名称（默认：mul_mat）
-  --backend NAME  后端名称，可指定多个（默认：HTP0 OpenCL0）
+  --backend NAME  后端名称，可指定多个（默认：HTP0 GPUOpenCL CPU）
   --m M           输出维度/权重行数（默认：2048）
   --k K           输入维度/权重列数（默认：2048）
   --n N           批大小/输入列数（默认：1）
