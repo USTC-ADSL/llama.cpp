@@ -894,7 +894,8 @@ bool qnn_aot_runtime::is_transformer_stage_name(const char * name) {
     }
 
     return has_prefix(name, "norm-") || has_prefix(name, "attn_norm-") || has_prefix(name, "attn_out-") || has_prefix(name, "Qcur-") ||
-           has_prefix(name, "Kcur-") || has_prefix(name, "Vcur-") || has_prefix(name, "cache_k_l") || has_prefix(name, "cache_v_l") ||
+           has_prefix(name, "Qcur_normed-") || has_prefix(name, "Kcur-") || has_prefix(name, "Kcur_normed-") ||
+           has_prefix(name, "Vcur-") || has_prefix(name, "cache_k_l") || has_prefix(name, "cache_v_l") ||
            has_prefix(name, "kq-") || has_prefix(name, "kq_soft_max-") || has_prefix(name, "kqv-") || has_prefix(name, "kqv_out-") ||
            has_prefix(name, "ffn_inp-") || has_prefix(name, "ffn_norm-") || has_prefix(name, "ffn_gate-") ||
            has_prefix(name, "ffn_up-") || has_prefix(name, "ffn_swiglu-") || has_prefix(name, "ffn_out-") ||
@@ -1020,6 +1021,16 @@ qnn_aot_runtime::aot_match_result qnn_aot_runtime::match_transformer_graph(ggml_
             const char * name = ggml_get_name(output);
             if (is_transformer_stage_name(name) && has_prefix(name, "l_out-")) {
                 result.out = output;
+            }
+        }
+    }
+
+    if (result.out == nullptr) {
+        for (int i = cgraph->n_nodes - 1; i >= 0; --i) {
+            auto * node = cgraph->nodes[i];
+            if (is_transformer_output_candidate(node)) {
+                result.out = node;
+                break;
             }
         }
     }
@@ -1470,6 +1481,26 @@ size_t qnn_aot_runtime::infer_start_pos(const std::vector<ggml_tensor *> & input
         }
     }
     return inferred;
+}
+
+bool qnn_aot_runtime::is_transformer_output_candidate(const ggml_tensor * tensor) const {
+    if (tensor == nullptr || (tensor->flags & GGML_TENSOR_FLAG_PARAM) != 0) {
+        return false;
+    }
+
+    if (tensor->type != GGML_TYPE_F32 || ggml_n_dims(tensor) < 1) {
+        return false;
+    }
+
+    if (static_cast<size_t>(tensor->ne[0]) != _config.model.embed_dim) {
+        return false;
+    }
+
+    if (ggml_n_dims(tensor) == 1) {
+        return true;
+    }
+
+    return tensor->ne[1] > 0;
 }
 
 bool qnn_aot_runtime::execute_transformer(ggml_cgraph * cgraph, const aot_match_result & match) {

@@ -150,6 +150,7 @@ class qnn_aot_runtime {
     static bool is_cpu_stage_name(const char * name);
     static bool is_lm_head_stage_name(const char * name);
     static bool is_embedding_lookup(const ggml_tensor * op);
+    bool is_transformer_output_candidate(const ggml_tensor * tensor) const;
 
     aot_match_result match_transformer_graph(ggml_cgraph * cgraph) const;
     aot_match_result match_lm_head_graph(ggml_cgraph * cgraph) const;

@@ -27,7 +27,7 @@ using qnn_tensor_cache_t = std::unordered_map<ggml_tensor *, qnn::qnn_tensor_ptr
 
 int get_op_max_rank(const ggml_tensor * op) {
     int max_rank = ggml_n_dims(op);
-    for (int i = 0; i < GGML_MAX_DIMS && op->src[i]; ++i) {
+    for (int i = 0; i < GGML_MAX_SRC && op->src[i]; ++i) {
         max_rank = std::max(max_rank, ggml_n_dims(op->src[i]));
     }
 
@@ -81,7 +81,7 @@ qnn::qnn_op_config_ptr_t create_operation_from_op_tensor(ggml_tensor * dst, cons
 
     // input tensors
     qnn::qnn_tensor_array_t input_qnn_tensors;
-    for (size_t i = 0; i < GGML_MAX_DIMS && dst->src[i]; ++i) {
+    for (size_t i = 0; i < GGML_MAX_SRC && dst->src[i]; ++i) {
         auto * src            = dst->src[i];
         auto input_qnn_tensor = create_tensor_with_cache(src, qnn::ggml_qnn_tensor::INTERMEDIATE, rank, GGML_TYPE_COUNT,
                                                          device, graph_handle, qnn_instance, tensor_cache);
@@ -153,7 +153,7 @@ int get_io_tensors_from_graph(const ggml_cgraph * cgraph, qnn::ggml_tensor_array
             ++(connectivity_map[dst].in_degree);
         }
 
-        for (size_t j = 0; j < GGML_MAX_DIMS && dst->src[j]; ++j) {
+        for (size_t j = 0; j < GGML_MAX_SRC && dst->src[j]; ++j) {
             auto * src = dst->src[j];
             rank       = std::max(rank, ggml_n_dims(src));
 
@@ -169,6 +169,41 @@ int get_io_tensors_from_graph(const ggml_cgraph * cgraph, qnn::ggml_tensor_array
                 ++(connectivity_map[src].out_degree);
             }
         }
+    }
+
+    // Scheduler-created split graphs may materialize external inputs in cgraph->leafs.
+    // When those leaves are not recovered through the src walk above, add them here so
+    // generic QNN JIT fallback can still build a valid graph.
+    for (int i = 0; i < cgraph->n_leafs; ++i) {
+        ggml_tensor * leaf = cgraph->leafs[i];
+        if (leaf == nullptr || ggml_is_empty(leaf)) {
+            continue;
+        }
+
+        size_t out_degree = 0;
+        for (int node_index = 0; node_index < cgraph->n_nodes; ++node_index) {
+            ggml_tensor * dst = cgraph->nodes[node_index];
+            if (dst == nullptr || ggml_is_empty(dst)) {
+                continue;
+            }
+
+            for (size_t src_index = 0; src_index < GGML_MAX_SRC && dst->src[src_index]; ++src_index) {
+                if (dst->src[src_index] == leaf) {
+                    ++out_degree;
+                }
+            }
+        }
+
+        if (out_degree == 0 || connectivity_map.count(leaf) != 0) {
+            continue;
+        }
+
+        rank = std::max(rank, ggml_n_dims(leaf));
+        connectivity_map[leaf] = {
+            0,
+            out_degree,
+            connectivity_map.size(),
+        };
     }
 
     for (const auto & kv : connectivity_map) {

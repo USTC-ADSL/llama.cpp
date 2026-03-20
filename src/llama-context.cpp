@@ -2310,7 +2310,9 @@ llm_graph_cb llama_context::graph_get_cb() const {
                 has_prefix(tensor_name, "norm-") ||
                 has_prefix(tensor_name, "attn_norm-") ||
                 has_prefix(tensor_name, "Qcur-") ||
+                has_prefix(tensor_name, "Qcur_normed-") ||
                 has_prefix(tensor_name, "Kcur-") ||
+                has_prefix(tensor_name, "Kcur_normed-") ||
                 has_prefix(tensor_name, "Vcur-") ||
                 has_prefix(tensor_name, "attn_out-") ||
                 has_prefix(tensor_name, "ffn_inp-") ||
@@ -2320,6 +2322,8 @@ llm_graph_cb llama_context::graph_get_cb() const {
                 has_prefix(tensor_name, "ffn_swiglu-") ||
                 has_prefix(tensor_name, "ffn_out-") ||
                 has_prefix(tensor_name, "l_out-") ||
+                std::strcmp(tensor_name, "self_kq_mask_cnv") == 0 ||
+                std::strcmp(tensor_name, "self_kq_mask_swa_cnv") == 0 ||
                 std::strcmp(tensor_name, "embd") == 0 ||
                 std::strcmp(tensor_name, "norm") == 0 ||
                 std::strcmp(tensor_name, "result_norm") == 0 ||
@@ -2359,38 +2363,47 @@ llm_graph_cb llama_context::graph_get_cb() const {
             }
         }
 
-        const bool force_cpu = tensor_name != nullptr && (
-            std::strcmp(tensor_name, "inp_tokens") == 0 ||
-            std::strcmp(tensor_name, "embd") == 0 ||
+        const bool aot_transformer_stage = has_prefix(tensor_name, "norm-") ||
+            has_prefix(tensor_name, "attn_norm-") ||
+            has_prefix(tensor_name, "attn_out-") ||
+            has_prefix(tensor_name, "Qcur-") ||
+            has_prefix(tensor_name, "Qcur_normed-") ||
+            has_prefix(tensor_name, "Kcur-") ||
+            has_prefix(tensor_name, "Kcur_normed-") ||
+            has_prefix(tensor_name, "Vcur-") ||
+            has_prefix(tensor_name, "kq-") ||
+            has_prefix(tensor_name, "kq_soft_max-") ||
+            has_prefix(tensor_name, "kqv-") ||
+            has_prefix(tensor_name, "kqv_out-") ||
+            has_prefix(tensor_name, "ffn_inp-") ||
+            has_prefix(tensor_name, "ffn_norm-") ||
+            has_prefix(tensor_name, "ffn_gate-") ||
+            has_prefix(tensor_name, "ffn_up-") ||
+            has_prefix(tensor_name, "ffn_swiglu-") ||
+            has_prefix(tensor_name, "ffn_out-") ||
+            has_prefix(tensor_name, "l_out-") ||
+            (tensor_name != nullptr && (
+                std::strcmp(tensor_name, "self_kq_mask_cnv") == 0 ||
+                std::strcmp(tensor_name, "self_kq_mask_swa_cnv") == 0));
+
+        const bool aot_lm_head_stage = tensor_name != nullptr && (
             std::strcmp(tensor_name, "norm") == 0 ||
             std::strcmp(tensor_name, "result_norm") == 0 ||
             std::strcmp(tensor_name, "result_output") == 0);
 
+        const bool force_cpu = tensor_name != nullptr && (
+            std::strcmp(tensor_name, "inp_tokens") == 0 ||
+            std::strcmp(tensor_name, "embd") == 0 ||
+            ((qnn_aot_backend == nullptr || !qnn_aot_enabled) && aot_lm_head_stage));
+
         if (qnn_aot_enabled && qnn_aot_backend != nullptr) {
-            const bool aot_transformer_stage = has_prefix(tensor_name, "norm-") ||
-                has_prefix(tensor_name, "attn_norm-") ||
-                has_prefix(tensor_name, "attn_out-") ||
-                has_prefix(tensor_name, "Qcur-") ||
-                has_prefix(tensor_name, "Kcur-") ||
-                has_prefix(tensor_name, "Vcur-") ||
-                has_prefix(tensor_name, "kq-") ||
-                has_prefix(tensor_name, "kq_soft_max-") ||
-                has_prefix(tensor_name, "kqv-") ||
-                has_prefix(tensor_name, "kqv_out-") ||
-                has_prefix(tensor_name, "ffn_inp-") ||
-                has_prefix(tensor_name, "ffn_norm-") ||
-                has_prefix(tensor_name, "ffn_gate-") ||
-                has_prefix(tensor_name, "ffn_up-") ||
-                has_prefix(tensor_name, "ffn_swiglu-") ||
-                has_prefix(tensor_name, "ffn_out-") ||
-                has_prefix(tensor_name, "l_out-");
             if (force_cpu) {
                 ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
                 trace_tensor("force-cpu", backend_cpu, true);
-            } else if (aot_transformer_stage && ggml_backend_supports_op(qnn_aot_backend, cur)) {
+            } else if ((aot_transformer_stage || aot_lm_head_stage) && ggml_backend_supports_op(qnn_aot_backend, cur)) {
                 ggml_backend_sched_set_tensor_backend(sched.get(), cur, qnn_aot_backend);
                 trace_tensor("aot-qnn", qnn_aot_backend, true);
-            } else if (aot_transformer_stage) {
+            } else if (aot_transformer_stage || aot_lm_head_stage) {
                 trace_tensor("aot-unsupported", qnn_aot_backend, false);
             }
             return;
@@ -2408,12 +2421,17 @@ llm_graph_cb llama_context::graph_get_cb() const {
         const bool attn_stage = has_prefix(tensor_name, "attn_norm-") ||
             has_prefix(tensor_name, "attn_out-") ||
             has_prefix(tensor_name, "Qcur-") ||
+            has_prefix(tensor_name, "Qcur_normed-") ||
             has_prefix(tensor_name, "Kcur-") ||
+            has_prefix(tensor_name, "Kcur_normed-") ||
             has_prefix(tensor_name, "Vcur-") ||
             has_prefix(tensor_name, "kq-") ||
             has_prefix(tensor_name, "kq_soft_max-") ||
             has_prefix(tensor_name, "kqv-") ||
-            has_prefix(tensor_name, "kqv_out-");
+            has_prefix(tensor_name, "kqv_out-") ||
+            (tensor_name != nullptr && (
+                std::strcmp(tensor_name, "self_kq_mask_cnv") == 0 ||
+                std::strcmp(tensor_name, "self_kq_mask_swa_cnv") == 0));
 
         const bool ffn_stage = has_prefix(tensor_name, "ffn_inp-") ||
             has_prefix(tensor_name, "ffn_norm-") ||
