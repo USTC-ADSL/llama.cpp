@@ -40,6 +40,9 @@ struct ggml_backend_qnn_device_context {
     bool                                  aot_mode = false;
     std::string                           aot_config_path;
     std::string                           aot_model_dir;
+    bool                                  aot_init_attempted = false;
+    std::string                           aot_attempted_config_path;
+    std::string                           aot_attempted_model_dir;
     std::unique_ptr<qnn::qnn_aot_runtime> aot_runtime;
     ggml_backend_t                        cpu_fallback_backend = nullptr;
 

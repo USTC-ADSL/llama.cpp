@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstring>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -110,6 +111,11 @@ class ggml_qnn_tensor : public std::enable_shared_from_this<ggml_qnn_tensor> {
 #endif
 
         if (!buffer) {
+            if (auto shared_buffer = try_bind_existing_qnn_host_buffer(tensor)) {
+                buffer = std::move(shared_buffer);
+            }
+        }
+        if (!buffer) {
             buffer =
                 std::make_shared<qnn_mem_buffer_slice>(reinterpret_cast<uint8_t *>(tensor->data), ggml_nbytes(tensor));
             QNN_LOG_DEBUG("[%s][%s]attach buffer to tensor(%s), size: %d\n", get_backend_name(_device),
@@ -148,7 +154,11 @@ class ggml_qnn_tensor : public std::enable_shared_from_this<ggml_qnn_tensor> {
             return true;
         }
 
-        if (!should_use_mem_handle()) {
+        if (QNN_TENSOR_GET_MEM_TYPE(_qnn_tensor) == QNN_TENSORMEMTYPE_MEMHANDLE) {
+            QNN_TENSOR_SET_MEM_TYPE(_qnn_tensor, QNN_TENSORMEMTYPE_RAW);
+            QNN_TENSOR_SET_MEM_HANDLE(_qnn_tensor, nullptr);
+            QNN_LOG_DEBUG("[%s]clear mem handle\n", _tensor_name.c_str());
+        } else {
             QNN_TENSOR_SET_MEM_TYPE(_qnn_tensor, QNN_TENSORMEMTYPE_RAW);
             Qnn_ClientBuffer_t client_buf = {};
             QNN_TENSOR_SET_CLIENT_BUF(_qnn_tensor, client_buf);
@@ -199,7 +209,14 @@ class ggml_qnn_tensor : public std::enable_shared_from_this<ggml_qnn_tensor> {
             return true;
         }
 
-        if (should_use_mem_handle()) {
+        if (auto mem_handle = buffer->get_mem_handle(); mem_handle != nullptr) {
+            QNN_TENSOR_SET_MEM_TYPE(_qnn_tensor, QNN_TENSORMEMTYPE_MEMHANDLE);
+            QNN_TENSOR_SET_MEM_HANDLE(_qnn_tensor, mem_handle);
+            QNN_LOG_DEBUG("[%s][%s]use direct mem handle %p\n",
+                          get_backend_name(_device),
+                          _tensor_name.c_str(),
+                          mem_handle);
+        } else if (should_use_mem_handle()) {
             if (!_rpc_buffer) {
                 auto rpc_buffer = std::make_shared<qnn_rpc_buffer>(
                     _qnn_instance, buffer->get_size(), QNN_TENSOR_GET_RANK(_qnn_tensor),
@@ -241,6 +258,39 @@ class ggml_qnn_tensor : public std::enable_shared_from_this<ggml_qnn_tensor> {
         QNN_LOG_DEBUG("[%s][%s]bind to buffer: %p, size: %d\n", get_backend_name(_device), _tensor_name.c_str(),
                       (void *) buffer->get_buffer(), (int) buffer->get_size());
         return true;
+    }
+
+    qnn_buffer_ptr try_bind_existing_qnn_host_buffer(ggml_tensor * tensor) const {
+        if (tensor == nullptr) {
+            return nullptr;
+        }
+
+        // qnn-npu-host is backed by the HTP shared-buffer path. Non-HTP backends
+        // should fall back to their normal client-buffer binding instead of trying
+        // to register an invalid shared-buffer memhandle.
+        if (_device != QNN_BACKEND_NPU || !_qnn_instance) {
+            return nullptr;
+        }
+
+        auto qnn_interface = _qnn_instance->get_qnn_interface();
+        if (qnn_interface == nullptr) {
+            return nullptr;
+        }
+
+        auto buffer = try_get_qnn_host_buffer_view(
+            tensor,
+            _qnn_instance->get_qnn_context_handle(),
+            QNN_TENSOR_GET_RANK(_qnn_tensor),
+            QNN_TENSOR_GET_DIMENSIONS(_qnn_tensor),
+            QNN_TENSOR_GET_DATA_TYPE(_qnn_tensor));
+        if (buffer && buffer->get_mem_handle() != nullptr) {
+            QNN_LOG_DEBUG("[%s][%s]reuse qnn shared-host buffer for tensor(%s)\n",
+                          get_backend_name(_device),
+                          _tensor_name.c_str(),
+                          ggml_get_name(tensor));
+        }
+
+        return buffer;
     }
 
     bool write_to_qnn_tensor() {

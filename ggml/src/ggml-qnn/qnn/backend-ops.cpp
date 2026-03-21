@@ -15,8 +15,31 @@
 #include <cstdlib>
 #include <memory>
 #include <string>
+#include <string_view>
 
 namespace {
+
+struct hetero_route_spec {
+    std::string attn;
+    std::string attn_proj;
+    std::string attn_core;
+    std::string attn_out;
+    std::string ffn;
+    std::string output;
+
+    std::string backend_for_output_stage() const {
+        if (!output.empty()) {
+            return output;
+        }
+        if (!attn_out.empty()) {
+            return attn_out;
+        }
+        if (!attn_core.empty()) {
+            return attn_core;
+        }
+        return attn;
+    }
+};
 
 bool trace_aot_support_enabled() {
     const char * value = std::getenv("GGML_QNN_AOT_TRACE_SUPPORT");
@@ -42,45 +65,183 @@ bool allow_aot_jit_fallback() {
     return env_flag_enabled("GGML_QNN_AOT_ALLOW_JIT_FALLBACK");
 }
 
-bool normalized_backend_is_qnn(const char * value) {
-    if (value == nullptr || value[0] == '\0') {
-        return false;
+bool qnn_backend_initialized_for_aot(const qnn::ggml_backend_qnn_device_context * ctx) {
+    return ctx != nullptr && ctx->instance != nullptr && ctx->qnn_interface != nullptr;
+}
+
+std::string trim_copy(std::string_view value) {
+    size_t begin = 0;
+    size_t end   = value.size();
+
+    while (begin < end && std::isspace(static_cast<unsigned char>(value[begin]))) {
+        ++begin;
+    }
+    while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
+        --end;
     }
 
-    std::string normalized(value);
-    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char ch) {
+    return std::string(value.substr(begin, end - begin));
+}
+
+std::string to_lower_copy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
         return (char) std::tolower(ch);
     });
+    return value;
+}
+
+std::string canonicalize_hetero_backend(std::string_view value) {
+    std::string normalized = to_lower_copy(trim_copy(value));
+    if (normalized.empty()) {
+        return {};
+    }
+
+    if (normalized == "cpu") {
+        return "cpu";
+    }
+    if (normalized == "opencl" || normalized == "gpuopencl" || normalized == "gpu") {
+        return "opencl";
+    }
+    if (normalized == "qnn" || normalized == "qnn-npu" || normalized == "npu" || normalized == "htp" ||
+        normalized == "htp0") {
+        return "qnn-npu";
+    }
+    if (normalized == "qnn-gpu") {
+        return "qnn-gpu";
+    }
+    if (normalized == "qnn-cpu") {
+        return "qnn-cpu";
+    }
+
+    return normalized;
+}
+
+bool normalized_backend_is_qnn(const char * value) {
+    const std::string normalized = canonicalize_hetero_backend(value ? std::string_view(value) : std::string_view());
+    if (normalized.empty()) {
+        return false;
+    }
 
     return normalized == "qnn" ||
            normalized == "qnn-npu" ||
-           normalized == "npu" ||
-           normalized == "htp" ||
-           normalized == "htp0";
+           normalized == "qnn-gpu" ||
+           normalized == "qnn-cpu";
+}
+
+void set_hetero_route_field(hetero_route_spec & route, const std::string & key, const std::string & value) {
+    if (key == "attn") {
+        route.attn = value;
+    } else if (key == "attn_proj") {
+        route.attn_proj = value;
+    } else if (key == "attn_core") {
+        route.attn_core = value;
+    } else if (key == "attn_out") {
+        route.attn_out = value;
+    } else if (key == "ffn") {
+        route.ffn = value;
+    } else if (key == "output") {
+        route.output = value;
+    }
+}
+
+hetero_route_spec parse_hetero_route_from_env() {
+    hetero_route_spec route;
+
+    const char * route_env = std::getenv("GGML_HETERO_STAGE_ROUTE");
+    if (route_env == nullptr || route_env[0] == '\0') {
+        route_env = std::getenv("GGML_HETERO_ROUTE");
+    }
+
+    if (route_env != nullptr && route_env[0] != '\0') {
+        std::string route_text(route_env);
+        size_t begin = 0;
+
+        while (begin < route_text.size()) {
+            size_t end = route_text.find_first_of(",;", begin);
+            if (end == std::string::npos) {
+                end = route_text.size();
+            }
+
+            const std::string token = trim_copy(std::string_view(route_text).substr(begin, end - begin));
+            if (!token.empty()) {
+                size_t sep = token.find('=');
+                if (sep == std::string::npos) {
+                    sep = token.find(':');
+                }
+
+                if (sep != std::string::npos) {
+                    const std::string key = to_lower_copy(trim_copy(std::string_view(token).substr(0, sep)));
+                    const std::string value = canonicalize_hetero_backend(std::string_view(token).substr(sep + 1));
+                    if (!key.empty() && !value.empty()) {
+                        set_hetero_route_field(route, key, value);
+                    }
+                }
+            }
+
+            begin = end + 1;
+        }
+
+        return route;
+    }
+
+    route.attn = canonicalize_hetero_backend(
+        std::getenv("GGML_HETERO_ATTN_BACKEND") ? std::getenv("GGML_HETERO_ATTN_BACKEND") : "");
+    route.ffn = canonicalize_hetero_backend(
+        std::getenv("GGML_HETERO_FFN_BACKEND") ? std::getenv("GGML_HETERO_FFN_BACKEND") : "");
+
+    return route;
+}
+
+bool route_explicitly_requests_qnn_cpu() {
+    const hetero_route_spec route = parse_hetero_route_from_env();
+    for (const std::string * backend : {
+             &route.attn,
+             &route.attn_proj,
+             &route.attn_core,
+             &route.attn_out,
+             &route.ffn,
+             &route.output,
+         }) {
+        if (*backend == "qnn-cpu") {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 bool hetero_mixed_stage_requested() {
-    const char * attn = std::getenv("GGML_HETERO_ATTN_BACKEND");
-    const char * ffn  = std::getenv("GGML_HETERO_FFN_BACKEND");
+    const hetero_route_spec route = parse_hetero_route_from_env();
 
-    const bool attn_set = attn != nullptr && attn[0] != '\0';
-    const bool ffn_set  = ffn  != nullptr && ffn[0]  != '\0';
-
-    if (!attn_set && !ffn_set) {
-        return false;
-    }
-
-    const bool attn_qnn = normalized_backend_is_qnn(attn);
-    const bool ffn_qnn  = normalized_backend_is_qnn(ffn);
-
-    if (attn_set && ffn_set) {
-        if (attn_qnn && ffn_qnn) {
-            return false;
+    bool has_qnn = false;
+    bool has_non_qnn = false;
+    for (const std::string * backend : {
+             &route.attn,
+             &route.attn_proj,
+             &route.attn_core,
+             &route.attn_out,
+             &route.ffn,
+         }) {
+        if (backend->empty()) {
+            continue;
         }
-        return true;
+        if (normalized_backend_is_qnn(backend->c_str())) {
+            has_qnn = true;
+        } else {
+            has_non_qnn = true;
+        }
     }
 
-    return (attn_set && !attn_qnn) || (ffn_set && !ffn_qnn);
+    const std::string output_backend = route.backend_for_output_stage();
+    if (!output_backend.empty()) {
+        if (normalized_backend_is_qnn(output_backend.c_str())) {
+            has_qnn = true;
+        } else {
+            has_non_qnn = true;
+        }
+    }
+
+    return has_qnn && has_non_qnn;
 }
 
 bool aot_mixed_stage_guard_enabled() {
@@ -98,6 +259,30 @@ void warn_mixed_stage_aot_guard_once() {
                  "[aot] mixed-stage QNN AoT graphs are unavailable in this config; "
                  "skip assigning transformer fragments to QNN to avoid unmatched/JIT fallback. "
                  "Set GGML_QNN_AOT_ALLOW_MIXED_STAGE_JIT=1 to restore the old experimental behavior.\n");
+}
+
+void warn_mixed_stage_qnn_cpu_guard_once() {
+    static bool warned = false;
+    if (warned) {
+        return;
+    }
+
+    warned = true;
+    std::fprintf(stderr,
+                 "[aot] mixed-stage AoT route does not explicitly request qnn-cpu; "
+                 "keep transformer residual fragments on plain CPU to avoid extra qnn-cpu splits.\n");
+}
+
+void warn_mixed_stage_aot_runtime_unavailable_once() {
+    static bool warned = false;
+    if (warned) {
+        return;
+    }
+
+    warned = true;
+    std::fprintf(stderr,
+                 "[aot] mixed-stage route requested QNN AoT execution, but the live qnn-npu backend has no AoT runtime. "
+                 "Skip assigning transformer fragments to qnn-npu to avoid falling back to the unsupported QNN JIT path.\n");
 }
 
 bool is_aot_trace_name(const char * name) {
@@ -191,6 +376,26 @@ bool is_aot_lm_head_stage_name(const char * name) {
     return std::strcmp(name, "norm") == 0 ||
            std::strcmp(name, "result_norm") == 0 ||
            std::strcmp(name, "result_output") == 0;
+}
+
+bool op_touches_aot_stage_boundary(const ggml_tensor * op) {
+    if (op == nullptr) {
+        return false;
+    }
+
+    const char * name = ggml_get_name(op);
+    if (is_aot_transformer_stage_name(name) || is_aot_lm_head_stage_name(name)) {
+        return true;
+    }
+
+    for (size_t i = 0; i < GGML_MAX_SRC && op->src[i]; ++i) {
+        const char * src_name = ggml_get_name(op->src[i]);
+        if (is_aot_transformer_stage_name(src_name) || is_aot_lm_head_stage_name(src_name)) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 bool is_aot_embedding_lookup(const ggml_tensor * op) {
@@ -730,20 +935,52 @@ bool device_supports_op(qnn::ggml_backend_qnn_device_context * ctx, const ggml_t
         return true;
     }
 
-    if (ctx && ctx->device == QNN_BACKEND_NPU && ctx->aot_runtime == nullptr && device_prefers_aot_preinit_cpu(op)) {
+    const bool qnn_backend_initialized = qnn_backend_initialized_for_aot(ctx);
+    if (ctx && ctx->device == QNN_BACKEND_NPU &&
+        qnn_backend_initialized &&
+        ctx->aot_runtime == nullptr &&
+        aot_env_enabled() &&
+        hetero_mixed_stage_requested() &&
+        op_touches_aot_stage_boundary(op)) {
+        warn_mixed_stage_aot_runtime_unavailable_once();
+        trace_aot_support(op, "aot-runtime-unavailable", false);
+#ifndef NDEBUG
+        ctx->unsupported_op_count++;
+        print_tensor_info(ctx, op, false);
+#endif
+        return false;
+    }
+
+    if (ctx && ctx->device == QNN_BACKEND_NPU && !qnn_backend_initialized &&
+        ctx->aot_runtime == nullptr && device_prefers_aot_preinit_cpu(op)) {
         trace_aot_support(op, "aot-preinit-prefers-cpu", false);
         return false;
     }
 
-    if (ctx && ctx->device == QNN_BACKEND_NPU && ctx->aot_runtime == nullptr && device_supports_aot_preinit(op)) {
+    if (ctx && ctx->device == QNN_BACKEND_NPU && !qnn_backend_initialized &&
+        ctx->aot_runtime == nullptr && device_supports_aot_preinit(op)) {
         trace_aot_support(op, "aot-preinit", true);
         return true;
+    }
+
+    if (ctx && ctx->device == QNN_BACKEND_CPU &&
+        aot_env_enabled() && hetero_mixed_stage_requested() && aot_mixed_stage_guard_enabled() &&
+        !route_explicitly_requests_qnn_cpu() &&
+        op_touches_aot_stage_boundary(op)) {
+        warn_mixed_stage_qnn_cpu_guard_once();
+        trace_aot_support(op, "aot-mixed-stage-qnn-cpu-guard", false);
+#ifndef NDEBUG
+        ctx->unsupported_op_count++;
+        print_tensor_info(ctx, op, false);
+#endif
+        return false;
     }
 
     if (ctx && ctx->device == QNN_BACKEND_NPU && ctx->aot_mode &&
         hetero_mixed_stage_requested() && aot_mixed_stage_guard_enabled() &&
         is_aot_transformer_stage_name(ggml_get_name(op)) &&
-        (!ctx->aot_runtime || !ctx->aot_runtime->supports_fragment_op(op))) {
+        (!ctx->aot_runtime ||
+         (!ctx->aot_runtime->supports_op(op) && !ctx->aot_runtime->supports_fragment_op(op)))) {
         warn_mixed_stage_aot_guard_once();
         trace_aot_support(op, "aot-mixed-stage-guard", false);
 #ifndef NDEBUG

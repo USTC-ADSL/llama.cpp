@@ -4,6 +4,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-hetero-route.h"
 
 #include <algorithm>
 #include <cassert>
@@ -124,13 +125,63 @@ llama_kv_cache::llama_kv_cache(
                             llama_hetero_kv_transfer_mode_name(this->kv_contract.transfer));
                 }
             } break;
-            case llama_hetero_kv_transfer_mode::QNN_RPCMEM:
-                LLAMA_LOG_WARN("%s: attn KV contract requested %s, but workflow2 only implements CPU<->OpenCL shared KV buffers today; keeping legacy per-layer KV placement until QNN sharing is added\n",
-                        __func__,
-                        llama_hetero_kv_transfer_mode_name(this->kv_contract.transfer));
-                break;
+            case llama_hetero_kv_transfer_mode::QNN_RPCMEM: {
+                ggml_backend_dev_t qnn_dev = ggml_backend_dev_by_name("qnn-npu");
+                if (qnn_dev != nullptr) {
+                    shared_kv_buft = ggml_backend_dev_host_buffer_type(qnn_dev);
+                }
+                if (shared_kv_buft != nullptr) {
+                    LLAMA_LOG_INFO("%s: attn KV contract layout=%s transfer=%s producer=%s consumer=%s storage=%s buft=%s\n",
+                            __func__,
+                            llama_hetero_kv_layout_name(this->kv_contract.layout),
+                            llama_hetero_kv_transfer_mode_name(this->kv_contract.transfer),
+                            this->kv_contract.producer_backend.c_str(),
+                            this->kv_contract.consumer_backend.c_str(),
+                            this->kv_contract.storage_backend.empty() ? "<unset>" : this->kv_contract.storage_backend.c_str(),
+                            ggml_backend_buft_name(shared_kv_buft));
+                } else {
+                    LLAMA_LOG_WARN("%s: attn KV contract requested %s but the QNN host buffer type is unavailable; falling back to legacy per-layer KV placement\n",
+                            __func__,
+                            llama_hetero_kv_transfer_mode_name(this->kv_contract.transfer));
+                }
+            } break;
             case llama_hetero_kv_transfer_mode::NONE:
                 break;
+        }
+    }
+
+    ggml_backend_buffer_type_t consumer_kv_buft = nullptr;
+    const char * consumer_kv_dev_name = nullptr;
+    if (shared_kv_buft == nullptr && this->kv_contract.stage_boundary_active()) {
+        const std::string consumer_backend = llama_hetero_canonical_backend(this->kv_contract.consumer_backend);
+        if (consumer_backend == "cpu") {
+            consumer_kv_buft = ggml_backend_cpu_buffer_type();
+            consumer_kv_dev_name = "CPU";
+        } else if (!consumer_backend.empty()) {
+            ggml_backend_dev_t consumer_dev = ggml_backend_dev_by_name(consumer_backend.c_str());
+            if (consumer_dev == nullptr && consumer_backend == "opencl") {
+                consumer_dev = ggml_backend_dev_by_name("GPUOpenCL");
+            }
+            if (consumer_dev != nullptr) {
+                consumer_kv_buft = ggml_backend_dev_buffer_type(consumer_dev);
+                consumer_kv_dev_name = ggml_backend_dev_name(consumer_dev);
+            }
+        }
+
+        if (consumer_kv_buft != nullptr) {
+            LLAMA_LOG_INFO("%s: attn KV contract fallback keeps legacy placement on the consumer backend=%s for %s -> %s (layout=%s transfer=%s reason=%s)\n",
+                    __func__,
+                    consumer_kv_dev_name != nullptr ? consumer_kv_dev_name : ggml_backend_buft_name(consumer_kv_buft),
+                    this->kv_contract.producer_backend.c_str(),
+                    this->kv_contract.consumer_backend.c_str(),
+                    llama_hetero_kv_layout_name(this->kv_contract.layout),
+                    llama_hetero_kv_transfer_mode_name(this->kv_contract.transfer),
+                    this->kv_contract.reason.empty() ? "<none>" : this->kv_contract.reason.c_str());
+        } else {
+            LLAMA_LOG_WARN("%s: attn KV split %s -> %s requested consumer-owned legacy placement, but the consumer buffer type is unavailable; falling back to model offload placement\n",
+                    __func__,
+                    this->kv_contract.producer_backend.c_str(),
+                    this->kv_contract.consumer_backend.c_str());
         }
     }
 
@@ -158,6 +209,9 @@ llama_kv_cache::llama_kv_cache(
         if (shared_kv_buft != nullptr) {
             buft = shared_kv_buft;
             dev_name = ggml_backend_buft_name(shared_kv_buft);
+        } else if (consumer_kv_buft != nullptr) {
+            buft = consumer_kv_buft;
+            dev_name = consumer_kv_dev_name != nullptr ? consumer_kv_dev_name : ggml_backend_buft_name(consumer_kv_buft);
         } else if (offload) {
             auto * dev = model.dev_layer(il);
             buft = ggml_backend_dev_buffer_type(dev);

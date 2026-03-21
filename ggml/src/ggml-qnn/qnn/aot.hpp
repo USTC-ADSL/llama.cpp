@@ -23,6 +23,12 @@ struct qnn_aot_graph_config {
     std::string model_path;
     std::string x_name;
     std::string out_name;
+    std::string q_name;
+    std::string k_name;
+    std::string v_name;
+    std::string cache_k_name;
+    std::string cache_v_name;
+    std::string attn_bias_name;
 
     size_t batch_size     = 0;
     size_t cache_size     = 0;
@@ -56,6 +62,8 @@ struct qnn_aot_config {
 
     std::vector<qnn_aot_graph_config> transformer_graphs;
     std::vector<qnn_aot_graph_config> attention_graphs;
+    std::vector<qnn_aot_graph_config> attn_proj_graphs;
+    std::vector<qnn_aot_graph_config> attn_core_graphs;
     std::vector<qnn_aot_graph_config> ffn_graphs;
     std::vector<qnn_aot_graph_config> lm_head_graphs;
 
@@ -91,6 +99,8 @@ class qnn_aot_graph {
     const void * buffer_data(const std::string & name) const;
     size_t       buffer_size(const std::string & name) const;
     bool         has_buffer(const std::string & name) const;
+    bool         bind_external_tensor(const std::string & name, ggml_tensor * tensor);
+    void         clear_external_tensor_bindings();
     // Returns QNN_DATATYPE_UNDEFINED if the tensor name is not found.
     Qnn_DataType_t tensor_data_type(const std::string & name) const;
     size_t       batch_size() const { return _config.batch_size; }
@@ -116,6 +126,7 @@ class qnn_aot_graph {
     std::unordered_map<std::string, size_t> _input_index;
     std::unordered_map<std::string, size_t> _output_index;
     std::unordered_map<std::string, qnn_buffer_ptr> _buffers;
+    std::unordered_map<std::string, qnn_buffer_ptr> _external_buffers;
     std::shared_ptr<qnn_shared_buffer_allocator> _shared_allocator;
 };
 
@@ -147,12 +158,22 @@ class qnn_aot_runtime {
         ggml_tensor * embd = nullptr;
         ggml_tensor * aux  = nullptr;
         ggml_tensor * out  = nullptr;
+        ggml_tensor * q_out = nullptr;
+        ggml_tensor * k_out = nullptr;
+        ggml_tensor * v_out = nullptr;
+        ggml_tensor * cache_k = nullptr;
+        ggml_tensor * cache_v = nullptr;
+        ggml_tensor * kq_mask = nullptr;
+        ggml_tensor * k_idxs = nullptr;
+        ggml_tensor * v_idxs = nullptr;
         size_t        n_tokens = 0;
         size_t        inferred_pos = 0;
         size_t        start_layer_id = 0;
         size_t        end_layer_id   = 0;
         size_t        layer_id       = std::numeric_limits<size_t>::max();
         bool          is_attention   = false;
+        bool          is_attn_proj   = false;
+        bool          is_attn_core   = false;
         bool          is_transformer = false;
         bool          is_ffn         = false;
         bool          is_lm_head     = false;
@@ -160,6 +181,9 @@ class qnn_aot_runtime {
 
     static bool has_prefix(const char * name, const char * prefix);
     static size_t parse_layer_id_from_name(const char * name);
+    static bool is_attention_proj_stage_name(const char * name);
+    static bool is_attention_core_stage_name(const char * name);
+    static bool is_attention_output_stage_name(const char * name);
     static bool is_attention_stage_name(const char * name);
     static bool is_ffn_stage_name(const char * name);
     static bool is_transformer_stage_name(const char * name);
@@ -169,14 +193,20 @@ class qnn_aot_runtime {
     bool is_transformer_output_candidate(const ggml_tensor * tensor) const;
 
     aot_match_result match_attention_graph(ggml_cgraph * cgraph) const;
+    aot_match_result match_attn_proj_graph(ggml_cgraph * cgraph) const;
+    aot_match_result match_attn_core_graph(ggml_cgraph * cgraph) const;
     aot_match_result match_transformer_graph(ggml_cgraph * cgraph) const;
     aot_match_result match_ffn_graph(ggml_cgraph * cgraph) const;
     aot_match_result match_lm_head_graph(ggml_cgraph * cgraph) const;
     bool execute_attention(ggml_cgraph * cgraph, const aot_match_result & match);
+    bool execute_attn_proj(ggml_cgraph * cgraph, const aot_match_result & match);
+    bool execute_attn_core(ggml_cgraph * cgraph, const aot_match_result & match);
     bool execute_transformer(ggml_cgraph * cgraph, const aot_match_result & match);
     bool execute_ffn(ggml_cgraph * cgraph, const aot_match_result & match);
     bool execute_lm_head(ggml_cgraph * cgraph, const aot_match_result & match);
     qnn_aot_graph * select_attention_graph(size_t start_layer_id, size_t end_layer_id, size_t n_tokens) const;
+    qnn_aot_graph * select_attn_proj_graph(size_t n_tokens, size_t layer_id) const;
+    qnn_aot_graph * select_attn_core_graph(size_t n_tokens, size_t layer_id) const;
     qnn_aot_graph * select_transformer_graph(size_t n_tokens) const;
     qnn_aot_graph * select_ffn_graph(size_t n_tokens, size_t layer_id) const;
     qnn_aot_graph * select_lm_head_graph(size_t n_tokens) const;
@@ -204,6 +234,8 @@ class qnn_aot_runtime {
     std::vector<rope_embedding> _rope_embeds;
     graph_family _transformer_graphs;
     std::vector<std::unique_ptr<qnn_aot_graph>> _attention_graphs;
+    graph_family _attn_proj_graphs;
+    graph_family _attn_core_graphs;
     graph_family _ffn_graphs;
     graph_family _lm_head_graphs;
     std::unordered_map<std::string, std::shared_ptr<qnn_aot_context>> _contexts;

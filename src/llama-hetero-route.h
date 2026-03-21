@@ -61,7 +61,13 @@ struct llama_hetero_route_spec {
             case llama_hetero_route_stage::ATTN_CORE:
                 return !attn_core.empty() ? attn_core : attn;
             case llama_hetero_route_stage::ATTN_OUT:
-                return !attn_out.empty() ? attn_out : attn;
+                if (!attn_out.empty()) {
+                    return attn_out;
+                }
+                if (!attn_core.empty()) {
+                    return attn_core;
+                }
+                return attn;
             case llama_hetero_route_stage::FFN:
                 return ffn;
             case llama_hetero_route_stage::OUTPUT:
@@ -70,6 +76,9 @@ struct llama_hetero_route_spec {
                 }
                 if (!attn_out.empty()) {
                     return attn_out;
+                }
+                if (!attn_core.empty()) {
+                    return attn_core;
                 }
                 return attn;
         }
@@ -289,12 +298,15 @@ static inline bool llama_hetero_is_attn_core_tensor_name(const char * tensor_nam
 }
 
 static inline bool llama_hetero_is_attn_out_tensor_name(const char * tensor_name) {
-    return llama_hetero_name_has_prefix(tensor_name, "attn_out-");
+    return tensor_name != nullptr && (
+        llama_hetero_name_has_prefix(tensor_name, "attn_out-") ||
+        llama_hetero_name_has_prefix(tensor_name, "ffn_inp-"));
 }
 
 static inline bool llama_hetero_is_ffn_tensor_name(const char * tensor_name) {
     return tensor_name != nullptr && (
-        llama_hetero_name_has_prefix(tensor_name, "ffn") ||
+        (llama_hetero_name_has_prefix(tensor_name, "ffn") &&
+         !llama_hetero_name_has_prefix(tensor_name, "ffn_inp-")) ||
         llama_hetero_name_has_prefix(tensor_name, "l_out-"));
 }
 
@@ -448,6 +460,76 @@ static inline bool llama_hetero_route_has_cpu_opencl_mix(const llama_hetero_rout
     return has_cpu && has_opencl;
 }
 
+static inline bool llama_hetero_route_has_qnn_mix(const llama_hetero_route_spec & spec) {
+    bool has_qnn = false;
+    bool has_non_qnn = false;
+
+    const std::array<llama_hetero_route_stage, 5> stages = {{
+        llama_hetero_route_stage::ATTN_PROJ,
+        llama_hetero_route_stage::ATTN_CORE,
+        llama_hetero_route_stage::ATTN_OUT,
+        llama_hetero_route_stage::FFN,
+        llama_hetero_route_stage::OUTPUT,
+    }};
+
+    for (const auto stage : stages) {
+        const int kind = llama_hetero_backend_kind(spec.backend_for(stage));
+        if (kind == 0) {
+            continue;
+        }
+        if (kind == 3) {
+            has_qnn = true;
+        } else {
+            has_non_qnn = true;
+        }
+    }
+
+    return has_qnn && has_non_qnn;
+}
+
+template <typename Predicate>
+static inline bool llama_hetero_route_has_adjacent_stage_boundary(
+        const llama_hetero_route_spec & spec,
+        Predicate predicate) {
+    static constexpr std::array<std::pair<llama_hetero_route_stage, llama_hetero_route_stage>, 4> kAdjacentStagePairs = {{
+        { llama_hetero_route_stage::ATTN_PROJ, llama_hetero_route_stage::ATTN_CORE },
+        { llama_hetero_route_stage::ATTN_CORE, llama_hetero_route_stage::ATTN_OUT  },
+        { llama_hetero_route_stage::ATTN_OUT,  llama_hetero_route_stage::FFN       },
+        { llama_hetero_route_stage::FFN,       llama_hetero_route_stage::OUTPUT    },
+    }};
+
+    for (const auto & [producer_stage, consumer_stage] : kAdjacentStagePairs) {
+        const std::string producer_backend = spec.backend_for(producer_stage);
+        const std::string consumer_backend = spec.backend_for(consumer_stage);
+
+        if (producer_backend.empty() || consumer_backend.empty() || producer_backend == consumer_backend) {
+            continue;
+        }
+
+        if (predicate(producer_backend, consumer_backend)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static inline bool llama_hetero_route_has_cpu_opencl_adjacent_boundary(const llama_hetero_route_spec & spec) {
+    return llama_hetero_route_has_adjacent_stage_boundary(spec, [](const std::string & lhs, const std::string & rhs) {
+        const int lhs_kind = llama_hetero_backend_kind(lhs);
+        const int rhs_kind = llama_hetero_backend_kind(rhs);
+        return (lhs_kind == 1 && rhs_kind == 2) || (lhs_kind == 2 && rhs_kind == 1);
+    });
+}
+
+static inline bool llama_hetero_route_has_qnn_adjacent_boundary(const llama_hetero_route_spec & spec) {
+    return llama_hetero_route_has_adjacent_stage_boundary(spec, [](const std::string & lhs, const std::string & rhs) {
+        const bool lhs_is_qnn = llama_hetero_is_qnn_backend(lhs);
+        const bool rhs_is_qnn = llama_hetero_is_qnn_backend(rhs);
+        return lhs_is_qnn != rhs_is_qnn;
+    });
+}
+
 static inline bool llama_hetero_route_has_cpu_opencl_attn_kv_boundary(const llama_hetero_route_spec & spec) {
     const int attn_proj_kind = llama_hetero_backend_kind(spec.backend_for(llama_hetero_route_stage::ATTN_PROJ));
     const int attn_core_kind = llama_hetero_backend_kind(spec.backend_for(llama_hetero_route_stage::ATTN_CORE));
@@ -460,6 +542,38 @@ static inline bool llama_hetero_route_has_cpu_opencl_attn_kv_boundary(const llam
     const bool proj_opencl_core_cpu = attn_proj_kind == 2 && attn_core_kind == 1;
 
     return proj_cpu_core_opencl || proj_opencl_core_cpu;
+}
+
+static inline bool llama_hetero_route_has_qnn_cpu_attn_kv_boundary(const llama_hetero_route_spec & spec) {
+    const std::string attn_proj_backend = spec.backend_for(llama_hetero_route_stage::ATTN_PROJ);
+    const std::string attn_core_backend = spec.backend_for(llama_hetero_route_stage::ATTN_CORE);
+
+    if (attn_proj_backend.empty() || attn_core_backend.empty() || attn_proj_backend == attn_core_backend) {
+        return false;
+    }
+
+    const bool proj_qnn_core_cpu = llama_hetero_is_qnn_backend(attn_proj_backend) &&
+                                   llama_hetero_is_cpu_backend(attn_core_backend);
+    const bool proj_cpu_core_qnn = llama_hetero_is_cpu_backend(attn_proj_backend) &&
+                                   llama_hetero_is_qnn_backend(attn_core_backend);
+
+    return proj_qnn_core_cpu || proj_cpu_core_qnn;
+}
+
+static inline bool llama_hetero_route_has_qnn_opencl_attn_kv_boundary(const llama_hetero_route_spec & spec) {
+    const std::string attn_proj_backend = spec.backend_for(llama_hetero_route_stage::ATTN_PROJ);
+    const std::string attn_core_backend = spec.backend_for(llama_hetero_route_stage::ATTN_CORE);
+
+    if (attn_proj_backend.empty() || attn_core_backend.empty() || attn_proj_backend == attn_core_backend) {
+        return false;
+    }
+
+    const bool proj_qnn_core_opencl = llama_hetero_is_qnn_backend(attn_proj_backend) &&
+                                      llama_hetero_is_opencl_backend(attn_core_backend);
+    const bool proj_opencl_core_qnn = llama_hetero_is_opencl_backend(attn_proj_backend) &&
+                                      llama_hetero_is_qnn_backend(attn_core_backend);
+
+    return proj_qnn_core_opencl || proj_opencl_core_qnn;
 }
 
 static inline llama_hetero_kv_contract llama_hetero_build_attn_kv_contract(
@@ -475,6 +589,8 @@ static inline llama_hetero_kv_contract llama_hetero_build_attn_kv_contract(
     }
 
     const bool cpu_opencl_boundary = llama_hetero_route_has_cpu_opencl_attn_kv_boundary(spec);
+    const bool qnn_cpu_boundary = llama_hetero_route_has_qnn_cpu_attn_kv_boundary(spec);
+    const bool qnn_opencl_boundary = llama_hetero_route_has_qnn_opencl_attn_kv_boundary(spec);
     const bool qnn_boundary = llama_hetero_is_qnn_backend(contract.producer_backend) ||
                               llama_hetero_is_qnn_backend(contract.consumer_backend);
 
@@ -500,12 +616,14 @@ static inline llama_hetero_kv_contract llama_hetero_build_attn_kv_contract(
         policy == llama_hetero_kv_contract_policy::QNN_RPCMEM) {
         contract.layout = llama_hetero_kv_layout_kind::STAGE_SHARED;
         contract.transfer = llama_hetero_kv_transfer_mode::QNN_RPCMEM;
-        contract.storage_backend = "qnn-rpcmem";
+        contract.storage_backend = (qnn_cpu_boundary || qnn_opencl_boundary) ? "qnn-npu-host" : "qnn-rpcmem";
         contract.shared_buffer_required = true;
-        contract.implemented = false;
+        contract.implemented = qnn_cpu_boundary || qnn_opencl_boundary;
         contract.buffer_available = false;
         contract.zero_copy = false;
-        contract.reason = "qnn-stage-shared-reserved";
+        contract.reason = qnn_cpu_boundary ? "qnn-cpu-stage-shared" :
+                          qnn_opencl_boundary ? "qnn-opencl-stage-shared" :
+                          "qnn-stage-shared-reserved";
         return contract;
     }
 
@@ -531,7 +649,8 @@ static inline llama_hetero_kv_contract llama_hetero_build_attn_kv_contract(const
 
 static inline llama_hetero_kv_contract llama_hetero_finalize_kv_contract(
         llama_hetero_kv_contract contract,
-        bool cpu_opencl_host_buffer_available) {
+        bool cpu_opencl_host_buffer_available,
+        bool qnn_host_buffer_available) {
     switch (contract.transfer) {
         case llama_hetero_kv_transfer_mode::NONE:
             contract.buffer_available = true;
@@ -545,8 +664,11 @@ static inline llama_hetero_kv_contract llama_hetero_finalize_kv_contract(
             }
             return contract;
         case llama_hetero_kv_transfer_mode::QNN_RPCMEM:
-            contract.buffer_available = false;
-            contract.zero_copy = false;
+            contract.buffer_available = qnn_host_buffer_available;
+            contract.zero_copy = contract.implemented && contract.buffer_available;
+            if (!contract.buffer_available && contract.reason == "qnn-cpu-stage-shared") {
+                contract.reason = "qnn-host-buffer-unavailable";
+            }
             return contract;
     }
 

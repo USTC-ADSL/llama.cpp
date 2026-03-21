@@ -267,12 +267,31 @@ llama_context::llama_context(
 
     const auto & hetero_route = hetero_plan.route;
     const bool dynamic_cpu_opencl_zero_copy =
-        llama_hetero_route_has_cpu_opencl_mix(dynamic_route_config.prefill.plan.route) ||
-        llama_hetero_route_has_cpu_opencl_mix(dynamic_route_config.decode.plan.route) ||
-        llama_hetero_route_has_cpu_opencl_mix(dynamic_route_config.fallback.plan.route);
+        llama_hetero_route_has_cpu_opencl_adjacent_boundary(dynamic_route_config.prefill.plan.route) ||
+        llama_hetero_route_has_cpu_opencl_adjacent_boundary(dynamic_route_config.decode.plan.route) ||
+        llama_hetero_route_has_cpu_opencl_adjacent_boundary(dynamic_route_config.fallback.plan.route);
+    const bool dynamic_qnn_shared_host =
+        llama_hetero_route_has_qnn_adjacent_boundary(dynamic_route_config.prefill.plan.route) ||
+        llama_hetero_route_has_qnn_adjacent_boundary(dynamic_route_config.decode.plan.route) ||
+        llama_hetero_route_has_qnn_adjacent_boundary(dynamic_route_config.fallback.plan.route);
     const bool hetero_cpu_opencl_zero_copy =
-        llama_hetero_route_has_cpu_opencl_mix(hetero_route) ||
+        llama_hetero_route_has_cpu_opencl_adjacent_boundary(hetero_route) ||
         dynamic_cpu_opencl_zero_copy;
+    const auto env_flag_enabled = [](const char * name) {
+        const char * value = std::getenv(name);
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    };
+    const bool qnn_shared_host_experimental =
+        env_flag_enabled("GGML_HETERO_QNN_SHARED_HOST");
+    const bool hetero_trace_share =
+        env_flag_enabled("GGML_HETERO_TRACE_SHARE");
+    const bool hetero_qnn_shared_host_requested =
+        qnn_shared_host_experimental && (
+            llama_hetero_route_has_qnn_adjacent_boundary(hetero_route) ||
+            dynamic_qnn_shared_host);
+    bool hetero_qnn_shared_host_compute = false;
+    bool hetero_shared_host_compute = hetero_cpu_opencl_zero_copy;
+    ggml_backend_buffer_type_t shared_host_buft = nullptr;
 
     if (!hparams.vocab_only) {
         // GPU backends
@@ -317,11 +336,62 @@ llama_context::llama_context(
             return nullptr;
         };
 
-        const bool opencl_host_buffer_available = find_opencl_host_buft() != nullptr;
+        const auto find_qnn_host_buft = [&]() -> ggml_backend_buffer_type_t {
+            for (const auto & backend : backends) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+                if (dev != nullptr && std::strcmp(ggml_backend_dev_name(dev), "qnn-npu") == 0) {
+                    return ggml_backend_dev_host_buffer_type(dev);
+                }
+            }
+
+            return nullptr;
+        };
+
+        ggml_backend_buffer_type_t opencl_shared_host_buft = find_opencl_host_buft();
+        ggml_backend_buffer_type_t qnn_shared_host_buft = find_qnn_host_buft();
+        const bool opencl_host_buffer_available = opencl_shared_host_buft != nullptr;
+        const bool qnn_host_buffer_available = qnn_shared_host_buft != nullptr;
+        const auto opencl_supports_buft = [&](ggml_backend_buffer_type_t buft) -> bool {
+            if (buft == nullptr) {
+                return false;
+            }
+
+            ggml_backend_dev_t opencl_dev = ggml_backend_dev_by_name("GPUOpenCL");
+            return opencl_dev != nullptr && ggml_backend_dev_supports_buft(opencl_dev, buft);
+        };
+
+        if (hetero_qnn_shared_host_requested) {
+            if (hetero_cpu_opencl_zero_copy) {
+                const bool opencl_can_alias_qnn_host = opencl_supports_buft(qnn_shared_host_buft);
+                if (qnn_host_buffer_available && opencl_can_alias_qnn_host) {
+                    shared_host_buft = qnn_shared_host_buft;
+                    hetero_qnn_shared_host_compute = true;
+                    LLAMA_LOG_INFO("%s: enabling unified CPU/QNN/OpenCL shared-host compute buffers with %s for hetero decode stages\n",
+                            __func__,
+                            ggml_backend_buft_name(shared_host_buft));
+                } else {
+                    shared_host_buft = opencl_shared_host_buft;
+                    hetero_qnn_shared_host_compute = false;
+                    LLAMA_LOG_WARN("%s: requested unified CPU/QNN/OpenCL shared-host compute buffers, but qnn-npu-host is unavailable or not OpenCL-compatible in this context. Falling back to %s for compute tensors; the attn KV contract may still allocate qnn-npu-host separately.\n",
+                            __func__,
+                            shared_host_buft ? ggml_backend_buft_name(shared_host_buft) : "<null>");
+                }
+            } else {
+                shared_host_buft = qnn_shared_host_buft;
+                hetero_qnn_shared_host_compute = qnn_host_buffer_available;
+            }
+        } else if (hetero_cpu_opencl_zero_copy) {
+            shared_host_buft = opencl_shared_host_buft;
+        }
+
+        hetero_shared_host_compute =
+            shared_host_buft != nullptr &&
+            (hetero_cpu_opencl_zero_copy || hetero_qnn_shared_host_compute);
 
         hetero_kv_contract_allocated = llama_hetero_finalize_kv_contract(
                 hetero_plan.attn_kv,
-                opencl_host_buffer_available);
+                opencl_host_buffer_available,
+                qnn_host_buffer_available);
 
         const auto maybe_promote_allocated_kv = [&](const llama_dynamic_route_candidate & candidate) {
             if (!candidate.configured ||
@@ -331,7 +401,8 @@ llama_context::llama_context(
 
             llama_hetero_kv_contract upgraded = llama_hetero_finalize_kv_contract(
                     candidate.plan.attn_kv,
-                    opencl_host_buffer_available);
+                    opencl_host_buffer_available,
+                    qnn_host_buffer_available);
 
             if (llama_hetero_kv_contract_can_satisfy(upgraded, hetero_kv_contract_allocated)) {
                 LLAMA_LOG_INFO("%s: promoting allocated attn KV contract for %s to layout=%s transfer=%s\n",
@@ -436,7 +507,7 @@ llama_context::llama_context(
         backend_ptrs.clear();
         backend_buf_exp_size.clear();
 
-        ggml_backend_buffer_type_t opencl_zero_copy_buft = nullptr;
+        ggml_backend_buffer_type_t shared_host_compute_buft = nullptr;
         const auto backend_dev_type_name = [](enum ggml_backend_dev_type type) -> const char * {
             switch (type) {
                 case GGML_BACKEND_DEVICE_TYPE_CPU:   return "CPU";
@@ -447,22 +518,33 @@ llama_context::llama_context(
             return "UNKNOWN";
         };
 
-        if (hetero_cpu_opencl_zero_copy) {
-            for (const auto & backend : backends) {
-                ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
-                if (dev != nullptr && std::strcmp(ggml_backend_dev_name(dev), "GPUOpenCL") == 0) {
-                    opencl_zero_copy_buft = ggml_backend_dev_host_buffer_type(dev);
-                    break;
-                }
-            }
-
-            if (opencl_zero_copy_buft != nullptr) {
-                LLAMA_LOG_INFO("%s: enabling CPU<->OpenCL zero-copy compute buffers with %s for hetero decode stages\n",
+        if (hetero_shared_host_compute) {
+            shared_host_compute_buft = shared_host_buft;
+            if (shared_host_compute_buft != nullptr) {
+                LLAMA_LOG_INFO("%s: enabling shared host compute buffers with %s for hetero decode stages (cpu/opencl=%s, qnn-mixed=%s)\n",
                                __func__,
-                               ggml_backend_buft_name(opencl_zero_copy_buft));
+                               ggml_backend_buft_name(shared_host_compute_buft),
+                               hetero_cpu_opencl_zero_copy ? "true" : "false",
+                               hetero_qnn_shared_host_compute ? "true" : "false");
+                if (hetero_trace_share) {
+                    std::fprintf(stderr,
+                                 "ggml_hetero_buft: shared_host=%s cpu_opencl=%d qnn_mixed=%d\n",
+                                 ggml_backend_buft_name(shared_host_compute_buft),
+                                 (int) hetero_cpu_opencl_zero_copy,
+                                 (int) hetero_qnn_shared_host_compute);
+                }
             } else {
-                LLAMA_LOG_WARN("%s: requested CPU<->OpenCL hetero decode zero-copy, but OpenCL host buffer type is unavailable\n",
-                               __func__);
+                LLAMA_LOG_WARN("%s: requested hetero shared-host compute buffers (cpu/opencl=%s, qnn-mixed=%s), but the selected host buffer type is unavailable\n",
+                               __func__,
+                               hetero_cpu_opencl_zero_copy ? "true" : "false",
+                               hetero_qnn_shared_host_requested ? "true" : "false");
+                if (hetero_trace_share) {
+                    std::fprintf(stderr,
+                                 "ggml_hetero_buft: shared_host=<null> cpu_opencl=%d qnn_mixed=%d requested_qnn=%d\n",
+                                 (int) hetero_cpu_opencl_zero_copy,
+                                 (int) hetero_qnn_shared_host_compute,
+                                 (int) hetero_qnn_shared_host_requested);
+                }
             }
         }
 
@@ -471,19 +553,25 @@ llama_context::llama_context(
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
             auto backend_type = ggml_backend_dev_type(dev);
 
-            if (hetero_cpu_opencl_zero_copy && opencl_zero_copy_buft != nullptr) {
+            if (hetero_shared_host_compute && shared_host_compute_buft != nullptr) {
                 const char * backend_name = dev ? ggml_backend_dev_name(dev) : nullptr;
-                const bool use_opencl_host_buft =
-                    backend_type == GGML_BACKEND_DEVICE_TYPE_CPU ||
-                    (backend_name != nullptr && std::strcmp(backend_name, "GPUOpenCL") == 0);
+                const bool is_opencl_backend =
+                    backend_name != nullptr && std::strcmp(backend_name, "GPUOpenCL") == 0;
+                const bool is_qnn_backend =
+                    backend_name != nullptr && llama_hetero_is_qnn_backend(backend_name);
+                const bool use_shared_host_buft =
+                    (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU &&
+                     (hetero_cpu_opencl_zero_copy || hetero_qnn_shared_host_compute)) ||
+                    (is_opencl_backend && hetero_cpu_opencl_zero_copy) ||
+                    (is_qnn_backend && hetero_qnn_shared_host_compute);
 
-                if (use_opencl_host_buft) {
-                    buft = opencl_zero_copy_buft;
+                if (use_shared_host_buft) {
+                    buft = shared_host_compute_buft;
                 }
             }
 
             if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU &&
-                !(hetero_cpu_opencl_zero_copy && opencl_zero_copy_buft != nullptr) &&
+                !(hetero_shared_host_compute && shared_host_compute_buft != nullptr) &&
                 !model.devices.empty()) {
                 // use the host buffer of the first device CPU for faster transfer of the intermediate state
                 auto * dev = model.devices[0];
@@ -493,13 +581,20 @@ llama_context::llama_context(
                 }
             }
 
-            if (hetero_cpu_opencl_zero_copy) {
+            if (hetero_shared_host_compute) {
                 const char * backend_name = dev ? ggml_backend_dev_name(dev) : ggml_backend_name(backend.get());
                 LLAMA_LOG_INFO("%s: hetero compute buft backend=%s type=%s buft=%s\n",
                         __func__,
                         backend_name ? backend_name : "<null>",
                         backend_dev_type_name(backend_type),
                         buft ? ggml_backend_buft_name(buft) : "<null>");
+                if (hetero_trace_share) {
+                    std::fprintf(stderr,
+                                 "ggml_hetero_buft: backend=%s type=%s buft=%s\n",
+                                 backend_name ? backend_name : "<null>",
+                                 backend_dev_type_name(backend_type),
+                                 buft ? ggml_backend_buft_name(buft) : "<null>");
+                }
             }
 
             backend_buft.push_back(buft);
@@ -611,6 +706,17 @@ bool llama_context::ensure_hetero_backend_ready(const std::string & backend_name
             __func__,
             requested_device_name,
             route_name != nullptr ? route_name : "<unknown>");
+
+    if (backend_cpu != nullptr) {
+        auto cpu_it = std::find_if(backends.begin(), backends.end(), [&](const auto & candidate) {
+            return candidate.get() == backend_cpu;
+        });
+        if (cpu_it != backends.end()) {
+            backends.insert(cpu_it, ggml_backend_ptr(backend));
+            return true;
+        }
+    }
+
     backends.emplace_back(backend);
     return true;
 }

@@ -15,12 +15,108 @@
 
 namespace {
 
+const char * ggml_backend_qnn_device_get_name(ggml_backend_dev_t dev);
+
 qnn::ggml_backend_qnn_device_context * get_device_context(ggml_backend_dev_t dev) {
     return reinterpret_cast<qnn::ggml_backend_qnn_device_context *>(dev->context);
 }
 
 qnn::qnn_buffer_interface * get_buffer_context(ggml_backend_buffer_t buffer) {
     return reinterpret_cast<qnn::qnn_buffer_interface *>(buffer->context);
+}
+
+bool is_qnn_device(ggml_backend_dev_t dev) {
+    return dev != nullptr && dev->iface.get_name == ggml_backend_qnn_device_get_name;
+}
+
+bool qnn_aot_env_enabled() {
+    const char * value = std::getenv("GGML_QNN_AOT_CONFIG");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+bool ggml_backend_qnn_try_initialize_aot_runtime(qnn::ggml_backend_qnn_device_context * dev_ctx) {
+    if (dev_ctx == nullptr || dev_ctx->device != QNN_BACKEND_NPU || !dev_ctx->instance) {
+        return false;
+    }
+
+    if (!qnn_aot_env_enabled()) {
+        dev_ctx->aot_mode = false;
+        dev_ctx->aot_runtime.reset();
+        return false;
+    }
+
+    const std::string aot_config_path = std::getenv("GGML_QNN_AOT_CONFIG");
+    std::string       aot_model_dir;
+    if (const char * env_aot_model_dir = std::getenv("GGML_QNN_AOT_MODEL_DIR");
+        env_aot_model_dir && env_aot_model_dir[0] != '\0') {
+        aot_model_dir = env_aot_model_dir;
+    } else {
+        aot_model_dir = std::filesystem::path(aot_config_path).parent_path().string();
+    }
+
+    const bool same_runtime =
+        dev_ctx->aot_runtime != nullptr &&
+        dev_ctx->aot_runtime->is_enabled() &&
+        dev_ctx->aot_config_path == aot_config_path &&
+        dev_ctx->aot_model_dir == aot_model_dir;
+    if (same_runtime) {
+        dev_ctx->aot_mode = true;
+        return true;
+    }
+
+    const bool already_attempted_same_config =
+        dev_ctx->aot_init_attempted &&
+        dev_ctx->aot_runtime == nullptr &&
+        dev_ctx->aot_attempted_config_path == aot_config_path &&
+        dev_ctx->aot_attempted_model_dir == aot_model_dir;
+    if (already_attempted_same_config) {
+        return false;
+    }
+
+    dev_ctx->aot_init_attempted        = true;
+    dev_ctx->aot_attempted_config_path = aot_config_path;
+    dev_ctx->aot_attempted_model_dir   = aot_model_dir;
+    dev_ctx->aot_mode                  = true;
+    dev_ctx->aot_config_path           = aot_config_path;
+    dev_ctx->aot_model_dir             = aot_model_dir;
+    dev_ctx->aot_runtime.reset();
+
+    const bool config_exists = std::filesystem::exists(dev_ctx->aot_config_path);
+    const bool model_dir_exists = !dev_ctx->aot_model_dir.empty() && std::filesystem::exists(dev_ctx->aot_model_dir);
+    if (!config_exists || !model_dir_exists) {
+        QNN_LOG_WARN("[aot] config/model dir unavailable for %s: config=%s exists=%d model_dir=%s exists=%d\n",
+                     qnn::get_backend_name(dev_ctx->device),
+                     dev_ctx->aot_config_path.c_str(),
+                     (int) config_exists,
+                     dev_ctx->aot_model_dir.c_str(),
+                     (int) model_dir_exists);
+        dev_ctx->aot_mode = false;
+        return false;
+    }
+
+    auto aot_runtime = std::make_unique<qnn::qnn_aot_runtime>(dev_ctx->instance, dev_ctx->device);
+    if (!aot_runtime->initialize(dev_ctx->aot_config_path, dev_ctx->aot_model_dir)) {
+        QNN_LOG_WARN("[aot] failed to initialize AoT runtime from %s (model_dir=%s)\n",
+                     dev_ctx->aot_config_path.c_str(),
+                     dev_ctx->aot_model_dir.c_str());
+        dev_ctx->aot_mode = false;
+        return false;
+    }
+
+    dev_ctx->aot_runtime = std::move(aot_runtime);
+    QNN_LOG_INFO("[aot] enabled AoT runtime with config %s (model_dir=%s)\n",
+                 dev_ctx->aot_config_path.c_str(),
+                 dev_ctx->aot_model_dir.c_str());
+    return true;
+}
+
+struct ggml_backend_qnn_buffer_type_context {
+    std::string name;
+    bool        is_host = false;
+};
+
+ggml_backend_qnn_buffer_type_context * get_buffer_type_context(ggml_backend_buffer_type_t buft) {
+    return reinterpret_cast<ggml_backend_qnn_buffer_type_context *>(buft->context);
 }
 
 /*
@@ -95,25 +191,47 @@ constexpr const ggml_backend_buffer_i ggml_backend_qnn_buffer_interface = {
  * -----------------------------------------------------------------------------------------------
  */
 const char * ggml_backend_qnn_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    auto * type_ctx = get_buffer_type_context(buft);
+    if (type_ctx != nullptr && !type_ctx->name.empty()) {
+        return type_ctx->name.c_str();
+    }
+
     auto * dev_ctx = get_device_context(buft->device);
     return qnn::get_backend_name(dev_ctx->device);
 }
 
 ggml_backend_buffer_t ggml_backend_qnn_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    qnn::qnn_buffer_interface * ctx = new qnn::qnn_mem_buffer(size);
+    auto * dev_ctx  = get_device_context(buft->device);
+    auto * type_ctx = get_buffer_type_context(buft);
+
+    size = std::max<size_t>(size, 1);
+
+    qnn::qnn_buffer_interface * ctx = nullptr;
+    if (type_ctx != nullptr && type_ctx->is_host && dev_ctx->device == QNN_BACKEND_NPU) {
+        auto host_pool = std::make_unique<qnn::qnn_htp_buffer_pool>(
+            dev_ctx->instance,
+            size);
+        if (!host_pool->is_valid()) {
+            return nullptr;
+        }
+        ctx = host_pool.release();
+    } else {
+        ctx = new qnn::qnn_mem_buffer(size);
+    }
+
     if (!ctx->is_valid()) {
+        delete ctx;
         return nullptr;
     }
 
-    QNN_LOG_DEBUG("[%s]alloc buffer: %p, size: %ld\n", qnn::get_backend_name(get_device_context(buft->device)->device),
+    QNN_LOG_DEBUG("[%s]alloc buffer: %p, size: %ld\n", ggml_backend_qnn_buffer_type_name(buft),
                   (void *) ctx->get_buffer(), (long) size);
     return ggml_backend_buffer_init(buft, ggml_backend_qnn_buffer_interface, ctx, size);
 }
 
 size_t ggml_backend_qnn_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
-    GGML_UNUSED(buft);
-    // TODO: fix this
-    return 32;
+    auto * type_ctx = get_buffer_type_context(buft);
+    return type_ctx != nullptr && type_ctx->is_host ? 64 : 32;
 }
 
 size_t ggml_backend_qnn_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
@@ -123,9 +241,8 @@ size_t ggml_backend_qnn_buffer_type_get_max_size(ggml_backend_buffer_type_t buft
 }
 
 bool ggml_backend_qnn_buffer_is_host(ggml_backend_buffer_type_t buft) {
-    // TODO: fix this
-    GGML_UNUSED(buft);
-    return true;
+    auto * type_ctx = get_buffer_type_context(buft);
+    return type_ctx != nullptr && type_ctx->is_host;
 }
 
 const char * ggml_backend_qnn_name(ggml_backend_t backend) {
@@ -172,8 +289,13 @@ bool ggml_backend_qnn_cpy_tensor_async(ggml_backend_t      backend_src,
 
 ggml_backend_buffer_type_t ggml_backend_qnn_buffer_type(ggml_backend_dev_t dev) {
     static ggml_backend_buffer_type ggml_backend_qnn_buffer_types[QNN_BACKEND_COUNT];
+    static ggml_backend_qnn_buffer_type_context ggml_backend_qnn_buffer_type_ctx[QNN_BACKEND_COUNT];
     auto *                          dev_ctx = get_device_context(dev);
     if (!ggml_backend_qnn_buffer_types[dev_ctx->device].device) {
+        ggml_backend_qnn_buffer_type_ctx[dev_ctx->device] = {
+            /* .name    = */ qnn::get_backend_name(dev_ctx->device),
+            /* .is_host = */ false,
+        };
         ggml_backend_qnn_buffer_types[dev_ctx->device] = {
             /* .iface   = */ {
                               /* .get_name         = */ ggml_backend_qnn_buffer_type_name,
@@ -181,17 +303,50 @@ ggml_backend_buffer_type_t ggml_backend_qnn_buffer_type(ggml_backend_dev_t dev) 
                 ggml_backend_qnn_buffer_type_alloc_buffer,  /* .get_alignment    = */
                 ggml_backend_qnn_buffer_type_get_alignment, /* .get_max_size     = */
                 ggml_backend_qnn_buffer_type_get_max_size, /* .get_alloc_size   = */ nullptr,          // defaults to ggml_nbytes
-                /* .is_host          = */ ggml_backend_qnn_buffer_is_host,
+                              /* .is_host          = */ ggml_backend_qnn_buffer_is_host,
                               },
             /* .device */
             dev,
-            /* .context = */ nullptr,
+            /* .context = */ &ggml_backend_qnn_buffer_type_ctx[dev_ctx->device],
         };
     } else {
         GGML_ASSERT(ggml_backend_qnn_buffer_types[dev_ctx->device].device == dev);
     }
 
     return &ggml_backend_qnn_buffer_types[dev_ctx->device];
+}
+
+ggml_backend_buffer_type_t ggml_backend_qnn_device_get_host_buffer_type(ggml_backend_dev_t dev) {
+    static ggml_backend_buffer_type ggml_backend_qnn_host_buffer_types[QNN_BACKEND_COUNT];
+    static ggml_backend_qnn_buffer_type_context ggml_backend_qnn_host_buffer_type_ctx[QNN_BACKEND_COUNT];
+
+    auto * dev_ctx = get_device_context(dev);
+    if (dev_ctx->device != QNN_BACKEND_NPU) {
+        return nullptr;
+    }
+
+    if (!ggml_backend_qnn_host_buffer_types[dev_ctx->device].device) {
+        ggml_backend_qnn_host_buffer_type_ctx[dev_ctx->device] = {
+            /* .name    = */ std::string(qnn::get_backend_name(dev_ctx->device)) + "-host",
+            /* .is_host = */ true,
+        };
+        ggml_backend_qnn_host_buffer_types[dev_ctx->device] = {
+            /* .iface   = */ {
+                              /* .get_name         = */ ggml_backend_qnn_buffer_type_name,
+                              /* .alloc_buffer     = */ ggml_backend_qnn_buffer_type_alloc_buffer,
+                              /* .get_alignment    = */ ggml_backend_qnn_buffer_type_get_alignment,
+                              /* .get_max_size     = */ ggml_backend_qnn_buffer_type_get_max_size,
+                              /* .get_alloc_size   = */ nullptr,
+                              /* .is_host          = */ ggml_backend_qnn_buffer_is_host,
+                              },
+            /* .device  = */ dev,
+            /* .context = */ &ggml_backend_qnn_host_buffer_type_ctx[dev_ctx->device],
+        };
+    } else {
+        GGML_ASSERT(ggml_backend_qnn_host_buffer_types[dev_ctx->device].device == dev);
+    }
+
+    return &ggml_backend_qnn_host_buffer_types[dev_ctx->device];
 }
 
 ggml_status ggml_backend_qnn_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -243,13 +398,14 @@ enum ggml_backend_dev_type ggml_backend_qnn_device_get_type(ggml_backend_dev_t d
 }
 
 void ggml_backend_qnn_device_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
+    auto * dev_ctx = get_device_context(dev);
     props->name        = ggml_backend_qnn_device_get_name(dev);
     props->description = ggml_backend_qnn_device_get_description(dev);
     props->type        = ggml_backend_qnn_device_get_type(dev);
     ggml_backend_qnn_device_get_memory(dev, &props->memory_free, &props->memory_total);
     props->caps = {
         /* async                */ false,
-        /* host_buffer          */ false,
+        /* host_buffer          */ dev_ctx->device == QNN_BACKEND_NPU,
         /* buffer_from_host_ptr */ false,
         /* events               */ false,
     };
@@ -307,39 +463,8 @@ ggml_backend_t ggml_backend_qnn_init_with_device_context(ggml_backend_dev_t dev,
     }
 
     if (device == QNN_BACKEND_NPU) {
-        if (const char * aot_config = std::getenv("GGML_QNN_AOT_CONFIG"); aot_config && aot_config[0] != '\0') {
-            const std::string aot_config_path = aot_config;
-            std::string       aot_model_dir;
-
-            if (const char * env_aot_model_dir = std::getenv("GGML_QNN_AOT_MODEL_DIR");
-                env_aot_model_dir && env_aot_model_dir[0] != '\0') {
-                aot_model_dir = env_aot_model_dir;
-            } else {
-                aot_model_dir = std::filesystem::path(aot_config_path).parent_path().string();
-            }
-
-            dev_ctx->aot_mode        = true;
-            dev_ctx->aot_config_path = aot_config_path;
-            dev_ctx->aot_model_dir   = aot_model_dir;
-
-            const bool reuse_aot_runtime = dev_ctx->aot_runtime != nullptr &&
-                                           dev_ctx->aot_runtime->is_enabled() &&
-                                           dev_ctx->aot_runtime->config_path() == dev_ctx->aot_config_path;
-
-            if (reuse_aot_runtime) {
-                dev_ctx->aot_runtime->reset_state();
-            } else {
-                dev_ctx->aot_runtime.reset();
-
-                auto aot_runtime = std::make_unique<qnn::qnn_aot_runtime>(instance, device);
-                if (!aot_runtime->initialize(dev_ctx->aot_config_path, dev_ctx->aot_model_dir)) {
-                    QNN_LOG_WARN("[aot] failed to initialize AoT runtime from %s\n", dev_ctx->aot_config_path.c_str());
-                    dev_ctx->aot_mode = false;
-                } else {
-                    dev_ctx->aot_runtime = std::move(aot_runtime);
-                    QNN_LOG_INFO("[aot] enabled AoT runtime with config %s\n", dev_ctx->aot_config_path.c_str());
-                }
-            }
+        if (ggml_backend_qnn_try_initialize_aot_runtime(dev_ctx) && dev_ctx->aot_runtime != nullptr) {
+            dev_ctx->aot_runtime->reset_state();
         }
     }
     dev_ctx->supported_types          = device_caps.supported_types;
@@ -390,11 +515,24 @@ ggml_backend_buffer_t ggml_backend_qnn_device_buffer_from_ptr(ggml_backend_dev_t
 bool ggml_backend_qnn_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     // Note that this function could be called before the device context is initialized
     auto * device_ctx = get_device_context(dev);
+    ggml_backend_qnn_try_initialize_aot_runtime(device_ctx);
     return qnn::device_supports_op(device_ctx, op);
 }
 
 bool ggml_backend_qnn_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     auto * device_ctx = get_device_context(dev);
+    ggml_backend_qnn_try_initialize_aot_runtime(device_ctx);
+    if (buft == nullptr) {
+        return false;
+    }
+
+    ggml_backend_dev_t buft_dev = ggml_backend_buft_get_device(buft);
+    if (is_qnn_device(buft_dev)) {
+        auto * buft_dev_ctx = get_device_context(buft_dev);
+        if (buft_dev_ctx != nullptr && buft_dev_ctx->device == device_ctx->device) {
+            return true;
+        }
+    }
 
     if (device_ctx->device == QNN_BACKEND_NPU) {
         const char * aot_config = std::getenv("GGML_QNN_AOT_CONFIG");
@@ -437,8 +575,8 @@ constexpr const ggml_backend_device_i ggml_backend_qnn_device_interface = {
     /* .get_props            = */ ggml_backend_qnn_device_get_props,
     /* .init_backend         = */ ggml_backend_qnn_device_init,
     /* .get_buffer_type      = */ ggml_backend_qnn_device_get_buffer_type,
-    /* .get_host_buffer_type = */ nullptr,
-    /* .buffer_from_host_ptr = */ ggml_backend_qnn_device_buffer_from_ptr,
+    /* .get_host_buffer_type = */ ggml_backend_qnn_device_get_host_buffer_type,
+    /* .buffer_from_host_ptr = */ nullptr,
     /* .supports_op          = */ ggml_backend_qnn_device_supports_op,
     /* .supports_buft        = */ ggml_backend_qnn_device_supports_buft,
     /* .offload_op           = */ ggml_backend_qnn_device_offload_op,

@@ -1450,7 +1450,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     ggml_backend_buffer_type_t src_buft = src_buf ? src_buf->buft : sched->bufts[src_backend_id];
                     const char * src_name = ggml_get_name(src);
                     const char * node_name = ggml_get_name(node);
-                    GGML_LOG_INFO("ggml_hetero_share: split=%d src_backend=%s dst_backend=%s tensor=%s buft=%s node=%s index=%d\n",
+                    fprintf(stderr,
+                            "ggml_hetero_share: split=%d src_backend=%s dst_backend=%s tensor=%s buft=%s node=%s index=%d\n",
                             i_split,
                             ggml_backend_name(sched->backends[src_backend_id]),
                             ggml_backend_name(sched->backends[cur_backend_id]),
@@ -1461,6 +1462,21 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
 
                 if (src_backend_id != cur_backend_id && !buffer_supported) {
+                    if (ggml_backend_hetero_trace_share_enabled()) {
+                        ggml_backend_buffer_t src_buf = src->view_src ? src->view_src->buffer : src->buffer;
+                        ggml_backend_buffer_type_t src_buft = src_buf ? src_buf->buft : sched->bufts[src_backend_id];
+                        const char * src_name = ggml_get_name(src);
+                        const char * node_name = ggml_get_name(node);
+                        fprintf(stderr,
+                                "ggml_hetero_copy: split=%d src_backend=%s dst_backend=%s tensor=%s buft=%s node=%s index=%d\n",
+                                i_split,
+                                ggml_backend_name(sched->backends[src_backend_id]),
+                                ggml_backend_name(sched->backends[cur_backend_id]),
+                                src_name[0] != '\0' ? src_name : "<unnamed>",
+                                src_buft ? ggml_backend_buft_name(src_buft) : "<null>",
+                                node_name[0] != '\0' ? node_name : "<unnamed>",
+                                i);
+                    }
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
@@ -1991,7 +2007,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
     for (int b = 0; b < n_backends; b++) {
         sched->backends[b] = backends[b];
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
-        GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
+        const bool supports_buft = ggml_backend_supports_buft(backends[b], sched->bufts[b]);
+        if (!supports_buft) {
+            GGML_LOG_ERROR("%s: backend %s does not support buffer type %s\n",
+                    __func__,
+                    ggml_backend_name(backends[b]),
+                    sched->bufts[b] ? ggml_backend_buft_name(sched->bufts[b]) : "<null>");
+        }
+        GGML_ASSERT(supports_buft);
 
         const bool supports_events =
                 backends[b]->iface.event_record != NULL &&

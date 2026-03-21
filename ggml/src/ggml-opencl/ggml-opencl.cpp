@@ -28,6 +28,7 @@
 #include <cmath>
 #include <map>
 #include <memory>
+#include <unordered_map>
 #include <charconv>
 #include <mutex>
 #ifdef _WIN32
@@ -375,6 +376,7 @@ static void populateProfilingInfo(
 }
 
 struct ggml_backend_opencl_context;
+struct ggml_tensor_extra_cl;
 
 struct ggml_backend_opencl_buffer_type_context {
     bool host_accessible = false;
@@ -431,6 +433,9 @@ struct ggml_backend_opencl_context {
 
     cl_context context;
     cl_command_queue queue;
+
+    std::unordered_map<ggml_backend_buffer_t, cl_mem> external_host_buffer_aliases;
+    std::vector<ggml_tensor_extra_cl *> external_tensor_extras;
 
     // prealloc buffers for transposing weights and activations
     ggml_cl_buffer prealloc_quant_trans;
@@ -811,9 +816,12 @@ struct ggml_backend_opencl_context {
     cl_kernel CL_mul_mat_vec_q8_0_f32;
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
+    void release_external_host_views();
+
     void free() {
         ref_count--;
         if (ref_count == 0) {
+            release_external_host_views();
 #ifdef GGML_OPENCL_PROFILING
             write_profiling_info();
             profiling_info.clear();
@@ -3273,6 +3281,96 @@ struct ggml_tensor_extra_cl {
         actual_size = 0;
     }
 };
+
+void ggml_backend_opencl_context::release_external_host_views() {
+    for (auto & entry : external_host_buffer_aliases) {
+        if (entry.second != nullptr) {
+            CL_CHECK(clReleaseMemObject(entry.second));
+        }
+    }
+    external_host_buffer_aliases.clear();
+
+    for (ggml_tensor_extra_cl * extra : external_tensor_extras) {
+        delete extra;
+    }
+    external_tensor_extras.clear();
+}
+
+static bool ggml_backend_opencl_is_qnn_shared_host_buffer(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr || !ggml_backend_buffer_is_host(buffer)) {
+        return false;
+    }
+
+    const char * buffer_name = ggml_backend_buffer_name(buffer);
+    return buffer_name != nullptr && std::strcmp(buffer_name, "qnn-npu-host") == 0;
+}
+
+static ggml_tensor_extra_cl * ggml_backend_opencl_ensure_tensor_extra_from_host_buffer(
+        ggml_backend_t backend,
+        ggml_tensor * tensor) {
+    if (backend == nullptr || tensor == nullptr) {
+        return nullptr;
+    }
+
+    if (tensor->extra != nullptr) {
+        return static_cast<ggml_tensor_extra_cl *>(tensor->extra);
+    }
+
+    if (tensor->view_src != nullptr) {
+        auto * view_extra = ggml_backend_opencl_ensure_tensor_extra_from_host_buffer(backend, tensor->view_src);
+        if (view_extra != nullptr) {
+            tensor->extra = view_extra;
+            return view_extra;
+        }
+    }
+
+    if (ggml_is_quantized(tensor->type) || tensor->buffer == nullptr || tensor->data == nullptr) {
+        return nullptr;
+    }
+
+    if (!ggml_backend_opencl_is_qnn_shared_host_buffer(tensor->buffer)) {
+        return nullptr;
+    }
+
+    auto * backend_ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
+    if (backend_ctx == nullptr || backend_ctx->context == nullptr) {
+        return nullptr;
+    }
+
+    void * base = ggml_backend_buffer_get_base(tensor->buffer);
+    const size_t size = ggml_backend_buffer_get_size(tensor->buffer);
+    if (base == nullptr || size == 0) {
+        return nullptr;
+    }
+
+    const size_t alignment = std::max((size_t) backend_ctx->alignment, (size_t) TENSOR_ALIGNMENT);
+    if (((uintptr_t) base) % alignment != 0) {
+        return nullptr;
+    }
+
+    cl_mem data_device = nullptr;
+    auto it = backend_ctx->external_host_buffer_aliases.find(tensor->buffer);
+    if (it != backend_ctx->external_host_buffer_aliases.end()) {
+        data_device = it->second;
+    } else {
+        cl_int err = CL_SUCCESS;
+        data_device = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR, size, base, &err);
+        if (err != CL_SUCCESS || data_device == nullptr) {
+            return nullptr;
+        }
+        backend_ctx->external_host_buffer_aliases.emplace(tensor->buffer, data_device);
+    }
+
+    auto * extra = new ggml_tensor_extra_cl();
+    extra->reset();
+    extra->data_device = data_device;
+    extra->offset = static_cast<cl_ulong>((char *) tensor->data - (char *) base);
+    extra->actual_size = size;
+
+    backend_ctx->external_tensor_extras.push_back(extra);
+    tensor->extra = extra;
+    return extra;
+}
 
 // Additional tensor extra structs for quantized tensors.
 // These tensors are loaded from files and should not be allocated in scratch --
@@ -5773,6 +5871,13 @@ static bool ggml_backend_opencl_device_supports_op(ggml_backend_dev_t dev, const
 }
 
 static bool ggml_backend_opencl_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+    if (buft != nullptr) {
+        const char * buft_name = ggml_backend_buft_name(buft);
+        if (buft_name != nullptr && std::strcmp(buft_name, "qnn-npu-host") == 0) {
+            return true;
+        }
+    }
+
     // Check 'dev' and 'buffer_type' are not objects belonging to this backend.
     if (dev->iface.get_name != ggml_backend_opencl_device_get_name ||
         buft->iface.get_name != ggml_backend_opencl_buffer_type_get_name) {
@@ -7676,18 +7781,18 @@ static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * 
     const ggml_tensor * dst = mul_tensor;
 
     GGML_ASSERT(src0);
-    GGML_ASSERT(src0->extra);
     GGML_ASSERT(src1);
-    GGML_ASSERT(src1->extra);
     GGML_ASSERT(dst);
-    GGML_ASSERT(dst->extra);
 
-    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
-    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
-    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+    ggml_tensor_extra_cl * extra0 = ggml_backend_opencl_ensure_tensor_extra_from_host_buffer(backend, const_cast<ggml_tensor *>(src0));
+    ggml_tensor_extra_cl * extra1 = ggml_backend_opencl_ensure_tensor_extra_from_host_buffer(backend, const_cast<ggml_tensor *>(src1));
+    ggml_tensor_extra_cl * extrad = ggml_backend_opencl_ensure_tensor_extra_from_host_buffer(backend, const_cast<ggml_tensor *>(dst));
+    GGML_ASSERT(extra0);
+    GGML_ASSERT(extra1);
+    GGML_ASSERT(extrad);
 
     cl_ulong offset0 = extra0->offset + src0->view_offs;
-    cl_ulong offset1 = extra1->offset + src0->view_offs;
+    cl_ulong offset1 = extra1->offset + src1->view_offs;
     cl_ulong offsetd = extrad->offset + dst->view_offs;
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
@@ -7778,10 +7883,14 @@ static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm
     const ggml_tensor * src2 = add_tensor->src[0] == mul_tensor ? add_tensor->src[1] : add_tensor->src[0];
     const ggml_tensor * dst = add_tensor;
 
-    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
-    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
-    ggml_tensor_extra_cl * extra2 = (ggml_tensor_extra_cl *)src2->extra;
-    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+    ggml_tensor_extra_cl * extra0 = ggml_backend_opencl_ensure_tensor_extra_from_host_buffer(backend, const_cast<ggml_tensor *>(src0));
+    ggml_tensor_extra_cl * extra1 = ggml_backend_opencl_ensure_tensor_extra_from_host_buffer(backend, const_cast<ggml_tensor *>(src1));
+    ggml_tensor_extra_cl * extra2 = ggml_backend_opencl_ensure_tensor_extra_from_host_buffer(backend, const_cast<ggml_tensor *>(src2));
+    ggml_tensor_extra_cl * extrad = ggml_backend_opencl_ensure_tensor_extra_from_host_buffer(backend, const_cast<ggml_tensor *>(dst));
+    GGML_ASSERT(extra0);
+    GGML_ASSERT(extra1);
+    GGML_ASSERT(extra2);
+    GGML_ASSERT(extrad);
 
     cl_ulong offset0 = extra0->offset + src0->view_offs;
     cl_ulong offset1 = extra1->offset + src1->view_offs;
@@ -7864,10 +7973,14 @@ static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor 
     const ggml_tensor * src2 = add_tensor->src[0] == mul_tensor ? add_tensor->src[1] : add_tensor->src[0];
     const ggml_tensor * dst = add_tensor;
 
-    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
-    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
-    ggml_tensor_extra_cl * extra2 = (ggml_tensor_extra_cl *)src2->extra;
-    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+    ggml_tensor_extra_cl * extra0 = ggml_backend_opencl_ensure_tensor_extra_from_host_buffer(backend, const_cast<ggml_tensor *>(src0));
+    ggml_tensor_extra_cl * extra1 = ggml_backend_opencl_ensure_tensor_extra_from_host_buffer(backend, const_cast<ggml_tensor *>(src1));
+    ggml_tensor_extra_cl * extra2 = ggml_backend_opencl_ensure_tensor_extra_from_host_buffer(backend, const_cast<ggml_tensor *>(src2));
+    ggml_tensor_extra_cl * extrad = ggml_backend_opencl_ensure_tensor_extra_from_host_buffer(backend, const_cast<ggml_tensor *>(dst));
+    GGML_ASSERT(extra0);
+    GGML_ASSERT(extra1);
+    GGML_ASSERT(extra2);
+    GGML_ASSERT(extrad);
 
     cl_ulong offset0 = extra0->offset + src0->view_offs;
     cl_ulong offset1 = extra1->offset + src1->view_offs;
@@ -12562,10 +12675,17 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
 
     ggml_tensor * src0 = tensor->src[0];
     ggml_tensor * src1 = tensor->src[1];
+    ggml_tensor * src2 = tensor->src[2];
+
+    ggml_backend_opencl_ensure_tensor_extra_from_host_buffer(backend, tensor);
+    ggml_backend_opencl_ensure_tensor_extra_from_host_buffer(backend, src0);
+    ggml_backend_opencl_ensure_tensor_extra_from_host_buffer(backend, src1);
+    ggml_backend_opencl_ensure_tensor_extra_from_host_buffer(backend, src2);
 
     const bool any_on_device = tensor->extra
         || (src0 != nullptr && src0->extra)
-        || (src1 != nullptr && src1->extra);
+        || (src1 != nullptr && src1->extra)
+        || (src2 != nullptr && src2->extra);
 
     switch (tensor->op) {
         case GGML_OP_GET_ROWS:

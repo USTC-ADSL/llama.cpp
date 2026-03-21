@@ -1,11 +1,16 @@
 #pragma once
 
+#include <array>
+#include <cstring>
 #include <cstdint>
 #include <memory>
+#include <unordered_map>
 #include <unordered_set>
 
 #include <HTP/QnnHtpMem.h>
 
+#include "ggml-backend-impl.h"
+#include "ggml.h"
 #include "logger.hpp"
 #include "qnn-lib.hpp"
 
@@ -202,6 +207,239 @@ class qnn_htp_shared_buffer : public qnn_buffer_interface {
     DISABLE_COPY(qnn_htp_shared_buffer);
     DISABLE_MOVE(qnn_htp_shared_buffer);
 };
+
+class qnn_htp_shared_buffer_view : public qnn_buffer_interface {
+  public:
+    qnn_htp_shared_buffer_view(qnn_instance_ptr qnn_instance,
+                               std::shared_ptr<qnn_shared_buffer_allocator> allocator,
+                               size_t offset,
+                               size_t size,
+                               uint32_t rank,
+                               const uint32_t * dimensions,
+                               Qnn_DataType_t data_type,
+                               Qnn_ContextHandle_t context_handle) :
+        _size(size),
+        _offset(offset),
+        _rank(std::max<uint32_t>(1, std::min<uint32_t>(rank, GGML_MAX_DIMS))),
+        _allocator(std::move(allocator)),
+        _qnn_instance(std::move(qnn_instance)) {
+        if (!_allocator || !_allocator->is_valid() || !_qnn_instance) {
+            QNN_LOG_WARN("invalid shared buffer view allocator\n");
+            return;
+        }
+
+        _dimensions.fill(1);
+        if (dimensions != nullptr) {
+            for (uint32_t i = 0; i < _rank; ++i) {
+                _dimensions[i] = std::max<uint32_t>(dimensions[i], 1);
+            }
+        } else {
+            const size_t type_size = std::max<size_t>(1, qnn::qnn_datatype_size(data_type));
+            _dimensions[0] = static_cast<uint32_t>(std::max<size_t>(1, (size + type_size - 1) / type_size));
+        }
+
+        QnnMemHtp_Descriptor_t htp_mem_desc = {
+            .type = QNN_HTP_MEM_SHARED_BUFFER,
+            .size = _allocator->size(),
+            .sharedBufferConfig = {
+                .fd = _allocator->fd(),
+                .offset = static_cast<uint64_t>(_offset),
+            },
+        };
+        Qnn_MemDescriptor_t mem_desc = {
+            .memShape = {
+                .numDim = _rank,
+                .dimSize = _dimensions.data(),
+                .shapeConfig = nullptr,
+            },
+            .dataType = data_type,
+            .memType = QNN_MEM_TYPE_CUSTOM,
+            .customInfo = &htp_mem_desc,
+        };
+
+        auto qnn_interface = _qnn_instance->get_qnn_interface();
+        if (!qnn_interface || !context_handle) {
+            QNN_LOG_WARN("failed to register shared buffer view, qnn interface/context invalid\n");
+            return;
+        }
+
+        auto error = qnn_interface->qnn_mem_register(context_handle, &mem_desc, 1, &_mem_handle);
+        if (error != QNN_SUCCESS) {
+            QNN_LOG_WARN("failed to register shared buffer view, err=%d (%s)\n",
+                         (int) error,
+                         get_qnn_error_string(error));
+            _mem_handle = nullptr;
+            return;
+        }
+    }
+
+    ~qnn_htp_shared_buffer_view() {
+        if (_qnn_instance && _mem_handle) {
+            auto qnn_interface = _qnn_instance->get_qnn_interface();
+            if (qnn_interface) {
+                auto error = qnn_interface->qnn_mem_de_register(&_mem_handle, 1);
+                if (error != QNN_SUCCESS) {
+                    QNN_LOG_WARN("failed to unregister shared buffer view, error=%d (%s)\n",
+                                 (int) error,
+                                 get_qnn_error_string(error));
+                }
+            }
+            _mem_handle = nullptr;
+        }
+    }
+
+    bool is_valid() const override { return _allocator && _allocator->is_valid() && _mem_handle != nullptr; }
+    uint8_t * get_buffer() override { return _allocator ? _allocator->base() + _offset : nullptr; }
+    size_t get_size() const override { return _size; }
+    Qnn_MemHandle_t get_mem_handle() const override { return _mem_handle; }
+
+  private:
+    size_t                                      _size       = 0;
+    size_t                                      _offset     = 0;
+    uint32_t                                    _rank       = 1;
+    std::array<uint32_t, GGML_MAX_DIMS>         _dimensions = {};
+    Qnn_MemHandle_t                             _mem_handle = nullptr;
+    std::shared_ptr<qnn_shared_buffer_allocator> _allocator;
+    qnn_instance_ptr                            _qnn_instance;
+
+    DISABLE_COPY(qnn_htp_shared_buffer_view);
+    DISABLE_MOVE(qnn_htp_shared_buffer_view);
+};
+
+class qnn_htp_buffer_pool : public qnn_buffer_interface {
+  public:
+    qnn_htp_buffer_pool(qnn_instance_ptr qnn_instance,
+                        size_t size,
+                        size_t alignment = 64) :
+        _size(size),
+        _allocator(std::make_shared<qnn_shared_buffer_allocator>(qnn_instance, size, alignment)),
+        _qnn_instance(std::move(qnn_instance)) {}
+
+    bool is_valid() const override {
+        return _allocator && _allocator->is_valid();
+    }
+
+    uint8_t * get_buffer() override {
+        return _allocator ? _allocator->base() : nullptr;
+    }
+
+    size_t get_size() const override { return _size; }
+
+    Qnn_MemHandle_t get_mem_handle() const override { return nullptr; }
+
+    qnn_buffer_ptr get_tensor_view(
+            const ggml_tensor * tensor,
+            uint32_t rank,
+            const uint32_t * dimensions,
+            Qnn_DataType_t data_type,
+            Qnn_ContextHandle_t context_handle) {
+        if (!tensor || !tensor->data || !is_valid() || context_handle == nullptr) {
+            return nullptr;
+        }
+
+        const qnn_htp_tensor_view_key key = {
+            tensor,
+            context_handle,
+        };
+        auto it = _tensor_views.find(key);
+        if (it != _tensor_views.end()) {
+            return it->second;
+        }
+
+        auto * base = _allocator->base();
+        auto * ptr  = static_cast<uint8_t *>(tensor->data);
+        const size_t nbytes = std::max<size_t>(1, ggml_nbytes(tensor));
+
+        if (ptr < base || ptr + nbytes > base + _size) {
+            QNN_LOG_WARN("tensor buffer view out of range: tensor=%s ptr=%p base=%p bytes=%zu pool=%zu\n",
+                         ggml_get_name(tensor),
+                         (void *) ptr,
+                         (void *) base,
+                         nbytes,
+                         _size);
+            return nullptr;
+        }
+
+        const size_t offset = static_cast<size_t>(ptr - base);
+        auto view = std::make_shared<qnn_htp_shared_buffer_view>(
+            _qnn_instance,
+            _allocator,
+            offset,
+            nbytes,
+            rank,
+            dimensions,
+            data_type,
+            context_handle);
+        if (!view->is_valid()) {
+            return nullptr;
+        }
+
+        _tensor_views.emplace(key, view);
+        return view;
+    }
+
+  private:
+    struct qnn_htp_tensor_view_key {
+        const ggml_tensor *  tensor          = nullptr;
+        Qnn_ContextHandle_t  context_handle  = nullptr;
+
+        bool operator==(const qnn_htp_tensor_view_key & other) const {
+            return tensor == other.tensor && context_handle == other.context_handle;
+        }
+    };
+
+    struct qnn_htp_tensor_view_key_hash {
+        size_t operator()(const qnn_htp_tensor_view_key & key) const {
+            const size_t tensor_hash = std::hash<const ggml_tensor *>()(key.tensor);
+            const size_t ctx_hash    = std::hash<Qnn_ContextHandle_t>()(key.context_handle);
+            return tensor_hash ^ (ctx_hash << 1);
+        }
+    };
+
+    size_t                                       _size           = 0;
+    std::shared_ptr<qnn_shared_buffer_allocator> _allocator;
+    qnn_instance_ptr                             _qnn_instance;
+    std::unordered_map<qnn_htp_tensor_view_key, qnn_buffer_ptr, qnn_htp_tensor_view_key_hash> _tensor_views;
+
+    DISABLE_COPY(qnn_htp_buffer_pool);
+    DISABLE_MOVE(qnn_htp_buffer_pool);
+};
+
+inline qnn_htp_buffer_pool * get_qnn_htp_buffer_pool(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        return nullptr;
+    }
+
+    const char * buffer_name = ggml_backend_buffer_name(tensor->buffer);
+    if (buffer_name == nullptr || std::strcmp(buffer_name, "qnn-npu-host") != 0) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<qnn_htp_buffer_pool *>(tensor->buffer->context);
+}
+
+inline qnn_buffer_ptr try_get_qnn_host_buffer_view(const ggml_tensor * tensor,
+                                                   Qnn_ContextHandle_t context_handle,
+                                                   uint32_t            rank,
+                                                   const uint32_t *    dimensions,
+                                                   Qnn_DataType_t      data_type) {
+    auto * pool = get_qnn_htp_buffer_pool(tensor);
+    if (pool == nullptr || !pool->is_valid() || context_handle == nullptr) {
+        return nullptr;
+    }
+
+    auto buffer = pool->get_tensor_view(
+        tensor,
+        rank,
+        dimensions,
+        data_type,
+        context_handle);
+    if (buffer && buffer->get_mem_handle() != nullptr) {
+        QNN_LOG_DEBUG("reuse qnn shared-host buffer for tensor(%s)\n", ggml_get_name(tensor));
+    }
+
+    return buffer;
+}
 
 /**
  * @brief A class for managing QNN RPC memory buffers.
