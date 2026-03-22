@@ -216,6 +216,81 @@ split trace：
 - full-vs-split 的差距主要是端到端 runtime overhead；
 - 这正是后续必须优先量化和优化的瓶颈，而不是再回头纠缠“matcher 到底有没有命中”。
 
+### 4.4 最后一层 `FFN tokens=1` 属于 output-tail 语义
+
+这条 trace 里最后一层还会出现：
+
+- `execute ffn graph ffn_layer_23_batch_128 layer=23 tokens=1 batch=128`
+
+这不应再被解读为 “split prefill 又退化成了只跑一个 token”。
+
+更准确的解释是：
+
+- `llama_batch_allocr::init()` 在普通 prompt eval 下默认只把最后一个 prompt token 标成输出；
+- `llama_context::decode()` 随后按 `ubatch.output[i]` 统计 `n_outputs`；
+- 同一条 trace 里也明确打印了：
+  - `n_tokens = 128`
+  - `n_outputs = 1`
+
+因此最后一层 `FFN` 更像是在服务：
+
+- **最后输出 token 的 prompt tail**
+
+而不是代表整个 split prompt 路径重新缩成了 decode。
+
+这条结论的意义在于：
+
+- split prefill correctness 口径更稳了；
+- 但后续做 `Prefill` per-stage latency accounting 时，不能把最后一层 `FFN` 简单并入普通 `128` token 主体，需要把 output-tail fragment 单独标记。
+
+### 4.5 最小 stage-profiler 已经给出 `CPU / qnn-npu` 的分阶段方向
+
+为了让后续 `P3-1/P3-2` 不再停留在“只有端到端吞吐”的层面，这轮还补了一组同尺度的：
+
+- `p16 / n16 / c512`
+- `CPU`
+- `qnn-npu`
+
+stage-profiler 结果，见：
+
+- `docs/qnn-attn-core-shared/db6c02cf-stage-profiler-p16n16c512-2026-03-22.md`
+
+最重要的 `Decode mean_us` 结论是：
+
+| Stage | CPU | qnn-npu | qnn/CPU |
+| --- | ---: | ---: | ---: |
+| `Attn_Proj` | `906.19` | `871.39` | `0.96x` |
+| `KV_Cache` | `1631.12` | `1736.14` | `1.06x` |
+| `Attn_Core` | `111.68` | `579.72` | `5.19x` |
+| `FFN_Block` | `864.21` | `1234.62` | `1.43x` |
+
+这说明当前主设备 static `qnn-npu` decode 并不是“每个阶段都慢”，而是：
+
+- `Attn_Proj` 已经接近 `CPU`
+- 主要短板集中在：
+  - `Attn_Core`
+  - `FFN_Block`
+
+`Prefill` 里则出现了另一种方向：
+
+| Stage | CPU | qnn-npu | qnn/CPU |
+| --- | ---: | ---: | ---: |
+| `Attn_Proj` | `194.84` | `180.11` | `0.92x` |
+| `KV_Cache` | `124.09` | `274.23` | `2.21x` |
+| `Attn_Core` | `312.42` | `4017.45` | `12.86x` |
+| `FFN_Block` | `5843.39` | `1990.58` | `0.34x` |
+
+也就是说：
+
+- `FFN_Block` 已经显出更像适合 `qnn-npu` 的迹象；
+- `Attn_Core` 与 `KV_Cache` 当前则更像 static `qnn-npu` 的弱项。
+
+这批结果还不能外推成系统级收益，因为：
+
+- 当前只拿到了 `CPU / qnn-npu` 两列；
+- `GPUOpenCL` 在 stage-profiler 路径下仍被 OpenCL buffer 分配阻塞；
+- 这里依然是 static backend 观测，不是最终 mixed-stage 动态执行。
+
 ## 5. 对研究主线意味着什么
 
 把以上三组证据放在一起后，当前主线叙事可以更严格地收敛成下面几点：

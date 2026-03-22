@@ -83,7 +83,10 @@
 当前判断：
 
 - “看得见 overhead” 这件事已经完成。
-- 但系统级结论仍缺统一的 `ideal vs actual` 分解。
+- `db6c02cf` 上已经补出一组同尺度 `p16 / n16 / c512` 的 `CPU / qnn-npu` stage-profiler 数据：
+  - `Decode` 中，static `qnn-npu` 主要输在 `Attn_Core` 与 `FFN_Block`
+  - `Prefill` 中，static `qnn-npu` 的 `FFN_Block` 更快，但 `Attn_Core` 与 `KV_Cache` 更慢
+- `GPUOpenCL` 的 stage-profiler 路线当前仍被 OpenCL buffer 分配阻塞，因此系统级结论仍缺完整的三后端 `ideal vs actual` 分解。
 
 ### 2.5 Decode 主线进度
 
@@ -99,6 +102,20 @@
   - 日志整体 share-heavy
   - 未观察到 `ggml_hetero_copy`
   - 未观察到 `tensor_copy` / `tensor_copy_wait`
+- `db6c02cf` 上已经补出同尺度 `p16 / n16 / c512` 的 `CPU / qnn-npu` decode stage-profiler 数据：
+  - `CPU`：
+    - `Attn_Proj = 906.19 us`
+    - `KV_Cache = 1631.12 us`
+    - `Attn_Core = 111.68 us`
+    - `FFN_Block = 864.21 us`
+  - `qnn-npu`：
+    - `Attn_Proj = 871.39 us`
+    - `KV_Cache = 1736.14 us`
+    - `Attn_Core = 579.72 us`
+    - `FFN_Block = 1234.62 us`
+- 这说明当前主设备 static `qnn-npu` decode 的主要短板不是 `Attn_Proj`，而是：
+  - `Attn_Core`
+  - `FFN_Block`
 
 当前 `Decode` 仍未解决的问题：
 
@@ -129,6 +146,20 @@
 - 当前最强结论已经是：
   - split prefill 确实跑到了
   - full-vs-split 的差距是真实端到端 runtime overhead，而不再是“split 根本没执行”
+- 同一批 `p16 / n16 / c512` stage-profiler 也给出了一组最小 `Prefill` 分阶段数据：
+  - `CPU`：
+    - `Attn_Proj = 194.84 us`
+    - `KV_Cache = 124.09 us`
+    - `Attn_Core = 312.42 us`
+    - `FFN_Block = 5843.39 us`
+  - `qnn-npu`：
+    - `Attn_Proj = 180.11 us`
+    - `KV_Cache = 274.23 us`
+    - `Attn_Core = 4017.45 us`
+    - `FFN_Block = 1990.58 us`
+- 这说明 `Prefill` 的阶段异构已经开始出现清晰方向：
+  - `FFN_Block` 更像适合 `qnn-npu`
+  - `Attn_Core` 与 `KV_Cache` 当前更像不适合 static `qnn-npu`
 
 当前 `Prefill` 仍未解决的问题：
 
@@ -137,7 +168,9 @@
   - `72` 次 graph launch
   - fragment I/O direct-bind 命中率不足
   - per-layer shared-host KV writeback/materialization
-- 最后一层 `FFN tokens=1` 仍需继续确认它对 per-stage accounting 的影响
+- 最后一层 `FFN tokens=1` 已确认是 prompt eval 默认 `n_outputs=1` 导致的 output-tail 视图，而不是 split correctness regression；
+  - 它会影响 per-stage accounting；
+  - 但不改变 “split prefill 已真实执行、gap 主要来自 runtime overhead” 这个主结论。
 
 ## 三、主线覆盖度评估
 
@@ -176,7 +209,7 @@
 |------|------|------|------|
 | P1-1 收口 decode tail residual | 最高 | 重点跟踪 `cache_k_upd-23 -> attn_out-23` 与 `ffn_inp-23` 的分裂原因 | 代码补丁 + 日志 |
 | P1-2 保证 unmatched residual 统一走 CPU | 高 | 避免 residual 掉回 QNN JIT 小图 | 代码补丁 + 复现命令 |
-| P1-3 确认 prefill tail `FFN tokens=1` 语义 | 高 | 判定它是 prompt tail 现象还是 matcher/accounting 问题 | 分析记录 |
+| P1-3 确认 prefill tail `FFN tokens=1` 语义 | 已完成 | 已确认它是 prompt eval 默认 `n_outputs=1` 下的 output-tail 视图，主要影响 per-stage accounting | `progress/2026-03-22-009-prefill-tail-ffn-output-tail-semantics.md` |
 | P1-4 `fd8657d6` 降级为辅助设备 | 中 | 保留 static baseline 能力，不把关键 AoT 实验压在其上 | 设备状态说明 |
 
 ### Phase 2：单后端基线采集
@@ -195,8 +228,8 @@
 
 | 任务 | 优先级 | 说明 | 产出 |
 |------|------|------|------|
-| P3-1 Decode 分阶段 profiling | 最高 | 优先补齐 `attn_proj / attn_core / ffn / output` 的 per-stage latency | CSV |
-| P3-2 Prefill 分阶段 profiling | 高 | 对照 `batch=128+` prompt 路径 | CSV |
+| P3-1 Decode 分阶段 profiling | 进行中 | 已补出 `CPU / qnn-npu` 的 `p16 / n16 / c512` per-stage latency，`GPUOpenCL` 仍被 OpenCL buffer 分配阻塞 | CSV |
+| P3-2 Prefill 分阶段 profiling | 进行中 | 同一批 stage-profiler 已拿到最小 `p16` prompt 数据，但还缺 `GPUOpenCL` 与更长 prompt | CSV |
 | P3-3 阶段×后端矩阵汇总 | 高 | 构建 `phase × stage × backend` 矩阵 | 图表/文档 |
 | P3-4 阶段最优后端判定 | 高 | 解释计算/访存/KV 依赖和 overhead 风险 | 分析文档 |
 
