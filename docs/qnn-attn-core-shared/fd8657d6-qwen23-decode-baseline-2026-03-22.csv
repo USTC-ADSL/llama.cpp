@@ -1,0 +1,13 @@
+device,model,phase,backend,device_arg,cpu_mask,threads,test,tokens,ctx,batch,ubatch,ctk,ctv,mmap,repetitions,warmup,tps,log
+fd8657d6,qwen2_0.5b,decode,cpu,,80,1,tg1,1,2048,1,1,f16,f16,0,1,warm,14.74,tmp/fd8657d6_qwen2_cpu_decode_tg1_warm_ctkf16_20260323.log
+fd8657d6,qwen2_0.5b,decode,cpu,,80,1,tg128,128,2048,1,1,f16,f16,0,1,warm,14.76,tmp/fd8657d6_qwen2_cpu_decode_tg128_warm_20260323.log
+fd8657d6,qwen2_0.5b,decode,gpu,GPUOpenCL,80,1,tg1,1,2048,1,1,f16,f16,0,1,warm,74.32,tmp/fd8657d6_qwen2_gpu_decode_tg1_tg128_warm_20260323.log
+fd8657d6,qwen2_0.5b,decode,gpu,GPUOpenCL,80,1,tg128,128,2048,1,1,f16,f16,0,1,warm,74.70,tmp/fd8657d6_qwen2_gpu_decode_tg1_tg128_warm_20260323.log
+fd8657d6,qwen2_0.5b,decode,npu,qnn-npu,80,1,tg1,1,2048,1,1,f16,f16,0,1,warm,10.87,tmp/fd8657d6_qwen2_qnn_decode_tg1_tg128_warm_20260323.log
+fd8657d6,qwen2_0.5b,decode,npu,qnn-npu,80,1,tg128,128,2048,1,1,f16,f16,0,1,warm,10.92,tmp/fd8657d6_qwen2_qnn_decode_tg1_tg128_warm_20260323.log
+fd8657d6,qwen3_1.7b_q8_0,decode,cpu,,80,1,tg1,1,2048,1,1,f16,f16,0,1,warm,16.02,tmp/fd8657d6_qwen3_1p7b_cpu_decode_tg1_tg64_warm_20260323.log
+fd8657d6,qwen3_1.7b_q8_0,decode,cpu,,80,1,tg64,64,2048,1,1,f16,f16,0,1,warm,15.84,tmp/fd8657d6_qwen3_1p7b_cpu_decode_tg1_tg64_warm_20260323.log
+fd8657d6,qwen3_1.7b_q8_0,decode,gpu,GPUOpenCL,80,1,tg1,1,2048,1,1,f16,f16,0,1,warm,27.11,tmp/fd8657d6_qwen3_1p7b_gpu_decode_tg1_tg64_warm_20260323.log
+fd8657d6,qwen3_1.7b_q8_0,decode,gpu,GPUOpenCL,80,1,tg64,64,2048,1,1,f16,f16,0,1,warm,27.17,tmp/fd8657d6_qwen3_1p7b_gpu_decode_tg1_tg64_warm_20260323.log
+fd8657d6,qwen3_1.7b_q8_0,decode,npu,qnn-npu,80,1,tg1,1,2048,1,1,f16,f16,0,1,warm,10.12,tmp/fd8657d6_qwen3_1p7b_qnn_decode_tg1_tg64_warm_20260323.log
+fd8657d6,qwen3_1.7b_q8_0,decode,npu,qnn-npu,80,1,tg64,64,2048,1,1,f16,f16,0,1,warm,10.07,tmp/fd8657d6_qwen3_1p7b_qnn_decode_tg1_tg64_warm_20260323.log

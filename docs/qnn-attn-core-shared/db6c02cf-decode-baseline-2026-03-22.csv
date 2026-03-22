@@ -1,0 +1,9 @@
+device,model,phase,backend,dev_arg,taskset,threads,test,tokens,ctx,n_batch,n_ubatch,type_k,type_v,mmap,fast_exit,tok_per_s,log_path
+db6c02cf,qwen2_0.5b,decode,cpu,,80,1,tg1,1,2048,1,1,f32,f32,0,1,14.59,tmp/db6c02cf_cpu_decode_tg1_fast_exit.log
+db6c02cf,qwen2_0.5b,decode,cpu,,80,1,tg128,128,2048,1,1,f32,f32,0,1,14.63,tmp/db6c02cf_cpu_decode_tg128_fast_exit.log
+db6c02cf,qwen2_0.5b,decode,cpu,,C0,2,tg1,1,2048,1,1,f32,f32,0,1,9.84,tmp/db6c02cf_cpu2_decode_tg1_fast_exit.log
+db6c02cf,qwen2_0.5b,decode,cpu,,C0,2,tg128,128,2048,1,1,f32,f32,0,1,15.33,tmp/db6c02cf_cpu2_decode_tg128_fast_exit.log
+db6c02cf,qwen2_0.5b,decode,gpu,GPUOpenCL,80,1,tg1,1,2048,1,1,f32,f32,0,1,71.06,tmp/db6c02cf_gpu_decode_tg1_fast_exit.log
+db6c02cf,qwen2_0.5b,decode,gpu,GPUOpenCL,80,1,tg128,128,2048,1,1,f32,f32,0,1,68.34,tmp/db6c02cf_gpu_decode_tg128_fast_exit.log
+db6c02cf,qwen2_0.5b,decode,npu,qnn-npu,80,1,tg1,1,2048,1,1,f32,f32,0,1,10.87,tmp/db6c02cf_npu_decode_tg1_fast_exit.log
+db6c02cf,qwen2_0.5b,decode,npu,qnn-npu,80,1,tg128,128,2048,1,1,f32,f32,0,1,10.89,tmp/db6c02cf_npu_decode_tg128_fast_exit.log

@@ -1,0 +1,10 @@
+device,model,phase,backend,dev_arg,taskset,threads,test,tokens,ctx,n_batch,n_ubatch,type_k,type_v,mmap,fast_exit,tok_per_s,log_path
+db6c02cf,qwen2_0.5b,prefill,cpu,,80,1,pp128,128,2048,128,128,f32,f32,0,1,193.86,tmp/db6c02cf_cpu_prefill_pp128_fast_exit.log
+db6c02cf,qwen2_0.5b,prefill,cpu,,80,1,pp256,256,2048,256,256,f32,f32,0,1,196.32,tmp/db6c02cf_cpu_prefill_pp256_fast_exit.log
+db6c02cf,qwen2_0.5b,prefill,cpu,,80,1,pp512,512,2048,512,512,f32,f32,0,1,146.64,tmp/db6c02cf_cpu_prefill_pp512_fast_exit.log
+db6c02cf,qwen2_0.5b,prefill,gpu,GPUOpenCL,80,1,pp128,128,2048,128,128,f32,f32,0,1,1295.68,tmp/db6c02cf_gpu_prefill_pp128_fast_exit.log
+db6c02cf,qwen2_0.5b,prefill,gpu,GPUOpenCL,80,1,pp256,256,2048,256,256,f32,f32,0,1,1705.44,tmp/db6c02cf_gpu_prefill_pp256_fast_exit.log
+db6c02cf,qwen2_0.5b,prefill,gpu,GPUOpenCL,80,1,pp512,512,2048,512,512,f32,f32,0,1,1686.60,tmp/db6c02cf_gpu_prefill_pp512_fast_exit.log
+db6c02cf,qwen2_0.5b,prefill,npu,qnn-npu,80,1,pp128,128,2048,128,128,f32,f32,0,1,201.17,tmp/db6c02cf_npu_prefill_pp128_fast_exit.log
+db6c02cf,qwen2_0.5b,prefill,npu,qnn-npu,80,1,pp256,256,2048,256,256,f32,f32,0,1,195.47,tmp/db6c02cf_npu_prefill_pp256_fast_exit.log
+db6c02cf,qwen2_0.5b,prefill,npu,qnn-npu,80,1,pp512,512,2048,512,512,f32,f32,0,1,150.46,tmp/db6c02cf_npu_prefill_pp512_fast_exit.log

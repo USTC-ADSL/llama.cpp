@@ -1,0 +1,3 @@
+device,model,phase,route_kind,backend,device_arg,cpu_mask,threads,test,prompt,ctx,batch,ubatch,ctk,ctv,mmap,repetitions,warmup,aot_config,aot_model_dir,tps,log
+fd8657d6,qwen2_0.5b,prefill,qnn_aot_fullgraph,npu,qnn-npu,80,1,pp128,128,2048,128,128,f16,f16,0,1,warm,/data/local/tmp/acom-attn-proj-verify/models/qwen2_0.5b/qnn/config.json,/data/local/tmp/acom-attn-proj-verify/models/qwen2_0.5b/qnn,4280.48,tmp/fd8657d6_qwen2_qnn_aot_fullgraph_prefill_pp128_20260322.log
+fd8657d6,qwen2_0.5b,prefill,qnn_aot_fullgraph,npu,qnn-npu,80,1,pp256,256,2048,256,256,f16,f16,0,1,warm,/data/local/tmp/acom-attn-proj-verify/models/qwen2_0.5b/qnn/config.json,/data/local/tmp/acom-attn-proj-verify/models/qwen2_0.5b/qnn,4565.30,tmp/fd8657d6_qwen2_qnn_aot_fullgraph_prefill_pp256_20260322.log

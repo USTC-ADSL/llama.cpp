@@ -38,6 +38,11 @@ static uint64_t get_time_ns() {
     return std::chrono::nanoseconds(clock::now().time_since_epoch()).count();
 }
 
+static bool llama_bench_fast_exit_requested() {
+    const char * value = std::getenv("LLAMA_BENCH_FAST_EXIT");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
 static bool tensor_buft_override_equal(const llama_model_tensor_buft_override& a, const llama_model_tensor_buft_override& b) {
     if (a.pattern != b.pattern) {
         // cString comparison that may be null
@@ -2361,6 +2366,14 @@ int main(int argc, char ** argv) {
 
     if (p_err) {
         p_err->print_footer();
+    }
+
+    // Android/QNN can still abort in shared-library finalizers after the benchmark
+    // output has already been printed. This opt-in escape hatch keeps the result
+    // usable for device-side baseline collection while we debug the runtime teardown.
+    if (llama_bench_fast_exit_requested()) {
+        fflush(nullptr);
+        std::_Exit(0);
     }
 
     llama_backend_free();

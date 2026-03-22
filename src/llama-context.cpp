@@ -297,6 +297,12 @@ llama_context::llama_context(
 
     if (!hparams.vocab_only) {
         // GPU backends
+        const auto backend_device_already_added = [&](ggml_backend_dev_t dev) {
+            return std::any_of(backends.begin(), backends.end(), [&](const ggml_backend_ptr & backend) {
+                return ggml_backend_get_device(backend.get()) == dev;
+            });
+        };
+
         for (auto * dev : model.devices) {
             ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
             if (backend == nullptr) {
@@ -309,6 +315,9 @@ llama_context::llama_context(
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
             if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+                if (backend_device_already_added(dev)) {
+                    continue;
+                }
                 ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
                 if (backend == nullptr) {
                     throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));

@@ -186,6 +186,8 @@ llama_kv_cache::llama_kv_cache(
     }
 
     const bool is_mla = hparams.is_mla();
+    bool logged_qnn_host_kv_placement = false;
+    bool warned_qnn_host_kv_unavailable = false;
 
     for (uint32_t il = 0; il < hparams.n_layer; il++) {
         if (!hparams.has_kv(il)) {
@@ -214,9 +216,34 @@ llama_kv_cache::llama_kv_cache(
             dev_name = consumer_kv_dev_name != nullptr ? consumer_kv_dev_name : ggml_backend_buft_name(consumer_kv_buft);
         } else if (offload) {
             auto * dev = model.dev_layer(il);
-            buft = ggml_backend_dev_buffer_type(dev);
+            const char * offload_dev_name = dev != nullptr ? ggml_backend_dev_name(dev) : nullptr;
 
-            dev_name = ggml_backend_dev_name(dev);
+            if (dev != nullptr &&
+                offload_dev_name != nullptr &&
+                std::strcmp(offload_dev_name, "qnn-npu") == 0) {
+                ggml_backend_buffer_type_t qnn_host_buft = ggml_backend_dev_host_buffer_type(dev);
+                if (qnn_host_buft != nullptr) {
+                    buft = qnn_host_buft;
+                    dev_name = ggml_backend_buft_name(qnn_host_buft);
+                    if (!logged_qnn_host_kv_placement) {
+                        LLAMA_LOG_INFO("%s: static qnn-npu KV cache uses %s so cache SET_ROWS/GET_ROWS can stay on a host-visible buffer while preserving qnn-npu decode offload\n",
+                                __func__,
+                                dev_name);
+                        logged_qnn_host_kv_placement = true;
+                    }
+                } else {
+                    buft = ggml_backend_dev_buffer_type(dev);
+                    dev_name = offload_dev_name;
+                    if (!warned_qnn_host_kv_unavailable) {
+                        LLAMA_LOG_WARN("%s: qnn-npu KV cache requested host-visible placement, but qnn-npu-host is unavailable; falling back to legacy device KV placement\n",
+                                __func__);
+                        warned_qnn_host_kv_unavailable = true;
+                    }
+                }
+            } else {
+                buft = ggml_backend_dev_buffer_type(dev);
+                dev_name = offload_dev_name != nullptr ? offload_dev_name : "CPU";
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);

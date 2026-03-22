@@ -4,6 +4,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -198,6 +199,8 @@ class qnn_aot_runtime {
     aot_match_result match_transformer_graph(ggml_cgraph * cgraph) const;
     aot_match_result match_ffn_graph(ggml_cgraph * cgraph) const;
     aot_match_result match_lm_head_graph(ggml_cgraph * cgraph) const;
+    bool execute_fragment_view(ggml_cgraph * cgraph, int i0, int i1);
+    bool try_execute_fragmented_transformer(ggml_cgraph * cgraph);
     bool execute_attention(ggml_cgraph * cgraph, const aot_match_result & match);
     bool execute_attn_proj(ggml_cgraph * cgraph, const aot_match_result & match);
     bool execute_attn_core(ggml_cgraph * cgraph, const aot_match_result & match);
@@ -205,12 +208,17 @@ class qnn_aot_runtime {
     bool execute_ffn(ggml_cgraph * cgraph, const aot_match_result & match);
     bool execute_lm_head(ggml_cgraph * cgraph, const aot_match_result & match);
     qnn_aot_graph * select_attention_graph(size_t start_layer_id, size_t end_layer_id, size_t n_tokens) const;
-    qnn_aot_graph * select_attn_proj_graph(size_t n_tokens, size_t layer_id) const;
-    qnn_aot_graph * select_attn_core_graph(size_t n_tokens, size_t layer_id) const;
+    qnn_aot_graph * select_attn_proj_graph(size_t n_tokens, size_t layer_id);
+    qnn_aot_graph * select_attn_core_graph(size_t n_tokens, size_t layer_id);
     qnn_aot_graph * select_transformer_graph(size_t n_tokens) const;
-    qnn_aot_graph * select_ffn_graph(size_t n_tokens, size_t layer_id) const;
-    qnn_aot_graph * select_lm_head_graph(size_t n_tokens) const;
-    qnn_aot_graph * select_graph(const graph_family & family, size_t n_tokens, size_t layer_id) const;
+    qnn_aot_graph * select_ffn_graph(size_t n_tokens, size_t layer_id);
+    qnn_aot_graph * select_lm_head_graph(size_t n_tokens);
+    qnn_aot_graph * select_graph(const std::vector<qnn_aot_graph_config> & configs,
+                                 graph_family &                              family,
+                                 size_t                                      n_tokens,
+                                 size_t                                      layer_id);
+    qnn_aot_graph * ensure_graph_loaded(const qnn_aot_graph_config & graph_config,
+                                        graph_family &                family);
 
     void compute_rope_embeds();
     void fill_rope_embeds(qnn_aot_graph & graph, size_t start_pos, size_t n_tokens);
@@ -239,6 +247,7 @@ class qnn_aot_runtime {
     graph_family _ffn_graphs;
     graph_family _lm_head_graphs;
     std::unordered_map<std::string, std::shared_ptr<qnn_aot_context>> _contexts;
+    std::mutex _lazy_graph_mutex;
 
     size_t _kv_position = 0;
     size_t _seed_kv_size = 0;
