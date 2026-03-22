@@ -292,6 +292,8 @@ static inline bool llama_hetero_is_attn_core_tensor_name(const char * tensor_nam
     return tensor_name != nullptr && (
         llama_hetero_name_has_prefix(tensor_name, "__fattn__-") ||
         llama_hetero_name_has_prefix(tensor_name, "fattn") ||
+        llama_hetero_name_has_prefix(tensor_name, "cache_k_") ||
+        llama_hetero_name_has_prefix(tensor_name, "cache_v_") ||
         llama_hetero_name_has_prefix(tensor_name, "kq") ||
         llama_hetero_name_has_prefix(tensor_name, "kqv") ||
         llama_hetero_name_has_prefix(tensor_name, "v_cont-"));
@@ -326,7 +328,8 @@ static inline void llama_hetero_set_route_field(llama_hetero_route_spec & spec, 
         spec.attn = value;
     } else if (key == "attn_proj" || key == "attn_projection" || key == "attention_projection" || key == "qkv_proj") {
         spec.attn_proj = value;
-    } else if (key == "attn_core" || key == "attention_core") {
+    } else if (key == "attn_core" || key == "attention_core" ||
+               key == "attn_kvcore" || key == "attention_kvcore" || key == "kvcore") {
         spec.attn_core = value;
     } else if (key == "attn_out" || key == "attn_output" || key == "attention_output" || key == "o_proj") {
         spec.attn_out = value;

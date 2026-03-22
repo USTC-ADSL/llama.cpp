@@ -276,6 +276,8 @@ private:
     const llama_model & model;
 
     llama_cparams cparams;
+    ggml_type kv_type_k = GGML_TYPE_F16;
+    ggml_type kv_type_v = GGML_TYPE_F16;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;

@@ -337,9 +337,23 @@ class qnn_htp_buffer_pool : public qnn_buffer_interface {
             return nullptr;
         }
 
+        std::array<uint32_t, GGML_MAX_DIMS> normalized_dimensions = {};
+        normalized_dimensions.fill(1);
+        const uint32_t normalized_rank = std::max<uint32_t>(1, std::min<uint32_t>(rank, GGML_MAX_DIMS));
+        if (dimensions != nullptr) {
+            for (uint32_t i = 0; i < normalized_rank; ++i) {
+                normalized_dimensions[i] = std::max<uint32_t>(dimensions[i], 1);
+            }
+        }
+
+        const size_t nbytes = std::max<size_t>(1, ggml_nbytes(tensor));
         const qnn_htp_tensor_view_key key = {
-            tensor,
+            tensor->data,
+            nbytes,
             context_handle,
+            normalized_rank,
+            normalized_dimensions,
+            data_type,
         };
         auto it = _tensor_views.find(key);
         if (it != _tensor_views.end()) {
@@ -348,7 +362,6 @@ class qnn_htp_buffer_pool : public qnn_buffer_interface {
 
         auto * base = _allocator->base();
         auto * ptr  = static_cast<uint8_t *>(tensor->data);
-        const size_t nbytes = std::max<size_t>(1, ggml_nbytes(tensor));
 
         if (ptr < base || ptr + nbytes > base + _size) {
             QNN_LOG_WARN("tensor buffer view out of range: tensor=%s ptr=%p base=%p bytes=%zu pool=%zu\n",
@@ -380,19 +393,34 @@ class qnn_htp_buffer_pool : public qnn_buffer_interface {
 
   private:
     struct qnn_htp_tensor_view_key {
-        const ggml_tensor *  tensor          = nullptr;
-        Qnn_ContextHandle_t  context_handle  = nullptr;
+        const void *                     data            = nullptr;
+        size_t                           nbytes          = 0;
+        Qnn_ContextHandle_t              context_handle  = nullptr;
+        uint32_t                         rank            = 1;
+        std::array<uint32_t, GGML_MAX_DIMS> dimensions   = {};
+        Qnn_DataType_t                   data_type       = QNN_DATATYPE_UNDEFINED;
 
         bool operator==(const qnn_htp_tensor_view_key & other) const {
-            return tensor == other.tensor && context_handle == other.context_handle;
+            return data == other.data &&
+                   nbytes == other.nbytes &&
+                   context_handle == other.context_handle &&
+                   rank == other.rank &&
+                   dimensions == other.dimensions &&
+                   data_type == other.data_type;
         }
     };
 
     struct qnn_htp_tensor_view_key_hash {
         size_t operator()(const qnn_htp_tensor_view_key & key) const {
-            const size_t tensor_hash = std::hash<const ggml_tensor *>()(key.tensor);
-            const size_t ctx_hash    = std::hash<Qnn_ContextHandle_t>()(key.context_handle);
-            return tensor_hash ^ (ctx_hash << 1);
+            size_t hash = std::hash<const void *>()(key.data);
+            hash ^= std::hash<size_t>()(key.nbytes) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+            hash ^= std::hash<Qnn_ContextHandle_t>()(key.context_handle) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+            hash ^= std::hash<uint32_t>()(key.rank) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+            hash ^= std::hash<int>()(static_cast<int>(key.data_type)) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+            for (uint32_t dim : key.dimensions) {
+                hash ^= std::hash<uint32_t>()(dim) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+            }
+            return hash;
         }
     };
 

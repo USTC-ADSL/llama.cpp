@@ -133,7 +133,7 @@ void set_hetero_route_field(hetero_route_spec & route, const std::string & key, 
         route.attn = value;
     } else if (key == "attn_proj") {
         route.attn_proj = value;
-    } else if (key == "attn_core") {
+    } else if (key == "attn_core" || key == "attn_kvcore" || key == "kvcore") {
         route.attn_core = value;
     } else if (key == "attn_out") {
         route.attn_out = value;
@@ -307,8 +307,8 @@ bool is_aot_trace_name(const char * name) {
              "ffn_swiglu-",
              "ffn_out-",
              "l_out-",
-             "cache_k_l",
-             "cache_v_l",
+             "cache_k_",
+             "cache_v_",
          }) {
         if (std::strncmp(name, prefix, std::strlen(prefix)) == 0) {
             return true;
@@ -349,6 +349,8 @@ bool is_aot_transformer_stage_name(const char * name) {
              "ffn_swiglu-",
              "ffn_out-",
              "l_out-",
+             "cache_k_",
+             "cache_v_",
          }) {
         if (std::strncmp(name, prefix, std::strlen(prefix)) == 0) {
             return true;
@@ -1007,6 +1009,15 @@ bool device_supports_op(qnn::ggml_backend_qnn_device_context * ctx, const ggml_t
             print_tensor_info(ctx, op, false);
 #endif
             return false;
+        }
+
+        if (ctx->aot_runtime->supports_fragment_op(op)) {
+            trace_aot_support(op, "aot-fragment-runtime", true);
+#ifndef NDEBUG
+            ctx->supported_op_count++;
+            print_tensor_info(ctx, op, true);
+#endif
+            return true;
         }
     }
 

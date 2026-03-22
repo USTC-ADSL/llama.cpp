@@ -55,6 +55,8 @@ llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
     model(model),
+    kv_type_k(params.type_k),
+    kv_type_v(params.type_v),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
@@ -562,7 +564,7 @@ llama_context::llama_context(
                 const bool use_shared_host_buft =
                     (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU &&
                      (hetero_cpu_opencl_zero_copy || hetero_qnn_shared_host_compute)) ||
-                    (is_opencl_backend && hetero_cpu_opencl_zero_copy) ||
+                    (is_opencl_backend && (hetero_cpu_opencl_zero_copy || hetero_qnn_shared_host_compute)) ||
                     (is_qnn_backend && hetero_qnn_shared_host_compute);
 
                 if (use_shared_host_buft) {
@@ -2851,6 +2853,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
         }
         static bool warned_hetero_attn_kv_boundary = false;
         static bool logged_hetero_attn_kv_contract = false;
+        static bool warned_qnn_attn_core_kv_dtype = false;
         if (hetero_plan.attn_kv.stage_boundary_active() && !logged_hetero_attn_kv_contract) {
             LLAMA_LOG_INFO("%s: attn KV contract layout=%s transfer=%s zero_copy=%s available=%s reason=%s\n",
                     __func__,
@@ -2872,6 +2875,15 @@ llm_graph_cb llama_context::graph_get_cb() const {
                     llama_hetero_kv_transfer_mode_name(hetero_kv_contract_allocated.transfer),
                     hetero_kv_contract_allocated.reason.empty() ? "<none>" : hetero_kv_contract_allocated.reason.c_str());
             warned_hetero_attn_kv_boundary = true;
+        }
+        if (hetero_attn_core_backend == qnn_aot_backend &&
+            (kv_type_k != GGML_TYPE_F32 || kv_type_v != GGML_TYPE_F32) &&
+            !warned_qnn_attn_core_kv_dtype) {
+            LLAMA_LOG_WARN("%s: QNN AoT attn_core currently uses the experimental shared-KV contract with F32 cache inputs. The current context was built with type_k=%s type_v=%s, so attn_core=qnn-npu will not be a valid zero-copy KV route. Rebuild the context with F32 KV cache types for the attn_core experiment.\n",
+                    __func__,
+                    ggml_type_name(kv_type_k),
+                    ggml_type_name(kv_type_v));
+            warned_qnn_attn_core_kv_dtype = true;
         }
     }
 

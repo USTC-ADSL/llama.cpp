@@ -42,6 +42,10 @@ If `--system-prompt-file` is provided, the script also snapshots seed KV files i
 - input `attn_bias`: the fixed-size attention bias buffer the runtime materializes from `self_kq_mask`
 - output `out`: `ffn_inp`, i.e. the post-attention residual that should cross the `attn_core -> ffn` boundary
 
+Current attn-core export uses `F32` for `attn_bias`, `cache_k`, and `cache_v`.
+This is an intentional workaround for the current QNN converter path, which fails to calibrate graphs that expose those external inputs as `F16`.
+For zero-copy `attn_proj <-> attn_core` KV sharing across CPU / OpenCL / QNN AoT, the runtime KV layout therefore also needs to be `F32` for the experimental `type=attn_core` path.
+
 Example:
 
 ```bash
@@ -94,3 +98,4 @@ Current limitation:
 - `type=attention` still follows the PowerServe full-attention contract and keeps its own QNN-side KV state.
 - `type=attn_core` is intentionally scoped to the 3-way split where `attn_out` is folded into `attn_core`; it is not the old 4-way `attn_core + attn_out` route.
 - The current `attn_core` runtime path is scoped to the single-stream shared-KV layout that decode/prefill currently use in this tree; it is not yet a generic replacement for every historical attention layout variant.
+- The current QNN `attn_core` path is zero-copy only when the shared KV layout is `F32`. If the context still uses the default `F16` KV cache, the route is not a valid no-copy attn-core experiment.

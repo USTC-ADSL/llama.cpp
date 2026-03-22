@@ -210,10 +210,8 @@ class AttentionCoreExporter:
 
         graph = self.onnx_model.graph
 
-        for name in ("x", "qcur", "kcur", "vcur", "out"):
+        for name in ("x", "qcur", "kcur", "vcur", "attn_bias", "cache_k", "cache_v", "out"):
             encode_activation(name, 32)
-        for name in ("attn_bias", "cache_k", "cache_v"):
-            encode_activation(name, 16)
 
         for node in graph.node:
             if match(node, "(.*/)?core.*"):
@@ -313,9 +311,9 @@ def flatten_attn_core_inputs(attention_module: nn.Module, inputs: Tuple[object, 
         qcur,
         kcur,
         vcur,
-        clone_cpu_tensor(attn_bias).to(torch.float16),
-        cache_k.unsqueeze(0).contiguous().to(torch.float16),
-        cache_v.unsqueeze(0).contiguous().to(torch.float16),
+        clone_cpu_tensor(attn_bias).to(torch.float32),
+        cache_k.unsqueeze(0).contiguous().to(torch.float32),
+        cache_v.unsqueeze(0).contiguous().to(torch.float32),
     )
 
 
