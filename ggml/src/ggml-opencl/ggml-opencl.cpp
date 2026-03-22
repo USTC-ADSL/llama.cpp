@@ -3274,11 +3274,19 @@ struct ggml_tensor_extra_cl {
     // The actual size of the cl_mem object. This is needed when returning the
     // block to the pool.
     size_t actual_size;
+    // External host aliases must be tied to the live ggml buffer that owns the
+    // underlying host allocation. Mixed-route tensors can reuse the same
+    // ggml_tensor object across runs, so tensor->extra may outlive the buffer
+    // assignment that created it.
+    ggml_backend_buffer_t owner_buffer;
+    bool external_host_alias;
 
     void reset() {
         data_device = nullptr;
         offset = 0;
         actual_size = 0;
+        owner_buffer = nullptr;
+        external_host_alias = false;
     }
 };
 
@@ -3305,6 +3313,10 @@ static bool ggml_backend_opencl_is_qnn_shared_host_buffer(ggml_backend_buffer_t 
     return buffer_name != nullptr && std::strcmp(buffer_name, "qnn-npu-host") == 0;
 }
 
+static bool ggml_backend_opencl_can_create_aligned_sub_buffer(const ggml_tensor_extra_cl * extra, size_t alignment) {
+    return extra != nullptr && extra->data_device != nullptr && alignment != 0 && (extra->offset % alignment) == 0;
+}
+
 static ggml_tensor_extra_cl * ggml_backend_opencl_ensure_tensor_extra_from_host_buffer(
         ggml_backend_t backend,
         ggml_tensor * tensor) {
@@ -3312,8 +3324,21 @@ static ggml_tensor_extra_cl * ggml_backend_opencl_ensure_tensor_extra_from_host_
         return nullptr;
     }
 
+    const bool is_qnn_shared_host = ggml_backend_opencl_is_qnn_shared_host_buffer(tensor->buffer);
     if (tensor->extra != nullptr) {
-        return static_cast<ggml_tensor_extra_cl *>(tensor->extra);
+        auto * extra = static_cast<ggml_tensor_extra_cl *>(tensor->extra);
+        if (!is_qnn_shared_host) {
+            return extra;
+        }
+
+        if (extra->external_host_alias && extra->owner_buffer == tensor->buffer) {
+            return extra;
+        }
+
+        // Stale OpenCL temp extras can survive on tensors that have been rebound
+        // onto qnn-npu-host. Drop them and rebuild a host alias for the current
+        // buffer assignment instead of reusing the wrong cl_mem view.
+        tensor->extra = nullptr;
     }
 
     if (tensor->view_src != nullptr) {
@@ -3328,7 +3353,7 @@ static ggml_tensor_extra_cl * ggml_backend_opencl_ensure_tensor_extra_from_host_
         return nullptr;
     }
 
-    if (!ggml_backend_opencl_is_qnn_shared_host_buffer(tensor->buffer)) {
+    if (!is_qnn_shared_host) {
         return nullptr;
     }
 
@@ -3366,6 +3391,8 @@ static ggml_tensor_extra_cl * ggml_backend_opencl_ensure_tensor_extra_from_host_
     extra->data_device = data_device;
     extra->offset = static_cast<cl_ulong>((char *) tensor->data - (char *) base);
     extra->actual_size = size;
+    extra->owner_buffer = tensor->buffer;
+    extra->external_host_alias = true;
 
     backend_ctx->external_tensor_extras.push_back(extra);
     tensor->extra = extra;
@@ -3514,6 +3541,7 @@ struct ggml_tensor_extra_cl_mxfp4 {
 };
 
 struct ggml_tensor_extra_cl_q8_0 {
+    uint32_t magic = 0x51383030u;
     cl_mem q = nullptr;
     cl_mem q_img = nullptr;
 
@@ -3528,6 +3556,7 @@ struct ggml_tensor_extra_cl_q8_0 {
     }
 
     void reset() {
+        magic = 0x51383030u;
         // q and d are subbuffers into the bigger buffer allocated in ggml_backend_buffer.
         // They must be properly released so that the original buffer can be
         // properly released to avoid memory leak.
@@ -5252,6 +5281,28 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         size, data, 0, NULL, NULL));
 
     GGML_UNUSED(buffer);
+}
+
+static bool ggml_backend_opencl_has_valid_q8_0_extra(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->extra == nullptr) {
+        return false;
+    }
+
+    auto * extra = static_cast<const ggml_tensor_extra_cl_q8_0 *>(tensor->extra);
+    return extra->magic == 0x51383030u;
+}
+
+static ggml_tensor_extra_cl_q8_0 * ggml_backend_opencl_ensure_q8_0_tensor_extra(ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->type != GGML_TYPE_Q8_0 || tensor->buffer == nullptr || tensor->data == nullptr) {
+        return nullptr;
+    }
+
+    if (!ggml_backend_opencl_has_valid_q8_0_extra(tensor)) {
+        ggml_backend_opencl_buffer_set_tensor(tensor->buffer, tensor, tensor->data, 0, ggml_nbytes(tensor));
+    }
+
+    GGML_ASSERT(ggml_backend_opencl_has_valid_q8_0_extra(tensor));
+    return static_cast<ggml_tensor_extra_cl_q8_0 *>(tensor->extra);
 }
 
 static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -9577,7 +9628,7 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
     ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
 
-    ggml_tensor_extra_cl_q8_0 * extra0_q8_0 = (ggml_tensor_extra_cl_q8_0 *)src0->extra;
+    ggml_tensor_extra_cl_q8_0 * extra0_q8_0 = ggml_backend_opencl_ensure_q8_0_tensor_extra(const_cast<ggml_tensor *>(src0));
 
     GGML_ASSERT(src1->view_offs == 0);
     GGML_ASSERT(dst->view_offs == 0);
@@ -9829,7 +9880,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     ggml_tensor_extra_cl_q4_0 * extra0_q4_0 = (ggml_tensor_extra_cl_q4_0 *)src0->extra;
     ggml_tensor_extra_cl_q4_1 * extra0_q4_1 = (ggml_tensor_extra_cl_q4_1 *)src0->extra;
     ggml_tensor_extra_cl_mxfp4 * extra0_mxfp4 = (ggml_tensor_extra_cl_mxfp4 *)src0->extra;
-    ggml_tensor_extra_cl_q8_0 * extra0_q8_0 = (ggml_tensor_extra_cl_q8_0 *)src0->extra;
+    ggml_tensor_extra_cl_q8_0 * extra0_q8_0 = ggml_backend_opencl_ensure_q8_0_tensor_extra(const_cast<ggml_tensor *>(src0));
     ggml_tensor_extra_cl_q6_K * extra0_q6_K = (ggml_tensor_extra_cl_q6_K *)src0->extra;
 #endif
 
@@ -9934,7 +9985,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
     // q8_0 x fp32
     if (src0t == GGML_TYPE_Q8_0 && src1t == GGML_TYPE_F32 &&
-        enable_adreno_trans_weight(backend_ctx, src0)) {
+        enable_adreno_trans_weight(backend_ctx, src0) &&
+        ggml_backend_opencl_can_create_aligned_sub_buffer(extra1, backend_ctx->alignment) &&
+        ggml_backend_opencl_can_create_aligned_sub_buffer(extrad, backend_ctx->alignment)) {
             ggml_cl_mul_mat_q8_0_f32_adreno(backend, src0, src1, dst);
             return;
     }
@@ -11170,7 +11223,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 #ifdef GGML_OPENCL_SOA_Q
     ggml_tensor_extra_cl_q4_0 * extra0_q4_0 = (ggml_tensor_extra_cl_q4_0 *)src0->extra;
     ggml_tensor_extra_cl_mxfp4 * extra0_mxfp4 = (ggml_tensor_extra_cl_mxfp4 *)src0->extra;
-    ggml_tensor_extra_cl_q8_0 * extra0_q8_0 = (ggml_tensor_extra_cl_q8_0 *)src0->extra;
+    ggml_tensor_extra_cl_q8_0 * extra0_q8_0 = ggml_backend_opencl_ensure_q8_0_tensor_extra(const_cast<ggml_tensor *>(src0));
 #endif
 
     const int ne00 = src0->ne[0];
@@ -12681,6 +12734,10 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
     ggml_backend_opencl_ensure_tensor_extra_from_host_buffer(backend, src0);
     ggml_backend_opencl_ensure_tensor_extra_from_host_buffer(backend, src1);
     ggml_backend_opencl_ensure_tensor_extra_from_host_buffer(backend, src2);
+
+    if (src0 != nullptr && src0->type == GGML_TYPE_Q8_0) {
+        ggml_backend_opencl_ensure_q8_0_tensor_extra(src0);
+    }
 
     const bool any_on_device = tensor->extra
         || (src0 != nullptr && src0->extra)
