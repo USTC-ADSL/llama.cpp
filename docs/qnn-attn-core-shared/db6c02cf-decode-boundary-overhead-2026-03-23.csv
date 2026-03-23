@@ -1,0 +1,4 @@
+route_key,route,route_string,reference_tg1_tok_s,profile_tg1_tok_s,measured_passes,tensor_copy_count,tensor_copy_wait_count,split_compute_count,split_compute_total_us,split_enqueue_total_us,split_compute_cpu_count,split_compute_cpu_us,split_compute_opencl_count,split_compute_opencl_us,split_compute_qnn_count,split_compute_qnn_us,cpu_tail_result_output_count,cpu_tail_result_output_us
+static_gpu,static GPUOpenCL,"-ngl 99 -dev GPUOpenCL",71.06,69.12,1,0,0,2,14288,7940,1,23,1,14265,0,0,0,0
+opencl_qnn_opencl,opencl->qnn->opencl,"attn_proj=opencl,attn_core=qnn-npu,attn_out=qnn-npu,ffn=opencl,output=cpu",24.35,10.82,2+3,0,0,104,86742,47087,28,15602,51,51632,25,19508,2,14031
+cpu_qnn_cpu,cpu->qnn->cpu,"attn_proj=cpu,attn_core=qnn-npu,attn_out=qnn-npu,ffn=cpu,output=cpu",19.20,11.92,2+3,0,0,296,78885,43966,148,23760,123,37413,25,17712,2,5850

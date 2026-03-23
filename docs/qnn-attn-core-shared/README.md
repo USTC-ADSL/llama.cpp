@@ -1,6 +1,6 @@
 # QNN `attn_core` Shared-Host Worklog
 
-更新日期：2026-03-22
+更新日期：2026-03-23
 
 ## Story anchor
 
@@ -20,6 +20,7 @@ Decode is the primary focus, so the narrative stays on the `attn_proj / attn_cor
 - The remaining gap is runtime-overhead dominated, not just “AoT init exploded”. The healthy full-graph trace loads only `transformer + lm_head`, reserves `graph splits = 2`, `qnn-npu = 74.62 MiB`, and `qnn-npu-host = 2.00 MiB` (`tmp/qnn_fullgraph_prefill_qnn_ctx2048_pp128_trace_exec.log`). The split trace cold-starts `72` binaries, reserves `graph splits = 4`, `qnn-npu = 15.75 MiB`, and `qnn-npu-host = 75.06 MiB`, and every `attn_core` graph only direct-binds shared KV while `x/q/k/v/out` mostly fall back to copies (`tmp/qnn_split_batch128_only_prefill_pp128_trace_exec_after_kcache_fix.log`).
 - The prompt-tail nuance is now narrowed down: the last split FFN logging `layer=23 tokens=1` matches llama.cpp prompt-eval semantics where only the last prompt token is marked as an output by default, so `n_outputs=1` collapses the final FFN fragment into an output-tail view. That affects per-stage accounting, but it is no longer evidence that split prefill failed to execute end-to-end.
 - A new minimal stage-profiler note now lives in `db6c02cf-stage-profiler-p16n16c512-2026-03-22.md`. At matched `p16 / n16 / c512`, `CPU` and static `qnn-npu` already show the expected stage heterogeneity: in `Decode`, `Attn_Proj` is near parity while `Attn_Core` and `FFN_Block` are still slower on static `qnn-npu`; in `Prefill`, `FFN_Block` flips and becomes the strongest `qnn-npu` stage, while `Attn_Core` and `KV_Cache` remain the obvious weak points. `GPUOpenCL` still does not fit through `llama-stage-profiler` because model load fails with `unable to allocate OpenCL buffer`, even after shrinking to `p8 / n8 / c256`.
+- A new decode boundary-overhead note now lives in `db6c02cf-decode-boundary-overhead-2026-03-23.md`. The first event-level CSV cut confirms that the measured `tg1` mixed routes still show `tensor_copy = 0` / `tensor_copy_wait = 0`, so the current decode boundary cost is no longer best explained by explicit memcpy. The dominant candidates are now split fragmentation, enqueue-heavy mixed execution, and the CPU `result_norm -> result_output` tail. The same note also shows that the route string `attn_proj=cpu, attn_core=qnn-npu, ffn=cpu` still materializes many `OpenCL` splits at runtime, so route purity remains an open decode-side issue rather than a closed assumption.
 
 ## Stage-level issues and runtime overhead to quantify
 
