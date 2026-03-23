@@ -1,0 +1,3 @@
+mode,route,reference_pp128_tok_s,profiled_pp128_tok_s,measured_pass,tensor_copy_count,tensor_copy_bytes,tensor_copy_total_us,split_compute_count,split_compute_total_us,split_enqueue_total_us,split_compute_cpu_count,split_compute_cpu_us,split_compute_qnn_count,split_compute_qnn_us,graph_splits_trace,aot_execute_graphs_trace,aot_loaded_binaries_trace,qnn_compute_buffer_trace_mib,qnn_host_buffer_trace_mib
+fullgraph,full-graph AoT,2605.81,2617.88,1,0,0,0,2,48598,48475,1,86,1,48512,2,2,2,74.62,2.00
+split,split batch128-only AoT,1531.31,1558.00,1,2,7168,2,4,81766,81496,3,3446,1,78320,4,72,72,15.75,75.06

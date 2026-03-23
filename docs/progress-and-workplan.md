@@ -1,6 +1,6 @@
 # 阶段级异构调度研究原型：进度评估与工作计划
 
-> 更新日期：2026-03-22
+> 更新日期：2026-03-23
 
 ## 一、研究主线与优先级
 
@@ -164,6 +164,9 @@
 当前 `Prefill` 仍未解决的问题：
 
 - split warm gap 仍约 `1.70x`
+- `2026-03-23` 的 event-level CSV 第一刀已经表明：
+  - 显式 scheduler `tensor_copy` 只有 `2` 次、`7168 B`、`2 us`
+  - full-vs-split 的 `33.168 ms` gap 中约 `29.808 ms`（`89.9%`）落在 split 路线那个大的 `qnn-npu` compute 区间内部
 - 关键 overhead 候选包括：
   - `72` 次 graph launch
   - fragment I/O direct-bind 命中率不足
@@ -179,7 +182,7 @@
 | ① `Prefill/Decode` 阶段异构性 | 🔶 部分完成 | 中 | 接口、切分、部分实测已具备，但还缺正式的 `phase × stage × backend` 延迟矩阵 |
 | ② `Prefill/Decode` 功率可调空间 | ⬜ 基本未完成 | 弱 | 路由能力已存在，但仍缺正式功率/能耗数据 |
 | ③ `SLO-aware` 调度框架 | 🔶 部分完成 | 弱到中 | 路由骨架已具备，但 `cost model` 与 `slo_us` 尚未形成真正决策闭环 |
-| ④ runtime overhead 量化 | 🔶 部分完成 | 中 | Decode 已补出第一版 event-level CSV 分解，确认当前 mixed decode 无显式 `tensor_copy`，主要风险转向 split fragmentation、CPU output tail 与 route purity；Prefill 仍缺统一分解表 |
+| ④ runtime overhead 量化 | 🔶 部分完成 | 中到强 | Decode 已补出第一版 event-level CSV 分解，确认当前 mixed decode 无显式 `tensor_copy`，主要风险转向 split fragmentation、CPU output tail 与 route purity；Prefill 也已补出第一版统一分解表，确认 warm `pp128` full-vs-split gap 的约 `89.9%` 落在 qnn backend 内部 stage-chain 区间，而非外层 scheduler `tensor_copy` |
 
 辅助判断：
 
@@ -240,12 +243,14 @@
 | 任务 | 优先级 | 说明 | 产出 |
 |------|------|------|------|
 | P4-1 Decode 边界 overhead 分解 | 最高 | 第一刀已完成：确认 decode mixed route 当前无显式 `tensor_copy`，重点瓶颈转向 split fragmentation、`result_output` CPU tail 与 route purity | CSV + 分析 |
-| P4-2 Prefill full-vs-split overhead 分解 | 最高 | 拆分 graph launch / stage copy / KV writeback | CSV + 分析 |
+| P4-2 Prefill full-vs-split overhead 分解 | 最高 | 第一刀已完成：确认 warm `pp128` gap 的主因不是外层 scheduler copy，而是 qnn backend 内部 stage-chain fragmentation / shared-host materialization | CSV + 分析 |
 | P4-3 ideal vs actual 对比 | 高 | 比较阶段最优之和与真实端到端结果 | 差距分析 |
 | P4-4 微基准与系统级对照 | 中 | 用 `hetero-switch-bench` 对照端到端观测 | 对比文档 |
 
 - `2026-03-23`：`P4-1` 已补出第一版 decode boundary-overhead 文档：
   - `docs/qnn-attn-core-shared/db6c02cf-decode-boundary-overhead-2026-03-23.md`
+- `2026-03-23`：`P4-2` 已补出第一版 prefill full-vs-split overhead 文档：
+  - `docs/qnn-attn-core-shared/db6c02cf-prefill-overhead-2026-03-23.md`
 
 ### Phase 5：功率可调空间测量
 
