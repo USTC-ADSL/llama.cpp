@@ -1,0 +1,9 @@
+flow,size_bytes,shared_avg_latency_us,memcpy_avg_latency_us,shared_over_memcpy_latency_x,delta_us,shared_valid_count,shared_total_count,memcpy_valid_count,memcpy_total_count,shared_avg_throughput_gbps,memcpy_avg_throughput_gbps,note
+host_write_to_opencl_read,7168,864.010,864.294,1.000,-0.283,50,50,50,50,0.008,0.008,shared and memcpy are effectively identical at the only explicit scheduler-copy size seen in P4-2
+host_write_to_opencl_read,65536,6425.406,6785.330,0.947,-359.924,50,50,50,50,0.010,0.010,shared is slightly faster but same order of magnitude
+host_write_to_opencl_read,1048576,85041.678,86255.060,0.986,-1213.382,50,50,50,50,0.012,0.012,shared and memcpy stay close
+host_write_to_opencl_read,16777216,1364761.000,1368890.000,0.997,-4129.000,50,50,50,50,0.012,0.012,large-size gap is still small relative to total latency
+opencl_write_to_host_read,7168,249.802,254.164,0.983,-4.361,0,50,50,50,0.038,0.031,shared looks slightly faster but is invalid on every iteration
+opencl_write_to_host_read,65536,731.499,689.156,1.061,42.343,0,50,50,50,0.098,0.123,shared is invalid on every iteration
+opencl_write_to_host_read,1048576,835.655,1021.502,0.818,-185.847,0,50,50,50,1.310,1.094,shared is invalid on every iteration
+opencl_write_to_host_read,16777216,1529.488,4863.001,0.315,-3333.512,0,50,50,50,11.032,3.459,shared is much faster but still invalid on every iteration

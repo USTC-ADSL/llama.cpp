@@ -248,7 +248,7 @@
 | P4-1 Decode 边界 overhead 分解 | 最高 | 第一刀已完成：确认 decode mixed route 当前无显式 `tensor_copy`，重点瓶颈转向 split fragmentation、`result_output` CPU tail 与 route purity | CSV + 分析 |
 | P4-2 Prefill full-vs-split overhead 分解 | 最高 | 第一刀已完成：确认 warm `pp128` gap 的主因不是外层 scheduler copy，而是 qnn backend 内部 stage-chain fragmentation / shared-host materialization | CSV + 分析 |
 | P4-3 ideal vs actual 对比 | 高 | 第一刀已完成：确认 matched-scale `pp128` 的 stage-local ideal 相对 static `qnn-npu` 只剩 `1.22%` headroom，且 `Decode` 当前 `CPU/qnn` 理论混排空间已接近耗尽 | 差距分析 |
-| P4-4 微基准与系统级对照 | 中 | 用 `hetero-switch-bench` 对照端到端观测 | 对比文档 |
+| P4-4 微基准与系统级对照 | 中 | 第一刀已完成：`host -> OpenCL` shared-host 与 memcpy 量级接近，而 raw `OpenCL -> host` shared-host 在当前设备上 `0/50` 全部校验失败，说明 shared-host 仍有 correctness / materialization 代价 | 对比文档 |
 
 - `2026-03-23`：`P4-1` 已补出第一版 decode boundary-overhead 文档：
   - `docs/qnn-attn-core-shared/db6c02cf-decode-boundary-overhead-2026-03-23.md`
@@ -256,6 +256,8 @@
   - `docs/qnn-attn-core-shared/db6c02cf-prefill-overhead-2026-03-23.md`
 - `2026-03-23`：`P4-3` 已补出第一版 ideal-vs-actual 文档：
   - `docs/qnn-attn-core-shared/db6c02cf-ideal-vs-actual-2026-03-23.md`
+- `2026-03-23`：`P4-4` 已补出第一版 hetero-switch-bench 对照文档：
+  - `docs/qnn-attn-core-shared/db6c02cf-hetero-switch-bench-2026-03-23.md`
 
 ### Phase 5：功率可调空间测量
 
