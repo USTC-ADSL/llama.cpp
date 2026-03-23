@@ -179,7 +179,7 @@
 
 | 主线 | 当前状态 | 证据强度 | 说明 |
 |------|------|------|------|
-| ① `Prefill/Decode` 阶段异构性 | 🔶 部分完成 | 中 | 接口、切分、部分实测已具备，但还缺正式的 `phase × stage × backend` 延迟矩阵 |
+| ① `Prefill/Decode` 阶段异构性 | 🔶 部分完成 | 中到强 | 接口、切分、部分实测已具备；`CPU / qnn-npu` 两列的正式 `phase × stage × backend` 矩阵已经完成，但 `GPUOpenCL` 这一列仍缺正式 stage-profiler 数据 |
 | ② `Prefill/Decode` 功率可调空间 | ⬜ 基本未完成 | 弱 | 路由能力已存在，但仍缺正式功率/能耗数据 |
 | ③ `SLO-aware` 调度框架 | 🔶 部分完成 | 弱到中 | 路由骨架已具备，但 `cost model` 与 `slo_us` 尚未形成真正决策闭环 |
 | ④ runtime overhead 量化 | 🔶 部分完成 | 中到强 | Decode 已补出第一版 event-level CSV 分解，确认当前 mixed decode 无显式 `tensor_copy`，主要风险转向 split fragmentation、CPU output tail 与 route purity；Prefill 也已补出第一版统一分解表，确认 warm `pp128` full-vs-split gap 的约 `89.9%` 落在 qnn backend 内部 stage-chain 区间，而非外层 scheduler `tensor_copy` |
@@ -236,8 +236,8 @@
 |------|------|------|------|
 | P3-1 Decode 分阶段 profiling | 进行中 | 已补出 `CPU / qnn-npu` 的 `p16 / n16 / c512` per-stage latency，`GPUOpenCL` 仍被 OpenCL buffer 分配阻塞 | CSV |
 | P3-2 Prefill 分阶段 profiling | 进行中 | 同一批 stage-profiler 已拿到最小 `p16` prompt 数据，但还缺 `GPUOpenCL` 与更长 prompt | CSV |
-| P3-3 阶段×后端矩阵汇总 | 高 | 构建 `phase × stage × backend` 矩阵 | 图表/文档 |
-| P3-4 阶段最优后端判定 | 高 | 解释计算/访存/KV 依赖和 overhead 风险 | 分析文档 |
+| P3-3 阶段×后端矩阵汇总 | 高 | 第一刀已完成：形成 `CPU / qnn-npu` 两列的正式 `phase × stage × backend` 矩阵，并显式标注 `GPUOpenCL` 缺列 | 图表/文档 |
+| P3-4 阶段最优后端判定 | 高 | 第一刀已完成：把 stage 数据、ideal-vs-actual、overhead 统一成强/弱结论，不再只列单一 winner | 分析文档 |
 
 ### Phase 4：runtime overhead 系统级量化
 
@@ -258,6 +258,9 @@
   - `docs/qnn-attn-core-shared/db6c02cf-ideal-vs-actual-2026-03-23.md`
 - `2026-03-23`：`P4-4` 已补出第一版 hetero-switch-bench 对照文档：
   - `docs/qnn-attn-core-shared/db6c02cf-hetero-switch-bench-2026-03-23.md`
+
+- `2026-03-23`：`P3-3/P3-4` 已补出第一版正式阶段矩阵文档：
+  - `docs/qnn-attn-core-shared/db6c02cf-phase-stage-backend-matrix-2026-03-23.md`
 
 ### Phase 5：功率可调空间测量
 

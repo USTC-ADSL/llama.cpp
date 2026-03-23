@@ -1,0 +1,13 @@
+phase,scale,stage,cpu_mean_us,qnn_mean_us,winner_in_scope,winner_margin_pct,gpu_stage_profiler_status,evidence_note
+decode,p16+n16/c512,Attn_Proj,906.19,871.39,qnn-npu,3.84,missing_opencl_stage_profiler,near parity
+decode,p16+n16/c512,KV_Cache,1631.12,1736.14,cpu,6.05,missing_opencl_stage_profiler,CPU slightly better and more host-friendly
+decode,p16+n16/c512,Attn_Core,111.68,579.72,cpu,80.74,missing_opencl_stage_profiler,CPU strongly better on current static path
+decode,p16+n16/c512,FFN_Block,864.21,1234.62,cpu,30.00,missing_opencl_stage_profiler,CPU clearly better on current static path
+prefill,p16/c512,Attn_Proj,194.84,180.11,qnn-npu,7.56,missing_opencl_stage_profiler,small-scale qnn edge
+prefill,p16/c512,KV_Cache,124.09,274.23,cpu,54.75,missing_opencl_stage_profiler,CPU strongly better
+prefill,p16/c512,Attn_Core,312.42,4017.45,cpu,92.22,missing_opencl_stage_profiler,small-scale CPU dominance
+prefill,p16/c512,FFN_Block,5843.39,1990.58,qnn-npu,65.93,missing_opencl_stage_profiler,strong small-scale qnn edge
+prefill,pp128/c2048,Attn_Proj,1245.92,1279.31,cpu,2.61,missing_opencl_stage_profiler,matched-scale flips to CPU but margin is tiny
+prefill,pp128/c2048,KV_Cache,315.94,360.16,cpu,12.28,missing_opencl_stage_profiler,CPU remains better
+prefill,pp128/c2048,Attn_Core,8724.57,4779.14,qnn-npu,45.22,missing_opencl_stage_profiler,matched-scale flips to qnn-npu
+prefill,pp128/c2048,FFN_Block,15649.25,15843.36,cpu,1.23,missing_opencl_stage_profiler,matched-scale near parity and flips to CPU
