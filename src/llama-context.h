@@ -331,6 +331,7 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+    ggml_backend_sched_ptr aot_saved_sched;
 
     bool sched_need_reserve = true;
 
@@ -367,6 +368,7 @@ private:
     // Force the next graph build onto CPU only. Used for the AoT bootstrap
     // correction path after seeding QNN state with the initial token.
     bool aot_force_cpu_graph = false;
+    bool aot_bootstrap_cpu_sched_active = false;
 
     llama_hetero_execution_plan hetero_plan;
     llama_hetero_execution_plan hetero_plan_base;

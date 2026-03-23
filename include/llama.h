@@ -341,7 +341,7 @@ extern "C" {
         // [EXPERIMENTAL]
         // "disabled" keeps the current static route.
         // "phase-heuristic" switches between prefill/decode candidate routes.
-        // "cost-model" is reserved for future SLO-aware routing.
+        // "cost-model" enables the experimental SLO-aware candidate selector.
         const char * mode;
 
         // [EXPERIMENTAL]
@@ -364,7 +364,9 @@ extern "C" {
         const char * fallback_kv_layout;
 
         // [EXPERIMENTAL]
-        // Reserved for future SLO-aware / cost-model routing.
+        // Optional latency target used by "cost-model". The runtime will pick
+        // the fastest compatible candidate that is estimated to satisfy this
+        // budget; if none fit, it falls back to the best-effort candidate.
         int64_t slo_us;
 
         // [EXPERIMENTAL]

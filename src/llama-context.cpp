@@ -1195,6 +1195,12 @@ void llama_context::synchronize() {
 
     n_queued_tokens = 0;
     t_compute_start_us = 0;
+
+    if (aot_bootstrap_cpu_sched_active && aot_saved_sched) {
+        LLAMA_LOG_DEBUG("%s: restoring steady-state scheduler after AoT bootstrap CPU correction\n", __func__);
+        sched = std::move(aot_saved_sched);
+        aot_bootstrap_cpu_sched_active = false;
+    }
 }
 
 const llama_model & llama_context::get_model() const {
@@ -1710,6 +1716,12 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    if (aot_bootstrap_cpu_sched_active) {
+        // Keep the bootstrap CPU-only scheduler alive until any async output fetches
+        // from the correction graph have been synchronized, then restore the main one.
+        synchronize();
+    }
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1785,6 +1797,35 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->invalidate_reuse();
 
         auto * cpu_res = gf_res_reserve.get();
+        ggml_backend_buffer_type_t cpu_buft = ggml_backend_get_default_buffer_type(backend_cpu);
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            if (backend_ptrs[i] == backend_cpu) {
+                cpu_buft = backend_buft[i];
+                break;
+            }
+        }
+
+        ggml_backend_t cpu_backend_ptrs[] = { backend_cpu };
+        ggml_backend_buffer_type_t cpu_backend_bufts[] = { cpu_buft };
+
+        aot_saved_sched = std::move(sched);
+        sched.reset(ggml_backend_sched_new(
+                cpu_backend_ptrs,
+                cpu_backend_bufts,
+                1,
+                cpu_res->get_max_nodes(),
+                /* parallel = */ false,
+                cparams.op_offload));
+
+        if (!sched) {
+            sched = std::move(aot_saved_sched);
+            LLAMA_LOG_ERROR("%s: failed to create CPU-only scheduler for AoT bootstrap correction\n", __func__);
+            ret = GGML_STATUS_ALLOC_FAILED;
+            return nullptr;
+        }
+
+        aot_bootstrap_cpu_sched_active = true;
+
         const char * prev_qnn_disable = std::getenv("GGML_QNN_DISABLE_BACKEND");
         const bool had_prev_qnn_disable = prev_qnn_disable != nullptr;
         const std::string prev_qnn_disable_value = had_prev_qnn_disable ? prev_qnn_disable : "";
@@ -1799,6 +1840,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         if (status != GGML_STATUS_SUCCESS) {
+            sched = std::move(aot_saved_sched);
+            aot_bootstrap_cpu_sched_active = false;
             LLAMA_LOG_ERROR("%s: failed to compute bootstrap CPU correction graph, status: %d\n", __func__, status);
             ret = status;
             return nullptr;
@@ -2834,6 +2877,12 @@ llm_graph_cb llama_context::graph_get_cb() const {
     const ggml_backend_t hetero_ffn_backend       = parse_hetero_backend(hetero_route.backend_for(llama_hetero_route_stage::FFN));
     const ggml_backend_t hetero_output_backend    = parse_hetero_backend(hetero_route.backend_for(llama_hetero_route_stage::OUTPUT));
     const bool hetero_stage_enabled = hetero_route.has_any_route();
+    const bool hetero_route_uses_opencl =
+        llama_hetero_is_opencl_backend(hetero_route.backend_for(llama_hetero_route_stage::ATTN_PROJ)) ||
+        llama_hetero_is_opencl_backend(hetero_route.backend_for(llama_hetero_route_stage::ATTN_CORE)) ||
+        llama_hetero_is_opencl_backend(hetero_route.backend_for(llama_hetero_route_stage::ATTN_OUT )) ||
+        llama_hetero_is_opencl_backend(hetero_route.backend_for(llama_hetero_route_stage::FFN      )) ||
+        llama_hetero_is_opencl_backend(hetero_route.backend_for(llama_hetero_route_stage::OUTPUT   ));
 
     if (hetero_stage_enabled) {
         const auto backend_name_or = [](ggml_backend_t backend) -> const char * {
@@ -3003,6 +3052,11 @@ llm_graph_cb llama_context::graph_get_cb() const {
             (attn_core_stage && hetero_attn_core_backend != nullptr) ||
             (attn_proj_stage && hetero_attn_proj_backend != nullptr) ||
             (ffn_stage       && hetero_ffn_backend       != nullptr);
+        const bool preserve_stage_purity_on_cpu =
+            hetero_stage_enabled &&
+            !hetero_route_uses_opencl &&
+            backend_cpu != nullptr &&
+            llama_hetero_is_stage_tensor_name(tensor_name);
 
         auto resolve_stage_backend = [&]() -> ggml_backend_t {
             if (route_output_to_backend) {
@@ -3050,9 +3104,18 @@ llm_graph_cb llama_context::graph_get_cb() const {
                 if (supported) {
                     set_tensor_backend(target_backend, explicit_hetero_stage);
                     trace_tensor(target_backend == qnn_aot_backend ? "aot-qnn" : "hetero-stage", target_backend, true);
+                } else if (preserve_stage_purity_on_cpu) {
+                    set_tensor_backend(backend_cpu, true);
+                    trace_tensor("hetero-unsupported-cpu-fallback", backend_cpu, true);
                 } else {
                     trace_tensor(target_backend == qnn_aot_backend ? "aot-unsupported" : "hetero-unsupported", target_backend, false);
                 }
+                return;
+            }
+
+            if (preserve_stage_purity_on_cpu) {
+                set_tensor_backend(backend_cpu, true);
+                trace_tensor("hetero-purity-cpu", backend_cpu, true);
                 return;
             }
 
@@ -3075,9 +3138,18 @@ llm_graph_cb llama_context::graph_get_cb() const {
             if (supported) {
                 set_tensor_backend(target_backend, true);
                 trace_tensor("hetero-stage", target_backend, true);
+            } else if (preserve_stage_purity_on_cpu) {
+                set_tensor_backend(backend_cpu, true);
+                trace_tensor("hetero-unsupported-cpu-fallback", backend_cpu, true);
             } else {
                 trace_tensor("hetero-unsupported", target_backend, false);
             }
+            return;
+        }
+
+        if (preserve_stage_purity_on_cpu) {
+            set_tensor_backend(backend_cpu, true);
+            trace_tensor("hetero-purity-cpu", backend_cpu, true);
             return;
         }
 

@@ -47,13 +47,15 @@
 | `PHASE_HEURISTIC` 动态路由 | ✅ | `Prefill/Decode` 已分离 |
 | `fallback` 路由 | ✅ | 已实现 |
 | `route_switches` 统计 | ✅ | 已实现 |
-| `GGML_HETERO_DYNAMIC_SLO_US` | 🔶 | 已接入配置，但尚未进入真正决策 |
-| `COST_MODEL_RESERVED` | ⬜ | 仅占位，尚未实现真正的 cost model routing |
+| `GGML_HETERO_DYNAMIC_SLO_US` | 🔶 | 第一刀已进入 runtime 决策与 trace，但当前仍是 latency-only 判定，`slo_us` 主要区分“满足 SLO”与“best effort over SLO” |
+| `COST_MODEL_RESERVED` | 🔶 | 第一刀已实现候选兼容性过滤、estimate、`decode/fallback/base` 选择，并已在设备上完成 trace 验证 |
 
 当前判断：
 
-- 动态路由框架只有“切换骨架”，还没有形成研究主线意义上的 `SLO-aware` 调度器。
-- 这部分不能过度表述为“已完成”，更准确的说法是“接口与决策插点已就绪，策略尚未完成”。
+- 动态路由框架已经从“切换骨架”推进到了“可运行的第一版 latency-only selector”。
+- 但这部分仍然不能过度表述为“已完成的 `SLO-aware` 调度器”，更准确的说法是：
+  - `cost table -> estimate -> candidate selection -> reason trace` 这条闭环已经跑通；
+  - 功率/能效目标、真实 switch overhead、达标率统计还没有进入正式策略。
 
 ### 2.3 KV cache 跨后端管理
 
@@ -119,10 +121,12 @@
 
 当前 `Decode` 仍未解决的问题：
 
-- `attn_core=qnn-npu` 的最后层 residual 仍可能出现：
-  - `cache_k_upd-23 -> attn_out-23`
-  - `ffn_inp-23`
-- 这更像 mixed-stage residual guard 与 tail fragment 切碎，而不是“Qwen3 适配直接破坏了 Qwen2 matcher”。
+- `AoT bootstrap CPU correction` 的大 `OpenCL` 泄漏已经被收口：
+  - correction graph 现在已经是 CPU-only；
+  - 它不再是 decode `tg1` runtime impurity 的主导来源。
+- 当前 remaining purity 问题收缩为 intended mixed graph 里的 `1` 个小 `OpenCL` residual split：
+  - 它已经不再表现为第二张大 correction graph；
+  - 更像 steady-state mixed graph 末端的 residual fragment，而不是“Qwen3 适配直接破坏了 Qwen2 matcher”。
 - `fd8657d6` 上 static `qnn-npu` baseline 已可测，但它们必须与 full-graph AoT 区分使用：
   - `Qwen2` full-graph AoT prefill 已复核到 `pp128 = 4280.48`、`pp256 = 4565.30`
   - `Qwen3` 当前仍缺 second-device full-graph AoT 产物
@@ -181,7 +185,7 @@
 |------|------|------|------|
 | ① `Prefill/Decode` 阶段异构性 | 🔶 部分完成 | 中到强 | 接口、切分、部分实测已具备；`CPU / qnn-npu` 两列的正式 `phase × stage × backend` 矩阵已经完成，但 `GPUOpenCL` 这一列仍缺正式 stage-profiler 数据 |
 | ② `Prefill/Decode` 功率可调空间 | ⬜ 基本未完成 | 弱 | 路由能力已存在，但仍缺正式功率/能耗数据 |
-| ③ `SLO-aware` 调度框架 | 🔶 部分完成 | 弱到中 | 路由骨架已具备，但 `cost model` 与 `slo_us` 尚未形成真正决策闭环 |
+| ③ `SLO-aware` 调度框架 | 🔶 部分完成 | 中 | 第一版 `cost-model` 与 `slo_us` 运行闭环已完成并做过设备 trace 验证，但当前仍是 latency-only first cut，尚未纳入功率目标、真实切换开销与达标率实验 |
 | ④ runtime overhead 量化 | 🔶 部分完成 | 中到强 | Decode 已补出第一版 event-level CSV 分解，确认当前 mixed decode 无显式 `tensor_copy`，主要风险转向 split fragmentation、CPU output tail 与 route purity；Prefill 也已补出第一版统一分解表，确认 warm `pp128` full-vs-split gap 的约 `89.9%` 落在 qnn backend 内部 stage-chain 区间，而非外层 scheduler `tensor_copy` |
 
 辅助判断：
@@ -213,8 +217,8 @@
 
 | 任务 | 优先级 | 说明 | 产出 |
 |------|------|------|------|
-| P1-1 收口 decode tail residual | 最高 | 重点跟踪 `cache_k_upd-23 -> attn_out-23` 与 `ffn_inp-23` 的分裂原因 | 代码补丁 + 日志 |
-| P1-2 保证 unmatched residual 统一走 CPU | 高 | 避免 residual 掉回 QNN JIT 小图 | 代码补丁 + 复现命令 |
+| P1-1 收口 decode tail residual | 最高 | 第一刀已完成：`bootstrap-cpu` correction 已收口为 CPU-only；steady-state mixed graph 仍剩 `1` 个小 `OpenCL` residual split | 代码补丁 + 日志 |
+| P1-2 保证 unmatched residual 统一走 CPU | 高 | 已完成：显式阶段路由下未匹配/不支持 stage 统一回退 CPU，避免 residual 掉回 QNN JIT 小图 | 代码补丁 + 复现命令 |
 | P1-3 确认 prefill tail `FFN tokens=1` 语义 | 已完成 | 已确认它是 prompt eval 默认 `n_outputs=1` 下的 output-tail 视图，主要影响 per-stage accounting | `progress/2026-03-22-009-prefill-tail-ffn-output-tail-semantics.md` |
 | P1-4 `fd8657d6` 降级为辅助设备 | 中 | 保留 static baseline 能力，不把关键 AoT 实验压在其上 | 设备状态说明 |
 
@@ -279,8 +283,8 @@
 | 任务 | 优先级 | 说明 | 产出 |
 |------|------|------|------|
 | P6-1 建 cost table | 高 | 以 Phase 2~5 的测量结果为输入 | 数据表 |
-| P6-2 实现 `COST_MODEL_RESERVED` | 高 | 让动态路由真正使用成本模型 | 代码 |
-| P6-3 接入 `slo_us` 约束 | 高 | 在决策时显式比较 route 是否满足 SLO | 代码 |
+| P6-2 实现 `COST_MODEL_RESERVED` | 高 | 第一刀已完成：runtime 已支持 candidate estimate、兼容性过滤与 `decode/fallback/base` 选择 | 代码 |
+| P6-3 接入 `slo_us` 约束 | 高 | 第一刀已完成：`slo_us` 已进入 runtime reason 分支，但当前仍是 latency-only 判定 | 代码 |
 | P6-4 Prefill→Decode 切换成本验证 | 高 | 验证 route switch 与 KV contract 的运行时代价 | 实验结果 |
 | P6-5 SLO 达标率实验 | 高 | 统计不同 phase / route 的达标率 | 数据与分析 |
 
@@ -315,22 +319,28 @@ P0 主线口径与记录体系
 
 ## 六、当前最小可验证方案
 
-如果按主线最小闭环推进，下一批最值得完成的是：
+当前非功耗 first cut 已经走到：
 
-1. 收口 `Decode` 最后一层 tail residual 的 unmatched 问题。
-2. 采集主设备 `Decode + Prefill` 的单后端 baseline。
-3. 形成 `phase × stage × backend` 的阶段矩阵初稿。
-4. 对 `Decode` 和 `Prefill` 各做一版 runtime overhead 分解。
+1. `Decode/Prefill` 主路径可跑、可测、可解释。
+2. `phase × stage × backend` 第一版矩阵已经形成。
+3. `Decode/Prefill` runtime overhead 第一版分解已经形成。
+4. `bootstrap-cpu` purity 问题已收口到 CPU-only correction。
+5. `cost-model + slo_us` 第一版 runtime 决策闭环已完成设备验证。
 
-成功意味着：
+如果继续沿主线推进，下一批最值得完成的是：
 
-- `Decode` 与 `Prefill` 都有稳定、可复现、可比较的主路径。
-- 主线 ① 与主线 ④ 从“原型存在”提升到“有系统测量支撑”。
+1. 进入 `P5`，补正式功率/能耗测量闭环。
+2. 在已有 latency-only cost model 之上，补 `P6-4/P6-5` 的 route switch 成本与 SLO 达标率实验。
+3. 只针对已经被证明是瓶颈的环节推进 `P7`，而不是继续扩大策略复杂度。
 
-失败意味着：
+当前成功的含义是：
 
-- 仍然无法分辨阶段收益与 runtime overhead 谁在主导。
-- `SLO-aware` 调度只能停留在接口层，而无法形成可信的研究结论。
+- 非功耗主线已经从“接口存在”推进到“有真实测量、有 route purity 复核、有第一版动态决策闭环”。
+
+当前仍未完成的强结论部分是：
+
+- 功率/能耗证据主线。
+- 把 switch overhead、达标率、功率目标统一进正式调度策略。
 
 ## 七、关键参考文件
 
@@ -339,6 +349,8 @@ P0 主线口径与记录体系
 | [AGENTS.md](/mnt/sda1/pzw/HeteroCompute/llama.cpp-acom/AGENTS.md) | 当前主线与优先级的唯一权威口径 |
 | [decode-stage-backend-support-matrix-2026-03-22.md](/mnt/sda1/pzw/HeteroCompute/llama.cpp-acom/docs/qnn-attn-core-shared/decode-stage-backend-support-matrix-2026-03-22.md) | Decode 三段子图支持矩阵与 4 组补测结果 |
 | [host-validation-2026-03-22.md](/mnt/sda1/pzw/HeteroCompute/llama.cpp-acom/docs/qnn-attn-core-shared/host-validation-2026-03-22.md) | `attn_core` shared-host decode 与 prefill 证据 |
+| [db6c02cf-decode-route-purity-2026-03-23.md](/mnt/sda1/pzw/HeteroCompute/llama.cpp-acom/docs/qnn-attn-core-shared/db6c02cf-decode-route-purity-2026-03-23.md) | `bootstrap-cpu` purity 修复与 decode residual 收口 |
+| [db6c02cf-dynamic-cost-model-validation-2026-03-23.md](/mnt/sda1/pzw/HeteroCompute/llama.cpp-acom/docs/qnn-attn-core-shared/db6c02cf-dynamic-cost-model-validation-2026-03-23.md) | `cost-model + slo_us` 设备侧闭环验证 |
 | [README.md](/mnt/sda1/pzw/HeteroCompute/llama.cpp-acom/docs/qnn-attn-core-shared/README.md) | 当前 prefill/decode runtime overhead 工作日志 |
 | [fd8657d6-baseline-2026-03-22.md](/mnt/sda1/pzw/HeteroCompute/llama.cpp-acom/docs/qnn-attn-core-shared/fd8657d6-baseline-2026-03-22.md) | 第二设备 baseline 与不稳定性说明 |
 | `src/llama-dyn-route.h/cpp` | 动态路由框架 |
