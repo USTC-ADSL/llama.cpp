@@ -188,6 +188,9 @@
 
 - `Decode` 主线进度明显领先于 `Prefill`。
 - `Prefill` 已经进入“解释瓶颈”的阶段，而不再只是“验证能不能跑”。
+- `P4-3` 的 matched-scale 第一刀已经说明：
+  - `Prefill p16` 看到的强异构 headroom，到了 `pp128` 后会明显收缩；
+  - 当前主设备 `Decode` 的 `CPU/qnn` 混排理论空间已经很小。
 - 真正最薄弱的两环仍然是：
   - 功率/能耗主线
   - `SLO-aware` 调度闭环
@@ -244,13 +247,15 @@
 |------|------|------|------|
 | P4-1 Decode 边界 overhead 分解 | 最高 | 第一刀已完成：确认 decode mixed route 当前无显式 `tensor_copy`，重点瓶颈转向 split fragmentation、`result_output` CPU tail 与 route purity | CSV + 分析 |
 | P4-2 Prefill full-vs-split overhead 分解 | 最高 | 第一刀已完成：确认 warm `pp128` gap 的主因不是外层 scheduler copy，而是 qnn backend 内部 stage-chain fragmentation / shared-host materialization | CSV + 分析 |
-| P4-3 ideal vs actual 对比 | 高 | 比较阶段最优之和与真实端到端结果 | 差距分析 |
+| P4-3 ideal vs actual 对比 | 高 | 第一刀已完成：确认 matched-scale `pp128` 的 stage-local ideal 相对 static `qnn-npu` 只剩 `1.22%` headroom，且 `Decode` 当前 `CPU/qnn` 理论混排空间已接近耗尽 | 差距分析 |
 | P4-4 微基准与系统级对照 | 中 | 用 `hetero-switch-bench` 对照端到端观测 | 对比文档 |
 
 - `2026-03-23`：`P4-1` 已补出第一版 decode boundary-overhead 文档：
   - `docs/qnn-attn-core-shared/db6c02cf-decode-boundary-overhead-2026-03-23.md`
 - `2026-03-23`：`P4-2` 已补出第一版 prefill full-vs-split overhead 文档：
   - `docs/qnn-attn-core-shared/db6c02cf-prefill-overhead-2026-03-23.md`
+- `2026-03-23`：`P4-3` 已补出第一版 ideal-vs-actual 文档：
+  - `docs/qnn-attn-core-shared/db6c02cf-ideal-vs-actual-2026-03-23.md`
 
 ### Phase 5：功率可调空间测量
 

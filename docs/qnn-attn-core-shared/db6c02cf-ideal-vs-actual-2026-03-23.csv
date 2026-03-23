@@ -1,0 +1,9 @@
+group,phase,scale,tool,route,total_us,tok_per_s,cpu_total_us,qnn_total_us,ideal_total_us,best_static_backend,best_static_total_us,ideal_vs_best_static_pct,attn_proj_pick,kv_cache_pick,attn_core_pick,ffn_pick,note
+stage_upper_bound,prefill,p16/c512,llama-stage-profiler,cpu_vs_qnn,,,155393.96,155096.88,62572.80,qnn-npu,155096.88,59.66,qnn-npu,cpu,cpu,qnn-npu,small-scale prefill
+stage_upper_bound,decode,p16+n16/c512,llama-stage-profiler,cpu_vs_qnn,,,1349066.67,1697994.85,1335705.60,cpu,1349066.67,0.99,qnn-npu,cpu,cpu,cpu,decode small-scale
+stage_upper_bound,prefill,pp128/c2048,llama-stage-profiler,cpu_vs_qnn,,,622456.30,534287.29,527766.00,qnn-npu,534287.29,1.22,cpu,cpu,qnn-npu,cpu,matched-scale prefill
+actual_end_to_end,prefill,pp128/c2048,llama-bench,cpu_static,660270.30,193.86,,,,,,,,,,static baseline
+actual_end_to_end,prefill,pp128/c2048,llama-bench,qnn_static,636277.78,201.17,,,,,,,,,,static baseline
+actual_end_to_end,prefill,pp128/c2048,llama-bench,gpu_static,98789.82,1295.68,,,,,,,,,,static baseline; no stage-profiler column
+actual_end_to_end,prefill,pp128/c2048,llama-bench+AOT,fullgraph_aot_profiled,48894.53,2617.88,,,,,,,,,,different runtime family
+actual_end_to_end,prefill,pp128/c2048,llama-bench+AOT,split_aot_profiled,82156.61,1558.00,,,,,,,,,,different runtime family; staged split
