@@ -2920,7 +2920,6 @@ llm_graph_cb llama_context::graph_get_cb() const {
         }
         static bool warned_hetero_attn_kv_boundary = false;
         static bool logged_hetero_attn_kv_contract = false;
-        static bool warned_qnn_attn_core_kv_dtype = false;
         if (hetero_plan.attn_kv.stage_boundary_active() && !logged_hetero_attn_kv_contract) {
             LLAMA_LOG_INFO("%s: attn KV contract layout=%s transfer=%s zero_copy=%s available=%s reason=%s\n",
                     __func__,
@@ -2943,18 +2942,10 @@ llm_graph_cb llama_context::graph_get_cb() const {
                     hetero_kv_contract_allocated.reason.empty() ? "<none>" : hetero_kv_contract_allocated.reason.c_str());
             warned_hetero_attn_kv_boundary = true;
         }
-        if (hetero_attn_core_backend == qnn_aot_backend &&
-            (kv_type_k != GGML_TYPE_F32 || kv_type_v != GGML_TYPE_F32) &&
-            !warned_qnn_attn_core_kv_dtype) {
-            LLAMA_LOG_WARN("%s: QNN AoT attn_core currently uses the experimental shared-KV contract with F32 cache inputs. The current context was built with type_k=%s type_v=%s, so attn_core=qnn-npu will not be a valid zero-copy KV route. Rebuild the context with F32 KV cache types for the attn_core experiment.\n",
-                    __func__,
-                    ggml_type_name(kv_type_k),
-                    ggml_type_name(kv_type_v));
-            warned_qnn_attn_core_kv_dtype = true;
-        }
     }
 
-    return [&, qnn_aot_enabled, qnn_aot_backend, hetero_stage_enabled,
+    return [&, qnn_aot_enabled, qnn_aot_backend, qnn_gpu_backend, qnn_cpu_backend,
+            hetero_stage_enabled, hetero_route_uses_opencl,
             hetero_attn_proj_backend, hetero_attn_core_backend, hetero_attn_out_backend,
             hetero_ffn_backend, hetero_output_backend](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
         if (il >= 0) {
@@ -3051,7 +3042,10 @@ llm_graph_cb llama_context::graph_get_cb() const {
             il >= 0 &&
             static_cast<uint32_t>(il + 1) == model.hparams.n_layer &&
             attn_stage &&
-            hetero_ffn_backend == backend_cpu &&
+            hetero_ffn_backend != nullptr &&
+            hetero_ffn_backend != qnn_aot_backend &&
+            hetero_ffn_backend != qnn_cpu_backend &&
+            hetero_ffn_backend != qnn_gpu_backend &&
             ((hetero_attn_proj_backend != nullptr && hetero_attn_proj_backend == qnn_aot_backend) ||
              (hetero_attn_core_backend != nullptr && hetero_attn_core_backend == qnn_aot_backend) ||
              (hetero_attn_out_backend  != nullptr && hetero_attn_out_backend  == qnn_aot_backend));
@@ -3144,8 +3138,9 @@ llm_graph_cb llama_context::graph_get_cb() const {
             }
 
             // The final decode layer inserts output-tail GET_ROWS nodes that are not covered by
-            // the current attn_core AoT binaries. Keep this mixed QNN->CPU boundary on plain CPU
-            // so it does not fragment into unmatched QNN residual splits.
+            // the current attn_core AoT binaries. If the downstream FFN leaves qnn-npu, force the
+            // final attention stage onto plain CPU so the tail does not fragment into unmatched
+            // QNN residual splits before crossing into CPU/OpenCL.
             if (last_layer_attention_cpu_tail_fallback) {
                 set_tensor_backend(backend_cpu, true);
                 trace_tensor("hetero-last-layer-attn-cpu-tail-fallback", backend_cpu, true);
