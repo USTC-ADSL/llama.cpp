@@ -290,6 +290,10 @@ bool is_aot_trace_name(const char * name) {
         return false;
     }
 
+    if (std::strncmp(name, "ffn", 3) == 0 || std::strncmp(name, "l_out-", 6) == 0) {
+        return true;
+    }
+
     for (const char * prefix : {
              "norm-",
              "attn_norm-",
@@ -301,12 +305,6 @@ bool is_aot_trace_name(const char * name) {
              "Vcur-",
              "attn_out-",
              "ffn_inp-",
-             "ffn_norm-",
-             "ffn_gate-",
-             "ffn_up-",
-             "ffn_swiglu-",
-             "ffn_out-",
-             "l_out-",
              "cache_k_",
              "cache_v_",
          }) {
@@ -328,6 +326,10 @@ bool is_aot_transformer_stage_name(const char * name) {
         return false;
     }
 
+    if (std::strncmp(name, "ffn", 3) == 0 || std::strncmp(name, "l_out-", 6) == 0) {
+        return true;
+    }
+
     for (const char * prefix : {
              "norm-",
              "attn_norm-",
@@ -343,12 +345,6 @@ bool is_aot_transformer_stage_name(const char * name) {
              "kqv-",
              "kqv_out-",
              "ffn_inp-",
-             "ffn_norm-",
-             "ffn_gate-",
-             "ffn_up-",
-             "ffn_swiglu-",
-             "ffn_out-",
-             "l_out-",
              "cache_k_",
              "cache_v_",
          }) {

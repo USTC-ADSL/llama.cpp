@@ -1797,34 +1797,41 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->invalidate_reuse();
 
         auto * cpu_res = gf_res_reserve.get();
-        ggml_backend_buffer_type_t cpu_buft = ggml_backend_get_default_buffer_type(backend_cpu);
-        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-            if (backend_ptrs[i] == backend_cpu) {
-                cpu_buft = backend_buft[i];
-                break;
+        const bool correction_requires_preserving_offloaded_weights = model.n_gpu_layers() > 0;
+
+        if (correction_requires_preserving_offloaded_weights) {
+            LLAMA_LOG_INFO("%s: bootstrap correction keeps the steady-state scheduler because n_gpu_layers=%d leaves model weights pre-allocated on non-CPU backends\n",
+                    __func__, model.n_gpu_layers());
+        } else {
+            ggml_backend_buffer_type_t cpu_buft = ggml_backend_get_default_buffer_type(backend_cpu);
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                if (backend_ptrs[i] == backend_cpu) {
+                    cpu_buft = backend_buft[i];
+                    break;
+                }
             }
+
+            ggml_backend_t cpu_backend_ptrs[] = { backend_cpu };
+            ggml_backend_buffer_type_t cpu_backend_bufts[] = { cpu_buft };
+
+            aot_saved_sched = std::move(sched);
+            sched.reset(ggml_backend_sched_new(
+                    cpu_backend_ptrs,
+                    cpu_backend_bufts,
+                    1,
+                    cpu_res->get_max_nodes(),
+                    /* parallel = */ false,
+                    cparams.op_offload));
+
+            if (!sched) {
+                sched = std::move(aot_saved_sched);
+                LLAMA_LOG_ERROR("%s: failed to create CPU-only scheduler for AoT bootstrap correction\n", __func__);
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
+
+            aot_bootstrap_cpu_sched_active = true;
         }
-
-        ggml_backend_t cpu_backend_ptrs[] = { backend_cpu };
-        ggml_backend_buffer_type_t cpu_backend_bufts[] = { cpu_buft };
-
-        aot_saved_sched = std::move(sched);
-        sched.reset(ggml_backend_sched_new(
-                cpu_backend_ptrs,
-                cpu_backend_bufts,
-                1,
-                cpu_res->get_max_nodes(),
-                /* parallel = */ false,
-                cparams.op_offload));
-
-        if (!sched) {
-            sched = std::move(aot_saved_sched);
-            LLAMA_LOG_ERROR("%s: failed to create CPU-only scheduler for AoT bootstrap correction\n", __func__);
-            ret = GGML_STATUS_ALLOC_FAILED;
-            return nullptr;
-        }
-
-        aot_bootstrap_cpu_sched_active = true;
 
         const char * prev_qnn_disable = std::getenv("GGML_QNN_DISABLE_BACKEND");
         const bool had_prev_qnn_disable = prev_qnn_disable != nullptr;
@@ -1840,8 +1847,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         if (status != GGML_STATUS_SUCCESS) {
-            sched = std::move(aot_saved_sched);
-            aot_bootstrap_cpu_sched_active = false;
+            if (aot_bootstrap_cpu_sched_active) {
+                sched = std::move(aot_saved_sched);
+                aot_bootstrap_cpu_sched_active = false;
+            }
             LLAMA_LOG_ERROR("%s: failed to compute bootstrap CPU correction graph, status: %d\n", __func__, status);
             ret = status;
             return nullptr;
@@ -2987,12 +2996,6 @@ llm_graph_cb llama_context::graph_get_cb() const {
             }
         };
 
-        if (aot_force_cpu_graph) {
-            set_tensor_backend(backend_cpu, false);
-            trace_tensor("bootstrap-cpu", backend_cpu, true);
-            return;
-        }
-
         // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer;
@@ -3041,6 +3044,17 @@ llm_graph_cb llama_context::graph_get_cb() const {
         const bool attn_out_stage  = llama_hetero_is_attn_out_tensor_name(tensor_name);
         const bool attn_stage      = attn_proj_stage || attn_core_stage || attn_out_stage;
         const bool ffn_stage       = llama_hetero_is_ffn_tensor_name(tensor_name) || ffn_lineage_norm;
+        const bool last_layer_attention_cpu_tail_fallback =
+            qnn_aot_enabled &&
+            hetero_stage_enabled &&
+            backend_cpu != nullptr &&
+            il >= 0 &&
+            static_cast<uint32_t>(il + 1) == model.hparams.n_layer &&
+            attn_stage &&
+            hetero_ffn_backend == backend_cpu &&
+            ((hetero_attn_proj_backend != nullptr && hetero_attn_proj_backend == qnn_aot_backend) ||
+             (hetero_attn_core_backend != nullptr && hetero_attn_core_backend == qnn_aot_backend) ||
+             (hetero_attn_out_backend  != nullptr && hetero_attn_out_backend  == qnn_aot_backend));
 
         const bool aot_transformer_stage = attn_stage || ffn_stage;
         const bool aot_lm_head_stage = tensor_name != nullptr && (
@@ -3080,6 +3094,37 @@ llm_graph_cb llama_context::graph_get_cb() const {
             return nullptr;
         };
 
+        const auto stage_backend_is_qnn = [&](ggml_backend_t backend) {
+            return backend != nullptr &&
+                (backend == qnn_aot_backend ||
+                 backend == qnn_gpu_backend ||
+                 backend == qnn_cpu_backend);
+        };
+
+        const bool correction_force_candidate =
+            aot_transformer_stage ||
+            aot_lm_head_stage ||
+            (tensor_name != nullptr && (
+                std::strcmp(tensor_name, "inp_tokens") == 0 ||
+                std::strcmp(tensor_name, "embd") == 0));
+
+        if (aot_force_cpu_graph && backend_cpu != nullptr && correction_force_candidate) {
+            const ggml_backend_t stage_backend = resolve_stage_backend();
+            const bool keep_stage_backend_for_offloaded_weights =
+                model.n_gpu_layers() > 0 &&
+                stage_backend != nullptr &&
+                stage_backend != backend_cpu &&
+                !stage_backend_is_qnn(stage_backend);
+
+            if (!keep_stage_backend_for_offloaded_weights) {
+                set_tensor_backend(backend_cpu, false);
+                trace_tensor(stage_backend_is_qnn(stage_backend) ? "bootstrap-qnn-cpu" : "bootstrap-cpu",
+                             backend_cpu,
+                             true);
+                return;
+            }
+        }
+
         const bool hetero_force_cpu = tensor_name != nullptr && (
             std::strcmp(tensor_name, "inp_tokens") == 0 ||
             std::strcmp(tensor_name, "embd") == 0 ||
@@ -3095,6 +3140,15 @@ llm_graph_cb llama_context::graph_get_cb() const {
             if (qnn_force_cpu) {
                 set_tensor_backend(backend_cpu, explicit_hetero_stage);
                 trace_tensor("force-cpu", backend_cpu, true);
+                return;
+            }
+
+            // The final decode layer inserts output-tail GET_ROWS nodes that are not covered by
+            // the current attn_core AoT binaries. Keep this mixed QNN->CPU boundary on plain CPU
+            // so it does not fragment into unmatched QNN residual splits.
+            if (last_layer_attention_cpu_tail_fallback) {
+                set_tensor_backend(backend_cpu, true);
+                trace_tensor("hetero-last-layer-attn-cpu-tail-fallback", backend_cpu, true);
                 return;
             }
 

@@ -1552,7 +1552,7 @@ bool qnn_aot_runtime::initialize(const std::string & config_path, const std::str
         for (auto graph_config : graph_configs) {
             graph_config.n_hvx_threads = _config.n_hvx_threads;
 
-            const auto model_path = (std::filesystem::path(_model_dir) / graph_config.model_path).string();
+            const auto model_path = resolve_model_path(graph_config.model_path);
             auto context_it = _contexts.find(model_path);
             if (context_it == _contexts.end()) {
                 auto context = std::make_shared<qnn_aot_context>(_instance, model_path);
@@ -1614,7 +1614,7 @@ bool qnn_aot_runtime::initialize(const std::string & config_path, const std::str
                 continue;
             }
 
-            const auto model_path = (std::filesystem::path(_model_dir) / graph_config.model_path).string();
+            const auto model_path = resolve_model_path(graph_config.model_path);
             auto context_it = _contexts.find(model_path);
             if (context_it == _contexts.end()) {
                 auto context = std::make_shared<qnn_aot_context>(_instance, model_path);
@@ -1791,9 +1791,10 @@ bool qnn_aot_runtime::is_ffn_stage_name(const char * name) {
         return false;
     }
 
-    return has_prefix(name, "ffn_inp-") || has_prefix(name, "ffn_norm-") || has_prefix(name, "ffn_gate-") ||
-           has_prefix(name, "ffn_up-") || has_prefix(name, "ffn_swiglu-") || has_prefix(name, "ffn_out-") ||
-           has_prefix(name, "l_out-");
+    // Qwen3 FFN inserts extra scale / activation nodes such as ffn_up_s, ffn_gate_s,
+    // ffn_down_s, ffn_silu, and ffn_gate_par. Treat the whole "ffn*" family as a
+    // single stage so the scheduler and matcher do not fragment the FFN route.
+    return has_prefix(name, "ffn") || has_prefix(name, "l_out-");
 }
 
 bool qnn_aot_runtime::is_transformer_stage_name(const char * name) {
@@ -2180,13 +2181,9 @@ qnn_aot_runtime::aot_match_result qnn_aot_runtime::match_attn_core_graph(ggml_cg
     const bool trace_match = aot_trace_match_enabled();
 
     auto is_ffn_compute_stage_name = [&](const char * name) {
-        return name != nullptr && (
-            has_prefix(name, "ffn_norm-") ||
-            has_prefix(name, "ffn_gate-") ||
-            has_prefix(name, "ffn_up-") ||
-            has_prefix(name, "ffn_swiglu-") ||
-            has_prefix(name, "ffn_out-") ||
-            has_prefix(name, "l_out-"));
+        return name != nullptr &&
+               !has_prefix(name, "ffn_inp-") &&
+               (has_prefix(name, "ffn") || has_prefix(name, "l_out-"));
     };
 
     auto is_residual_input = [this](const ggml_tensor * tensor) {
@@ -2477,12 +2474,7 @@ qnn_aot_runtime::aot_match_result qnn_aot_runtime::match_ffn_graph(ggml_cgraph *
         if (parsed_layer_id != std::numeric_limits<size_t>::max() &&
             name != nullptr &&
             (has_prefix(name, "norm-") ||
-             has_prefix(name, "ffn_inp-") ||
-             has_prefix(name, "ffn_norm-") ||
-             has_prefix(name, "ffn_gate-") ||
-             has_prefix(name, "ffn_up-") ||
-             has_prefix(name, "ffn_swiglu-") ||
-             has_prefix(name, "ffn_out-") ||
+             has_prefix(name, "ffn") ||
              has_prefix(name, "l_out-"))) {
             min_ffn_layer_id = std::min(min_ffn_layer_id, parsed_layer_id);
             max_ffn_layer_id = std::max(max_ffn_layer_id, parsed_layer_id);
@@ -2604,6 +2596,16 @@ qnn_aot_runtime::aot_match_result qnn_aot_runtime::match_ffn_graph(ggml_cgraph *
                      ggml_get_name(result.embd) ? ggml_get_name(result.embd) : "<unnamed>",
                      ggml_get_name(result.out) ? ggml_get_name(result.out) : "<unnamed>",
                      result.layer_id,
+                     append_tensor_names(io.inputs).c_str(),
+                     append_tensor_names(io.outputs).c_str());
+    } else if (trace_match) {
+        std::fprintf(stderr,
+                     "[aot-match] ffn accept: embd=%s out=%s layer=%zu tokens=%zu n_nodes=%d inputs=[%s] outputs=[%s]\n",
+                     ggml_get_name(result.embd) ? ggml_get_name(result.embd) : "<unnamed>",
+                     ggml_get_name(result.out) ? ggml_get_name(result.out) : "<unnamed>",
+                     result.layer_id,
+                     result.n_tokens,
+                     cgraph->n_nodes,
                      append_tensor_names(io.inputs).c_str(),
                      append_tensor_names(io.outputs).c_str());
     }
@@ -2793,7 +2795,7 @@ qnn_aot_graph * qnn_aot_runtime::ensure_graph_loaded(const qnn_aot_graph_config 
     qnn_aot_graph_config runtime_config = graph_config;
     runtime_config.n_hvx_threads        = _config.n_hvx_threads;
 
-    const auto model_path = (std::filesystem::path(_model_dir) / runtime_config.model_path).string();
+    const auto model_path = resolve_model_path(runtime_config.model_path);
     auto context_it = _contexts.find(model_path);
     if (context_it == _contexts.end()) {
         auto context = std::make_shared<qnn_aot_context>(_instance, model_path);
@@ -3028,12 +3030,40 @@ void qnn_aot_runtime::save_kv(qnn_aot_graph & graph, size_t n_tokens) {
     }
 }
 
+std::string qnn_aot_runtime::resolve_model_path(const std::string & relative_path) const {
+    std::filesystem::path rel_path(relative_path);
+    if (rel_path.is_absolute()) {
+        return rel_path.string();
+    }
+
+    std::filesystem::path base_dir(_model_dir);
+    std::filesystem::path candidate = base_dir / rel_path;
+    if (std::filesystem::exists(candidate)) {
+        return candidate.string();
+    }
+
+    for (std::filesystem::path parent = base_dir.parent_path();
+         !parent.empty() && parent != parent.parent_path();
+         parent = parent.parent_path()) {
+        const std::filesystem::path alt = parent / rel_path;
+        if (std::filesystem::exists(alt)) {
+            QNN_LOG_WARN("[aot] resolve model path via parent search: base=%s rel=%s resolved=%s\n",
+                         _model_dir.c_str(),
+                         relative_path.c_str(),
+                         alt.string().c_str());
+            return alt.string();
+        }
+    }
+
+    return candidate.string();
+}
+
 std::string qnn_aot_runtime::format_kv_path(const qnn_aot_graph_config & config, size_t layer_id, const char * kv_type, size_t head_id) const {
     std::string relative = config.kv_path_format;
     replace_all(relative, "{layer_id}", std::to_string(layer_id));
     replace_all(relative, "{kv_type}", kv_type ? kv_type : "");
     replace_all(relative, "{head_id}", std::to_string(head_id));
-    return (std::filesystem::path(_model_dir) / relative).string();
+    return resolve_model_path(relative);
 }
 
 bool qnn_aot_runtime::load_seed_kv() {
@@ -3990,6 +4020,48 @@ bool qnn_aot_runtime::execute_attn_core(ggml_cgraph * cgraph, const aot_match_re
 bool qnn_aot_runtime::execute_ffn(ggml_cgraph * cgraph, const aot_match_result & match) {
     GGML_UNUSED(cgraph);
     auto * graph = select_ffn_graph(match.n_tokens, match.layer_id);
+    auto describe_tensor = [](const ggml_tensor * tensor) {
+        if (tensor == nullptr) {
+            return std::string("<null>");
+        }
+
+        const char * tensor_name = ggml_get_name(tensor);
+        const char * buffer_name = tensor->buffer ? ggml_backend_buffer_name(tensor->buffer) : nullptr;
+        char dims[128];
+        std::snprintf(dims, sizeof(dims), "[%lld,%lld,%lld,%lld]",
+                      (long long) tensor->ne[0],
+                      (long long) tensor->ne[1],
+                      (long long) tensor->ne[2],
+                      (long long) tensor->ne[3]);
+        char strides[128];
+        std::snprintf(strides, sizeof(strides), "[%zu,%zu,%zu,%zu]",
+                      tensor->nb[0],
+                      tensor->nb[1],
+                      tensor->nb[2],
+                      tensor->nb[3]);
+        char data_ptr[32];
+        std::snprintf(data_ptr, sizeof(data_ptr), "%p", tensor->data);
+
+        return std::string(tensor_name != nullptr ? tensor_name : "<unnamed>") +
+               " type=" + ggml_type_name(tensor->type) +
+               " dims=" + dims +
+               " nb=" + strides +
+               " bytes=" + std::to_string(ggml_nbytes(tensor)) +
+               " data=" + data_ptr +
+               " buffer=" + (buffer_name != nullptr ? buffer_name : "<none>") +
+               " contiguous=" + std::to_string(ggml_is_contiguous(tensor) ? 1 : 0) +
+               " row_packed=" + std::to_string(tensor_rows_are_packed_f32(tensor, tensor->ne[0]) ? 1 : 0);
+    };
+
+    if (aot_trace_match_enabled()) {
+        QNN_LOG_INFO("[aot] execute_ffn enter: layer=%zu tokens=%zu graph=%s embd={%s} out={%s}\n",
+                     match.layer_id,
+                     match.n_tokens,
+                     graph ? graph->config().graph_name.c_str() : "<null>",
+                     describe_tensor(match.embd).c_str(),
+                     describe_tensor(match.out).c_str());
+    }
+
     if (!graph || !match.embd || !match.out) {
         QNN_LOG_WARN("[aot] missing ffn graph/io for layer=%zu tokens=%zu graph=%s embd=%s out=%s\n",
                      match.layer_id,
@@ -4029,11 +4101,30 @@ bool qnn_aot_runtime::execute_ffn(ggml_cgraph * cgraph, const aot_match_result &
         ggml_nbytes(match.embd) == graph->buffer_size(graph->config().x_name) &&
         ggml_nbytes(match.out) == graph->buffer_size(graph->config().out_name);
 
+    if (aot_trace_match_enabled()) {
+        QNN_LOG_INFO("[aot] ffn layer=%zu graph=%s direct_bind_candidate=%d graph_batch=%zu x_bytes=%zu/%zu out_bytes=%zu/%zu\n",
+                     match.layer_id,
+                     graph->config().graph_name.c_str(),
+                     can_direct_bind_io ? 1 : 0,
+                     graph->batch_size(),
+                     ggml_nbytes(match.embd),
+                     graph->buffer_size(graph->config().x_name),
+                     ggml_nbytes(match.out),
+                     graph->buffer_size(graph->config().out_name));
+    }
+
     if (can_direct_bind_io) {
         const bool bound_x =
             graph->bind_external_tensor(graph->config().x_name, match.embd);
         const bool bound_out =
             bound_x && graph->bind_external_tensor(graph->config().out_name, match.out);
+        if (aot_trace_match_enabled()) {
+            QNN_LOG_INFO("[aot] ffn layer=%zu graph=%s direct_bind_result x=%d out=%d\n",
+                         match.layer_id,
+                         graph->config().graph_name.c_str(),
+                         bound_x ? 1 : 0,
+                         bound_out ? 1 : 0);
+        }
         if (bound_x && bound_out) {
             if (aot_trace_bind_enabled()) {
                 QNN_LOG_INFO("[aot] ffn layer=%zu graph=%s direct-bind x=%s out=%s tokens=%zu\n",
@@ -4053,6 +4144,13 @@ bool qnn_aot_runtime::execute_ffn(ggml_cgraph * cgraph, const aot_match_result &
         }
 
         graph->clear_external_tensor_bindings();
+        if (aot_trace_match_enabled()) {
+            QNN_LOG_WARN("[aot] ffn direct bind rejected: layer=%zu graph=%s x={%s} out={%s}\n",
+                         match.layer_id,
+                         graph->config().graph_name.c_str(),
+                         describe_tensor(match.embd).c_str(),
+                         describe_tensor(match.out).c_str());
+        }
     }
 
     auto * x_buffer   = static_cast<float *>(graph->buffer_data(graph->config().x_name));
@@ -4065,6 +4163,15 @@ bool qnn_aot_runtime::execute_ffn(ggml_cgraph * cgraph, const aot_match_result &
     size_t offset = 0;
     while (offset < match.n_tokens) {
         const size_t step = std::min(match.n_tokens - offset, graph->batch_size());
+
+        if (aot_trace_match_enabled()) {
+            QNN_LOG_INFO("[aot] ffn copy-exec: layer=%zu graph=%s offset=%zu step=%zu batch=%zu\n",
+                         match.layer_id,
+                         graph->config().graph_name.c_str(),
+                         offset,
+                         step,
+                         graph->batch_size());
+        }
 
         if (step < graph->batch_size()) {
             std::memset(x_buffer, 0, graph->buffer_size(graph->config().x_name));
@@ -4171,7 +4278,26 @@ bool qnn_aot_runtime::execute_fragment_view(ggml_cgraph * cgraph, int i0, int i1
 
     const auto ffn_match = match_ffn_graph(&view);
     if (ffn_match.is_ffn) {
-        return execute_ffn(&view, ffn_match);
+        if (aot_trace_match_enabled()) {
+            const char * first_name = view.n_nodes > 0 ? ggml_get_name(view.nodes[0]) : nullptr;
+            const char * last_name  = view.n_nodes > 0 ? ggml_get_name(view.nodes[view.n_nodes - 1]) : nullptr;
+            QNN_LOG_INFO("[aot] fragment execute ffn: nodes=[%d,%d) first=%s last=%s layer=%zu tokens=%zu\n",
+                         i0,
+                         i1,
+                         first_name ? first_name : "<null>",
+                         last_name ? last_name : "<null>",
+                         ffn_match.layer_id,
+                         ffn_match.n_tokens);
+        }
+        const bool ok = execute_ffn(&view, ffn_match);
+        if (aot_trace_match_enabled()) {
+            QNN_LOG_INFO("[aot] fragment execute ffn result: nodes=[%d,%d) layer=%zu ok=%d\n",
+                         i0,
+                         i1,
+                         ffn_match.layer_id,
+                         ok ? 1 : 0);
+        }
+        return ok;
     }
 
     const auto lm_head_match = match_lm_head_graph(&view);
@@ -4486,7 +4612,23 @@ bool qnn_aot_runtime::maybe_execute(ggml_cgraph * cgraph) {
     }
 
     if (ffn_match.is_ffn) {
-        return execute_ffn(cgraph, ffn_match);
+        if (aot_trace_match_enabled()) {
+            const char * first_name = cgraph->n_nodes > 0 ? ggml_get_name(cgraph->nodes[0]) : nullptr;
+            const char * last_name  = cgraph->n_nodes > 0 ? ggml_get_name(cgraph->nodes[cgraph->n_nodes - 1]) : nullptr;
+            QNN_LOG_INFO("[aot] maybe_execute ffn: n_nodes=%d first=%s last=%s layer=%zu tokens=%zu\n",
+                         cgraph->n_nodes,
+                         first_name ? first_name : "<null>",
+                         last_name ? last_name : "<null>",
+                         ffn_match.layer_id,
+                         ffn_match.n_tokens);
+        }
+        const bool ok = execute_ffn(cgraph, ffn_match);
+        if (aot_trace_match_enabled()) {
+            QNN_LOG_INFO("[aot] maybe_execute ffn result: layer=%zu ok=%d\n",
+                         ffn_match.layer_id,
+                         ok ? 1 : 0);
+        }
+        return ok;
     }
 
     if (lm_head_match.is_lm_head) {

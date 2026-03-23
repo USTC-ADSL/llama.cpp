@@ -365,8 +365,11 @@ private:
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 
-    // Force the next graph build onto CPU only. Used for the AoT bootstrap
-    // correction path after seeding QNN state with the initial token.
+    // Force the next graph build onto the non-QNN fallback path used by the
+    // AoT bootstrap correction after seeding the initial token. When all model
+    // weights remain on CPU this becomes a CPU-only correction graph; when
+    // weights are already pre-allocated on another backend, the correction
+    // keeps those backends alive and only reroutes QNN-owned stages.
     bool aot_force_cpu_graph = false;
     bool aot_bootstrap_cpu_sched_active = false;
 

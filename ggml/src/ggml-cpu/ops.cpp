@@ -4952,6 +4952,18 @@ void ggml_compute_forward_set_rows(
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
+    if (dst->data == nullptr || src0 == nullptr || src1 == nullptr || src0->data == nullptr || src1->data == nullptr) {
+        GGML_ABORT("SET_ROWS null buffer: dst=%s data=%p src0=%s op=%s data=%p src1=%s op=%s data=%p",
+                   ggml_get_name(dst) != nullptr ? ggml_get_name(dst) : "<unnamed>",
+                   dst ? dst->data : nullptr,
+                   src0 && ggml_get_name(src0) != nullptr ? ggml_get_name(src0) : "<unnamed>",
+                   src0 ? ggml_op_name(src0->op) : "<null>",
+                   src0 ? src0->data : nullptr,
+                   src1 && ggml_get_name(src1) != nullptr ? ggml_get_name(src1) : "<unnamed>",
+                   src1 ? ggml_op_name(src1->op) : "<null>",
+                   src1 ? src1->data : nullptr);
+    }
+
     switch (src0->type) {
         case GGML_TYPE_F32:
             {

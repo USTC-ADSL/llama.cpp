@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -185,6 +186,51 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    ggml_backend_buffer_type_t mixed_attn_shared_kv_buft = nullptr;
+    const auto env_flag_enabled = [](const char * name) {
+        const char * value = std::getenv(name);
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    };
+    const auto & hetero_route = model.get_hetero_plan().route;
+    const bool hetero_qnn_shared_host_requested =
+        env_flag_enabled("GGML_HETERO_QNN_SHARED_HOST") &&
+        llama_hetero_route_has_qnn_adjacent_boundary(hetero_route);
+    const bool attn_uses_opencl =
+        llama_hetero_is_opencl_backend(hetero_route.backend_for(llama_hetero_route_stage::ATTN_PROJ)) ||
+        llama_hetero_is_opencl_backend(hetero_route.backend_for(llama_hetero_route_stage::ATTN_CORE)) ||
+        llama_hetero_is_opencl_backend(hetero_route.backend_for(llama_hetero_route_stage::ATTN_OUT));
+
+    if (shared_kv_buft == nullptr &&
+        consumer_kv_buft == nullptr &&
+        !this->kv_contract.stage_boundary_active() &&
+        hetero_qnn_shared_host_requested &&
+        attn_uses_opencl) {
+        ggml_backend_dev_t opencl_dev = ggml_backend_dev_by_name("GPUOpenCL");
+        ggml_backend_buffer_type_t opencl_host_buft =
+            opencl_dev != nullptr ? ggml_backend_dev_host_buffer_type(opencl_dev) : nullptr;
+
+        ggml_backend_dev_t qnn_dev = ggml_backend_dev_by_name("qnn-npu");
+        ggml_backend_buffer_type_t qnn_host_buft =
+            qnn_dev != nullptr ? ggml_backend_dev_host_buffer_type(qnn_dev) : nullptr;
+
+        if (qnn_host_buft != nullptr &&
+            opencl_dev != nullptr &&
+            ggml_backend_dev_supports_buft(opencl_dev, qnn_host_buft)) {
+            mixed_attn_shared_kv_buft = qnn_host_buft;
+            LLAMA_LOG_INFO("%s: mixed OpenCL-attn/QNN route keeps legacy KV cache on %s so OpenCL SET_ROWS/GET_ROWS can alias the cache without CPU fallback copies\n",
+                    __func__,
+                    ggml_backend_buft_name(mixed_attn_shared_kv_buft));
+        } else if (opencl_host_buft != nullptr) {
+            mixed_attn_shared_kv_buft = opencl_host_buft;
+            LLAMA_LOG_WARN("%s: mixed OpenCL-attn/QNN route requested qnn shared-host KV placement, but qnn-npu-host is unavailable or not OpenCL-compatible; falling back to %s for the legacy KV cache\n",
+                    __func__,
+                    ggml_backend_buft_name(mixed_attn_shared_kv_buft));
+        } else {
+            LLAMA_LOG_WARN("%s: mixed OpenCL-attn/QNN route requested host-visible KV placement, but neither qnn-npu-host nor OpenCL host buffer types are available; keeping legacy KV placement\n",
+                    __func__);
+        }
+    }
+
     const bool is_mla = hparams.is_mla();
     bool logged_qnn_host_kv_placement = false;
     bool warned_qnn_host_kv_unavailable = false;
@@ -211,6 +257,9 @@ llama_kv_cache::llama_kv_cache(
         if (shared_kv_buft != nullptr) {
             buft = shared_kv_buft;
             dev_name = ggml_backend_buft_name(shared_kv_buft);
+        } else if (mixed_attn_shared_kv_buft != nullptr) {
+            buft = mixed_attn_shared_kv_buft;
+            dev_name = ggml_backend_buft_name(mixed_attn_shared_kv_buft);
         } else if (consumer_kv_buft != nullptr) {
             buft = consumer_kv_buft;
             dev_name = consumer_kv_dev_name != nullptr ? consumer_kv_dev_name : ggml_backend_buft_name(consumer_kv_buft);

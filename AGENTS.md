@@ -4,17 +4,17 @@
 # 当前研究主线（Story Anchor）
 本项目当前的核心叙事不是“已经实现一个总能耗大幅优于所有静态方案的系统”，而是：
 
-1. 系统性证明端侧 LLM Decode 阶段存在显著的阶段异构性（stage heterogeneity）。
-2. 系统性证明端侧 LLM Decode 在不同硬件后端和工作点下存在可利用的功率可调空间（power-tunable space）。
+1. 系统性证明端侧 LLM Prefill/Decode 阶段存在显著的阶段异构性（stage heterogeneity）。
+2. 系统性证明端侧 LLM Prefill/Decode 在不同硬件后端和工作点下存在可利用的功率可调空间（power-tunable space）。
 3. 基于上述观察，构建一个满足 SLO 的阶段级功率感知调度框架。
 4. 量化揭示 runtime overhead（后端切换、数据搬移、同步、KV Cache 管理等）是释放更大系统收益的关键瓶颈。
 
 后续所有代码设计、实验分析、文档撰写和结果解释，应优先服务于这条主线。
 
 # 项目目标
-本项目面向高通骁龙平台，基于 `llama.cpp` 构建一个面向端侧 LLM Decode 的阶段级异构调度研究原型。重点不是追求“所有场景都赢过所有静态方案”，而是：
+本项目面向高通骁龙平台，基于 `llama.cpp` 构建一个面向端侧 LLM Prefill/Decode 的阶段级异构调度研究原型。重点不是追求“所有场景都赢过所有静态方案”，而是：
 
-- 刻画不同 Decode 阶段在 CPU / GPU / NPU 上的性能、功率与能效差异；
+- 刻画不同 Prefill/Decode 阶段在 CPU / GPU / NPU 上的性能、功率与能效差异；
 - 建立轻量级 cost model，支持 SLO-aware 的阶段级调度决策；
 - 实现阶段级异构执行原型；
 - 定量分析 runtime overhead 对理想收益和实际收益之间差距的影响。

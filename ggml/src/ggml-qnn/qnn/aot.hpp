@@ -225,6 +225,7 @@ class qnn_aot_runtime {
     void fill_attention_bias(qnn_aot_graph & graph, size_t n_tokens);
     void save_kv(qnn_aot_graph & graph, size_t n_tokens);
     bool load_seed_kv();
+    std::string resolve_model_path(const std::string & relative_path) const;
 
     void zero_transformer_state();
     size_t infer_start_pos(const std::vector<ggml_tensor *> & inputs, size_t n_tokens) const;

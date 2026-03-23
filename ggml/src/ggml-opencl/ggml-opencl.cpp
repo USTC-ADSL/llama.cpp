@@ -6376,12 +6376,16 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
 }
 
 static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    ggml_tensor_extra_cl * extra0 = ggml_backend_opencl_ensure_tensor_extra_from_host_buffer(backend, const_cast<ggml_tensor *>(src0));
+    ggml_tensor_extra_cl * extra1 = ggml_backend_opencl_ensure_tensor_extra_from_host_buffer(backend, const_cast<ggml_tensor *>(src1));
+    ggml_tensor_extra_cl * extrad = ggml_backend_opencl_ensure_tensor_extra_from_host_buffer(backend, dst);
+
     GGML_ASSERT(src0);
-    GGML_ASSERT(src0->extra);
+    GGML_ASSERT(extra0);
     GGML_ASSERT(src1);
-    GGML_ASSERT(src1->extra);
+    GGML_ASSERT(extra1);
     GGML_ASSERT(dst);
-    GGML_ASSERT(dst->extra);
+    GGML_ASSERT(extrad);
     GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
 
     // ne0 = ne00
@@ -6412,10 +6416,6 @@ static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, c
     const int nblk0 = ne0/ggml_blck_size(dst->type);
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
-
-    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
-    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
-    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
 
     cl_ulong offset0 = extra0->offset + src0->view_offs;
     cl_ulong offset1 = extra1->offset + src1->view_offs;
