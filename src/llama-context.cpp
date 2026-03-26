@@ -974,6 +974,10 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
     }
 
     const std::string target_route = llama_hetero_format_route_spec(decision.plan.route);
+    const bool switching_into_qnn_decode =
+        n_tokens == 1 &&
+        !hetero_route_requests_qnn(hetero_plan.route) &&
+        hetero_route_requests_qnn(decision.plan.route);
     const bool should_flush_pending_qnn_kv =
         n_tokens == 1 &&
         hetero_route_requests_qnn(hetero_plan.route) &&
@@ -1018,6 +1022,10 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
     const int64_t t_apply_start_us = trace_timing ? ggml_time_us() : 0;
     const bool applied = apply_hetero_plan(std::move(decision.plan), /* update_base_plan = */ false, decision.plan_label.c_str());
     const int64_t t_apply_end_us = trace_timing ? ggml_time_us() : 0;
+
+    if (applied && switching_into_qnn_decode) {
+        aot_skip_bootstrap_for_next_decode = true;
+    }
 
     if (trace_timing && hetero_phase_trace.active) {
         hetero_phase_trace.route_applied = applied;
@@ -1970,6 +1978,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const bool aot_single_token_pos0 =
         std::getenv("GGML_QNN_AOT_CONFIG") != nullptr &&
         aot_active_route_requests_qnn &&
+        !aot_skip_bootstrap_for_next_decode &&
         ubatch.n_tokens == 1 &&
         ubatch.n_pos > 0 &&
         ubatch.pos != nullptr &&
@@ -1977,6 +1986,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     auto * res = gf_res_prev.get();
     auto status = run_graph_once(res, /* allow_reuse = */ true, /* force_cpu_graph = */ false);
+    if (ubatch.n_tokens == 1) {
+        aot_skip_bootstrap_for_next_decode = false;
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;

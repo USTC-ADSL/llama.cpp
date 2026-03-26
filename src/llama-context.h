@@ -374,6 +374,7 @@ private:
     bool aot_force_cpu_graph = false;
     bool aot_bootstrap_cpu_sched_active = false;
     bool aot_active_route_requests_qnn = false;
+    bool aot_skip_bootstrap_for_next_decode = false;
 
     llama_hetero_execution_plan hetero_plan;
     llama_hetero_execution_plan hetero_plan_base;
