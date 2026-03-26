@@ -3787,6 +3787,129 @@ void qnn_aot_runtime::save_kv(qnn_aot_graph & graph, size_t n_tokens) {
     }
 }
 
+bool qnn_aot_runtime::import_generic_kv_prefix_to_graph(qnn_aot_graph & graph,
+                                                        const aot_match_result & match,
+                                                        size_t n_tokens) {
+    if (n_tokens == 0) {
+        return true;
+    }
+
+    const auto & graph_config = graph.config();
+    if (graph_config.cache_size == 0 || n_tokens > graph_config.cache_size) {
+        QNN_LOG_WARN("[aot] import_generic_kv_prefix_to_graph invalid token count=%zu cache_size=%zu graph=%s\n",
+                     n_tokens, graph_config.cache_size, graph_config.graph_name.c_str());
+        return false;
+    }
+
+    std::vector<int64_t> slots(n_tokens);
+    for (size_t i = 0; i < n_tokens; ++i) {
+        slots[i] = static_cast<int64_t>(i);
+    }
+
+    for (size_t layer = graph_config.start_layer_id; layer < graph_config.end_layer_id; ++layer) {
+        auto cache_k_it = match.cache_k_layers.find(layer);
+        auto cache_v_it = match.cache_v_layers.find(layer);
+        if (cache_k_it == match.cache_k_layers.end() || cache_v_it == match.cache_v_layers.end()) {
+            QNN_LOG_WARN("[aot] import_generic_kv_prefix_to_graph missing generic cache tensors at layer=%zu graph=%s\n",
+                         layer, graph_config.graph_name.c_str());
+            return false;
+        }
+
+        const ggml_tensor * generic_k = cache_k_it->second;
+        const ggml_tensor * generic_v = cache_v_it->second;
+        if (generic_k == nullptr || generic_v == nullptr) {
+            QNN_LOG_WARN("[aot] import_generic_kv_prefix_to_graph null generic cache tensors at layer=%zu graph=%s\n",
+                         layer, graph_config.graph_name.c_str());
+            return false;
+        }
+
+        const size_t generic_k_values = static_cast<size_t>(generic_k->ne[0]);
+        const size_t generic_v_values = static_cast<size_t>(generic_v->ne[0]);
+        if (generic_k_values == 0 || generic_v_values == 0 ||
+            generic_k_values % _config.model.n_kv_heads != 0 ||
+            generic_v_values % _config.model.n_kv_heads != 0) {
+            QNN_LOG_WARN("[aot] import_generic_kv_prefix_to_graph invalid generic row widths at layer=%zu graph=%s key_values=%zu value_values=%zu n_kv_heads=%zu\n",
+                         layer, graph_config.graph_name.c_str(), generic_k_values, generic_v_values, _config.model.n_kv_heads);
+            return false;
+        }
+
+        const size_t key_head_values = generic_k_values / _config.model.n_kv_heads;
+        const size_t value_head_values = generic_v_values / _config.model.n_kv_heads;
+
+        for (size_t head = 0; head < _config.model.n_kv_heads; ++head) {
+            const auto key_cache_name   = std::string("layer_") + std::to_string(layer) + "_key_t_cache_" + std::to_string(head);
+            const auto value_cache_name = std::string("layer_") + std::to_string(layer) + "_value_cache_" + std::to_string(head);
+
+            auto * key_cache   = static_cast<char *>(graph.buffer_data(key_cache_name));
+            auto * value_cache = static_cast<char *>(graph.buffer_data(value_cache_name));
+            if (key_cache == nullptr || value_cache == nullptr) {
+                QNN_LOG_WARN("[aot] import_generic_kv_prefix_to_graph missing private cache buffers at layer=%zu head=%zu graph=%s\n",
+                             layer, head, graph_config.graph_name.c_str());
+                return false;
+            }
+
+            const auto key_dtype = graph.tensor_data_type(key_cache_name);
+            const auto value_dtype = graph.tensor_data_type(value_cache_name);
+            const size_t key_elem_size =
+                qnn::qnn_datatype_size(key_dtype == QNN_DATATYPE_UNDEFINED ? QNN_DATATYPE_FLOAT_16 : key_dtype);
+            const size_t value_elem_size =
+                qnn::qnn_datatype_size(value_dtype == QNN_DATATYPE_UNDEFINED ? QNN_DATATYPE_FLOAT_16 : value_dtype);
+            if ((key_elem_size != sizeof(float) && key_elem_size != sizeof(ggml_fp16_t)) ||
+                (value_elem_size != sizeof(float) && value_elem_size != sizeof(ggml_fp16_t))) {
+                QNN_LOG_WARN("[aot] import_generic_kv_prefix_to_graph unsupported private cache dtype at layer=%zu head=%zu key=%s value=%s graph=%s\n",
+                             layer, head,
+                             qnn::qnn_datatype_to_string(key_dtype),
+                             qnn::qnn_datatype_to_string(value_dtype),
+                             graph_config.graph_name.c_str());
+                return false;
+            }
+
+            const size_t key_cache_stride = graph_config.cache_size * key_elem_size;
+            const size_t value_row_bytes = value_head_values * value_elem_size;
+            std::vector<uint8_t> key_rows(n_tokens * generic_k_values * key_elem_size);
+            std::vector<uint8_t> value_rows(n_tokens * generic_v_values * value_elem_size);
+
+            if (!copy_token_rows_from_cache(generic_k,
+                                            slots,
+                                            key_rows.data(),
+                                            key_rows.size(),
+                                            key_dtype) ||
+                !copy_token_rows_from_cache(generic_v,
+                                            slots,
+                                            value_rows.data(),
+                                            value_rows.size(),
+                                            value_dtype)) {
+                QNN_LOG_WARN("[aot] import_generic_kv_prefix_to_graph failed to read generic cache rows at layer=%zu head=%zu graph=%s\n",
+                             layer, head, graph_config.graph_name.c_str());
+                return false;
+            }
+
+            for (size_t token = 0; token < n_tokens; ++token) {
+                const char * key_row = reinterpret_cast<const char *>(key_rows.data()) + token * generic_k_values * key_elem_size;
+                const char * value_row = reinterpret_cast<const char *>(value_rows.data()) + token * generic_v_values * value_elem_size;
+                copy_contiguous_to_strided(key_cache + token * key_elem_size,
+                                           key_cache_stride,
+                                           key_row + head * key_head_values * key_elem_size,
+                                           key_head_values,
+                                           key_elem_size);
+                std::memcpy(value_cache + token * value_row_bytes,
+                            value_row + head * value_head_values * value_elem_size,
+                            value_row_bytes);
+            }
+        }
+    }
+
+    if (aot_trace_bind_enabled()) {
+        QNN_LOG_INFO("[aot] imported generic KV prefix into private QNN cache: graph=%s tokens=%zu layers=[%zu,%zu)\n",
+                     graph_config.graph_name.c_str(),
+                     n_tokens,
+                     graph_config.start_layer_id,
+                     graph_config.end_layer_id);
+    }
+
+    return true;
+}
+
 bool qnn_aot_runtime::should_write_generic_kv(const aot_match_result & match) const {
     return aot_generic_kv_writeback_needed_for_phase_switch() &&
            match.n_tokens > 1 &&
@@ -4335,6 +4458,29 @@ bool qnn_aot_runtime::execute_attention(ggml_cgraph * cgraph, const aot_match_re
         reset_state();
     }
 
+    size_t generic_prefix_tokens = match.inferred_pos;
+    if (_kv_position == 0 && generic_prefix_tokens == 0 && match.kq_mask != nullptr && match.n_tokens == 1) {
+        std::vector<int64_t> inferred_slots;
+        if (infer_current_token_slots_from_kq_mask(match.kq_mask,
+                                                   match.n_tokens,
+                                                   _config.model.attention_mask_value,
+                                                   inferred_slots) &&
+            !inferred_slots.empty() &&
+            inferred_slots[0] > 0) {
+            generic_prefix_tokens = static_cast<size_t>(inferred_slots[0]);
+        }
+    }
+
+    if (_kv_position == 0 && generic_prefix_tokens > 0) {
+        if (!import_generic_kv_prefix_to_graph(*graph, match, generic_prefix_tokens)) {
+            QNN_LOG_WARN("[aot] attention failed to import generic KV prefix for graph=%s inferred_pos=%zu\n",
+                         graph->config().graph_name.c_str(),
+                         generic_prefix_tokens);
+            return false;
+        }
+        _kv_position = generic_prefix_tokens;
+    }
+
     if (match.embd->type != GGML_TYPE_F32 || match.out->type != GGML_TYPE_F32) {
         QNN_LOG_WARN("[aot] attention IO expects F32 tensors, got %s -> %s\n",
                      ggml_type_name(match.embd->type),
@@ -4408,6 +4554,29 @@ bool qnn_aot_runtime::execute_transformer(ggml_cgraph * cgraph, const aot_match_
     if ((match.inferred_pos == 0 && _kv_position != 0) ||
         (_kv_position + match.n_tokens > graph->config().cache_size && match.inferred_pos == 0)) {
         reset_state();
+    }
+
+    size_t generic_prefix_tokens = match.inferred_pos;
+    if (_kv_position == 0 && generic_prefix_tokens == 0 && match.kq_mask != nullptr && match.n_tokens == 1) {
+        std::vector<int64_t> inferred_slots;
+        if (infer_current_token_slots_from_kq_mask(match.kq_mask,
+                                                   match.n_tokens,
+                                                   _config.model.attention_mask_value,
+                                                   inferred_slots) &&
+            !inferred_slots.empty() &&
+            inferred_slots[0] > 0) {
+            generic_prefix_tokens = static_cast<size_t>(inferred_slots[0]);
+        }
+    }
+
+    if (_kv_position == 0 && generic_prefix_tokens > 0) {
+        if (!import_generic_kv_prefix_to_graph(*graph, match, generic_prefix_tokens)) {
+            QNN_LOG_WARN("[aot] transformer failed to import generic KV prefix for graph=%s inferred_pos=%zu\n",
+                         graph->config().graph_name.c_str(),
+                         generic_prefix_tokens);
+            return false;
+        }
+        _kv_position = generic_prefix_tokens;
     }
 
     if (match.embd->type != GGML_TYPE_F32 || match.out->type != GGML_TYPE_F32) {

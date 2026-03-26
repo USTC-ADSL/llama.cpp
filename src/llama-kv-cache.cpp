@@ -153,6 +153,8 @@ llama_kv_cache::llama_kv_cache(
 
     ggml_backend_buffer_type_t consumer_kv_buft = nullptr;
     const char * consumer_kv_dev_name = nullptr;
+    ggml_backend_buffer_type_t producer_kv_buft = nullptr;
+    const char * producer_kv_dev_name = nullptr;
     if (shared_kv_buft == nullptr && this->kv_contract.stage_boundary_active()) {
         const std::string consumer_backend = llama_hetero_canonical_backend(this->kv_contract.consumer_backend);
         if (consumer_backend == "cpu") {
@@ -213,11 +215,25 @@ llama_kv_cache::llama_kv_cache(
                llama_hetero_is_opencl_backend(route.backend_for(llama_hetero_route_stage::ATTN_CORE)) ||
                llama_hetero_is_opencl_backend(route.backend_for(llama_hetero_route_stage::ATTN_OUT));
     };
+    const auto route_attn_consumer_backend = [](const llama_hetero_route_spec & route) {
+        return llama_hetero_canonical_backend(route.backend_for(llama_hetero_route_stage::ATTN_CORE));
+    };
     const auto & hetero_route = model.get_hetero_plan().route;
     const llama_hetero_route_spec dynamic_prefill_route =
         llama_hetero_parse_route_spec(std::getenv("GGML_HETERO_DYNAMIC_PREFILL_ROUTE"));
     const llama_hetero_route_spec dynamic_decode_route =
         llama_hetero_parse_route_spec(std::getenv("GGML_HETERO_DYNAMIC_DECODE_ROUTE"));
+    const std::string dynamic_prefill_consumer_backend = route_attn_consumer_backend(dynamic_prefill_route);
+    const std::string dynamic_decode_consumer_backend  = route_attn_consumer_backend(dynamic_decode_route);
+    const bool dynamic_phase_switch_active =
+        dynamic_prefill_route.has_any_route() &&
+        dynamic_decode_route.has_any_route() &&
+        !dynamic_prefill_consumer_backend.empty() &&
+        !dynamic_decode_consumer_backend.empty() &&
+        dynamic_prefill_consumer_backend != dynamic_decode_consumer_backend;
+    const bool dynamic_phase_cpu_opencl_switch =
+        ((dynamic_prefill_consumer_backend == "cpu" && dynamic_decode_consumer_backend == "opencl") ||
+         (dynamic_prefill_consumer_backend == "opencl" && dynamic_decode_consumer_backend == "cpu"));
     const bool dynamic_phase_qnn_opencl_switch =
         (route_requests_qnn(dynamic_prefill_route) && route_attn_uses_opencl(dynamic_decode_route)) ||
         (route_attn_uses_opencl(dynamic_prefill_route) && route_requests_qnn(dynamic_decode_route));
@@ -228,6 +244,81 @@ llama_kv_cache::llama_kv_cache(
         route_attn_uses_opencl(hetero_route) ||
         route_attn_uses_opencl(dynamic_prefill_route) ||
         route_attn_uses_opencl(dynamic_decode_route);
+
+    if (shared_kv_buft == nullptr &&
+        consumer_kv_buft == nullptr &&
+        producer_kv_buft == nullptr &&
+        !this->kv_contract.stage_boundary_active() &&
+        dynamic_phase_cpu_opencl_switch) {
+        ggml_backend_dev_t opencl_dev = ggml_backend_dev_by_name("GPUOpenCL");
+        ggml_backend_buffer_type_t opencl_host_buft =
+            opencl_dev != nullptr ? ggml_backend_dev_host_buffer_type(opencl_dev) : nullptr;
+        if (opencl_host_buft != nullptr) {
+            mixed_attn_shared_kv_buft = opencl_host_buft;
+            LLAMA_LOG_INFO("%s: phase-level CPU/OpenCL switch keeps legacy KV cache on %s for %s -> %s\n",
+                    __func__,
+                    ggml_backend_buft_name(mixed_attn_shared_kv_buft),
+                    dynamic_prefill_consumer_backend.c_str(),
+                    dynamic_decode_consumer_backend.c_str());
+        } else {
+            LLAMA_LOG_WARN("%s: phase-level CPU/OpenCL switch requested host-visible KV placement, but OpenCL host buffer type is unavailable; falling back to legacy placement\n",
+                    __func__);
+        }
+    }
+
+    if (shared_kv_buft == nullptr &&
+        consumer_kv_buft == nullptr &&
+        !this->kv_contract.stage_boundary_active() &&
+        dynamic_phase_switch_active) {
+        const bool prefill_qnn = llama_hetero_is_qnn_backend(dynamic_prefill_consumer_backend);
+        const bool decode_qnn  = llama_hetero_is_qnn_backend(dynamic_decode_consumer_backend);
+
+        if (prefill_qnn && !decode_qnn) {
+            if (dynamic_decode_consumer_backend == "cpu") {
+                consumer_kv_buft = ggml_backend_cpu_buffer_type();
+                consumer_kv_dev_name = "CPU";
+            } else if (!dynamic_decode_consumer_backend.empty()) {
+                ggml_backend_dev_t consumer_dev = ggml_backend_dev_by_name(dynamic_decode_consumer_backend.c_str());
+                if (consumer_dev == nullptr && dynamic_decode_consumer_backend == "opencl") {
+                    consumer_dev = ggml_backend_dev_by_name("GPUOpenCL");
+                }
+                if (consumer_dev != nullptr) {
+                    consumer_kv_buft = ggml_backend_dev_buffer_type(consumer_dev);
+                    consumer_kv_dev_name = ggml_backend_dev_name(consumer_dev);
+                }
+            }
+
+            if (consumer_kv_buft != nullptr) {
+                LLAMA_LOG_INFO("%s: phase-level KV placement keeps legacy cache on future decode consumer backend=%s for %s -> %s\n",
+                        __func__,
+                        consumer_kv_dev_name != nullptr ? consumer_kv_dev_name : ggml_backend_buft_name(consumer_kv_buft),
+                        dynamic_prefill_consumer_backend.c_str(),
+                        dynamic_decode_consumer_backend.c_str());
+            }
+        } else if (!prefill_qnn && decode_qnn) {
+            if (dynamic_prefill_consumer_backend == "cpu") {
+                producer_kv_buft = ggml_backend_cpu_buffer_type();
+                producer_kv_dev_name = "CPU";
+            } else if (!dynamic_prefill_consumer_backend.empty()) {
+                ggml_backend_dev_t producer_dev = ggml_backend_dev_by_name(dynamic_prefill_consumer_backend.c_str());
+                if (producer_dev == nullptr && dynamic_prefill_consumer_backend == "opencl") {
+                    producer_dev = ggml_backend_dev_by_name("GPUOpenCL");
+                }
+                if (producer_dev != nullptr) {
+                    producer_kv_buft = ggml_backend_dev_buffer_type(producer_dev);
+                    producer_kv_dev_name = ggml_backend_dev_name(producer_dev);
+                }
+            }
+
+            if (producer_kv_buft != nullptr) {
+                LLAMA_LOG_INFO("%s: phase-level KV placement keeps legacy cache on prefill producer backend=%s for %s -> %s so decode-side QNN can import from generic KV at phase switch\n",
+                        __func__,
+                        producer_kv_dev_name != nullptr ? producer_kv_dev_name : ggml_backend_buft_name(producer_kv_buft),
+                        dynamic_prefill_consumer_backend.c_str(),
+                        dynamic_decode_consumer_backend.c_str());
+            }
+        }
+    }
 
     if (shared_kv_buft == nullptr &&
         consumer_kv_buft == nullptr &&
@@ -289,6 +380,9 @@ llama_kv_cache::llama_kv_cache(
         } else if (mixed_attn_shared_kv_buft != nullptr) {
             buft = mixed_attn_shared_kv_buft;
             dev_name = ggml_backend_buft_name(mixed_attn_shared_kv_buft);
+        } else if (producer_kv_buft != nullptr) {
+            buft = producer_kv_buft;
+            dev_name = producer_kv_dev_name != nullptr ? producer_kv_dev_name : ggml_backend_buft_name(producer_kv_buft);
         } else if (consumer_kv_buft != nullptr) {
             buft = consumer_kv_buft;
             dev_name = consumer_kv_dev_name != nullptr ? consumer_kv_dev_name : ggml_backend_buft_name(consumer_kv_buft);

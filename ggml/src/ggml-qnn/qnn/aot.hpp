@@ -240,6 +240,7 @@ class qnn_aot_runtime {
     void fill_rope_embeds(qnn_aot_graph & graph, size_t start_pos, size_t n_tokens);
     void fill_attention_bias(qnn_aot_graph & graph, size_t n_tokens);
     void save_kv(qnn_aot_graph & graph, size_t n_tokens);
+    bool import_generic_kv_prefix_to_graph(qnn_aot_graph & graph, const aot_match_result & match, size_t n_tokens);
     bool should_write_generic_kv(const aot_match_result & match) const;
     bool should_defer_generic_kv_writeback() const;
     bool collect_generic_kv_from_graph(qnn_aot_graph & graph,
