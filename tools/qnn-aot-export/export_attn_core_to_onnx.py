@@ -15,6 +15,12 @@ parser.add_argument("--model-folder", type=Path, required=True)
 parser.add_argument("--model-name", required=True)
 parser.add_argument("--graph-name", required=True)
 parser.add_argument("--device", type=str, default="cpu")
+parser.add_argument(
+    "--shared-input-dtype",
+    choices=("float16", "float32"),
+    default="float16",
+    help="dtype for shared attn_core external inputs: attn_bias/cache_k/cache_v",
+)
 parser.add_argument("--system-prompt-file", type=Path)
 parser.add_argument("--prompt-file", type=Path, required=True)
 parser.add_argument("--n-model-chunks", type=int, default=1)
@@ -61,6 +67,22 @@ def dtype_name(tensor: torch.Tensor) -> str:
     raise RuntimeError(f"unsupported tensor dtype {tensor.dtype}")
 
 
+def torch_dtype_from_name(name: str) -> torch.dtype:
+    if name == "float16":
+        return torch.float16
+    if name == "float32":
+        return torch.float32
+    raise RuntimeError(f"unsupported dtype name {name}")
+
+
+def activation_bitwidth(tensor: torch.Tensor) -> int:
+    if tensor.dtype == torch.float16:
+        return 16
+    if tensor.dtype == torch.float32:
+        return 32
+    raise RuntimeError(f"unsupported activation dtype {tensor.dtype}")
+
+
 def clone_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.detach().cpu() if tensor.device.type != "cpu" else tensor.detach().clone()
 
@@ -71,13 +93,14 @@ class Sample(NamedTuple):
 
 
 class ExportableAttentionCoreStage(nn.Module):
-    def __init__(self, layer_id: int, attention_module: nn.Module):
+    def __init__(self, layer_id: int, attention_module: nn.Module, shared_input_dtype: torch.dtype):
         super().__init__()
         self.layer_id = layer_id
         self.attention = attention_module
         self.n_heads = attention_module.n_heads
         self.n_kv_heads = attention_module.n_kv_heads
         self.head_dim = attention_module.head_dim
+        self.shared_input_dtype = shared_input_dtype
         self.saved_samples: List[Sample] = []
 
     @property
@@ -106,9 +129,13 @@ class ExportableAttentionCoreStage(nn.Module):
         keys = [kcur[:, i, :] for i in range(self.n_kv_heads)]
         values = [vcur[:, i, :] for i in range(self.n_kv_heads)]
 
-        cache_k = cache_k.to(torch.float32)
-        cache_v = cache_v.to(torch.float32)
-        attn_bias = attn_bias.to(torch.float32)
+        # Keep the external shared-host contract configurable, but run the
+        # attention math in the stage's native compute dtype so export can
+        # accept F16 KV inputs without changing qcur/kcur/vcur routing.
+        compute_dtype = x.dtype
+        cache_k = cache_k.to(compute_dtype)
+        cache_v = cache_v.to(compute_dtype)
+        attn_bias = attn_bias.to(compute_dtype)
 
         key_t_caches = [cache_k[0, :, i, :].transpose(0, 1).contiguous() for i in range(self.n_kv_heads)]
         value_caches = [cache_v[0, :, i, :].contiguous() for i in range(self.n_kv_heads)]
@@ -210,8 +237,13 @@ class AttentionCoreExporter:
 
         graph = self.onnx_model.graph
 
-        for name in ("x", "qcur", "kcur", "vcur", "attn_bias", "cache_k", "cache_v", "out"):
-            encode_activation(name, 32)
+        input_tensors = dict(zip(self.model_chunk.input_names, self.model_chunk.saved_samples[0].inputs, strict=True))
+        output_tensors = dict(zip(self.model_chunk.output_names, self.model_chunk.saved_samples[0].outputs, strict=True))
+
+        for name, tensor in input_tensors.items():
+            encode_activation(name, activation_bitwidth(tensor))
+        for name, tensor in output_tensors.items():
+            encode_activation(name, activation_bitwidth(tensor))
 
         for node in graph.node:
             if match(node, "(.*/)?core.*"):
@@ -255,7 +287,8 @@ class AttentionCoreExporter:
             tensor_paths = []
             for name, tensor in zip(self.model_chunk.input_names, samples.inputs, strict=True):
                 output_path = data_folder / f"{name}.raw"
-                tensor.cpu().numpy().tofile(output_path)
+                calibration_tensor = tensor.float() if tensor.dtype == torch.float16 else tensor
+                calibration_tensor.cpu().numpy().tofile(output_path)
                 tensor_paths.append(f"{name}:={output_path}")
 
             input_list.append(" ".join(tensor_paths))
@@ -291,7 +324,9 @@ def build_current_qkv(attention_module: nn.Module,
     return qcur, kcur, vcur
 
 
-def flatten_attn_core_inputs(attention_module: nn.Module, inputs: Tuple[object, ...]) -> Tuple[torch.Tensor, ...]:
+def flatten_attn_core_inputs(attention_module: nn.Module,
+                             inputs: Tuple[object, ...],
+                             shared_input_dtype: torch.dtype) -> Tuple[torch.Tensor, ...]:
     if len(inputs) != 5:
         raise RuntimeError(f"expected 5 attention inputs, got {len(inputs)}")
 
@@ -311,9 +346,9 @@ def flatten_attn_core_inputs(attention_module: nn.Module, inputs: Tuple[object, 
         qcur,
         kcur,
         vcur,
-        clone_cpu_tensor(attn_bias).to(torch.float32),
-        cache_k.unsqueeze(0).contiguous().to(torch.float32),
-        cache_v.unsqueeze(0).contiguous().to(torch.float32),
+        clone_cpu_tensor(attn_bias).to(shared_input_dtype),
+        cache_k.unsqueeze(0).contiguous().to(shared_input_dtype),
+        cache_v.unsqueeze(0).contiguous().to(shared_input_dtype),
     )
 
 
@@ -359,12 +394,14 @@ model.load_weights()
 
 selected_layers = sorted(set(args.layers if args.layers else range(model_params.n_layers)))
 attn_core_modules: Dict[int, ExportableAttentionCoreStage] = {}
+shared_input_dtype = torch_dtype_from_name(args.shared_input_dtype)
 for model_chunk in model.model_chunks:
     for layer in model_chunk.layers:
         if layer.layer_id in selected_layers:
             attn_core_modules[layer.layer_id] = ExportableAttentionCoreStage(
                 layer_id=layer.layer_id,
                 attention_module=layer.attn,
+                shared_input_dtype=shared_input_dtype,
             )
 
 if sorted(attn_core_modules.keys()) != selected_layers:
@@ -390,7 +427,11 @@ for model_chunk in model.model_chunks:
             else:
                 output_tensor = output
 
-            x = flatten_attn_core_inputs(layer_ref.attn, inputs)
+            x = flatten_attn_core_inputs(
+                layer_ref.attn,
+                inputs,
+                attn_core_modules[layer_ref.layer_id].shared_input_dtype,
+            )
             y = (clone_cpu_tensor(output_tensor),)
             attn_core_modules[layer_ref.layer_id].saved_samples.append(Sample(x, y))
 

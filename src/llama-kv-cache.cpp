@@ -191,14 +191,43 @@ llama_kv_cache::llama_kv_cache(
         const char * value = std::getenv(name);
         return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
     };
+    const auto route_requests_qnn = [](const llama_hetero_route_spec & route) {
+        static constexpr std::array<llama_hetero_route_stage, 5> kStages = {{
+            llama_hetero_route_stage::ATTN_PROJ,
+            llama_hetero_route_stage::ATTN_CORE,
+            llama_hetero_route_stage::ATTN_OUT,
+            llama_hetero_route_stage::FFN,
+            llama_hetero_route_stage::OUTPUT,
+        }};
+
+        for (const auto stage : kStages) {
+            if (llama_hetero_is_qnn_backend(route.backend_for(stage))) {
+                return true;
+            }
+        }
+
+        return false;
+    };
+    const auto route_attn_uses_opencl = [](const llama_hetero_route_spec & route) {
+        return llama_hetero_is_opencl_backend(route.backend_for(llama_hetero_route_stage::ATTN_PROJ)) ||
+               llama_hetero_is_opencl_backend(route.backend_for(llama_hetero_route_stage::ATTN_CORE)) ||
+               llama_hetero_is_opencl_backend(route.backend_for(llama_hetero_route_stage::ATTN_OUT));
+    };
     const auto & hetero_route = model.get_hetero_plan().route;
+    const llama_hetero_route_spec dynamic_prefill_route =
+        llama_hetero_parse_route_spec(std::getenv("GGML_HETERO_DYNAMIC_PREFILL_ROUTE"));
+    const llama_hetero_route_spec dynamic_decode_route =
+        llama_hetero_parse_route_spec(std::getenv("GGML_HETERO_DYNAMIC_DECODE_ROUTE"));
+    const bool dynamic_phase_qnn_opencl_switch =
+        (route_requests_qnn(dynamic_prefill_route) && route_attn_uses_opencl(dynamic_decode_route)) ||
+        (route_attn_uses_opencl(dynamic_prefill_route) && route_requests_qnn(dynamic_decode_route));
     const bool hetero_qnn_shared_host_requested =
         env_flag_enabled("GGML_HETERO_QNN_SHARED_HOST") &&
-        llama_hetero_route_has_qnn_adjacent_boundary(hetero_route);
+        (llama_hetero_route_has_qnn_adjacent_boundary(hetero_route) || dynamic_phase_qnn_opencl_switch);
     const bool attn_uses_opencl =
-        llama_hetero_is_opencl_backend(hetero_route.backend_for(llama_hetero_route_stage::ATTN_PROJ)) ||
-        llama_hetero_is_opencl_backend(hetero_route.backend_for(llama_hetero_route_stage::ATTN_CORE)) ||
-        llama_hetero_is_opencl_backend(hetero_route.backend_for(llama_hetero_route_stage::ATTN_OUT));
+        route_attn_uses_opencl(hetero_route) ||
+        route_attn_uses_opencl(dynamic_prefill_route) ||
+        route_attn_uses_opencl(dynamic_decode_route);
 
     if (shared_kv_buft == nullptr &&
         consumer_kv_buft == nullptr &&

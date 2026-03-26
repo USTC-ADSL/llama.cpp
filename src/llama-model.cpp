@@ -4,6 +4,7 @@
 #include "llama-impl.h"
 #include "llama-mmap.h"
 #include "llama-cparams.h"
+#include "llama-hetero-route.h"
 #include "llama-model-loader.h"
 
 #include "llama-kv-cache.h"
@@ -183,11 +184,17 @@ static llama_rope_scaling_type llama_rope_scaling_type_from_string(const std::st
 // CPU: ACCEL -> GPU host -> CPU extra -> CPU
 static buft_list_t make_cpu_buft_list(const std::vector<ggml_backend_dev_t> & devices, bool use_extra_bufts, bool no_host) {
     buft_list_t buft_list;
+    const bool allow_qnn_accel_buft = std::any_of(devices.begin(), devices.end(), [](ggml_backend_dev_t dev) {
+        return dev != nullptr && llama_hetero_is_qnn_backend(ggml_backend_dev_name(dev));
+    });
 
     // add ACCEL buffer types
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+            if (!allow_qnn_accel_buft && llama_hetero_is_qnn_backend(ggml_backend_dev_name(dev))) {
+                continue;
+            }
             auto * buft = ggml_backend_dev_buffer_type(dev);
             // skip
             if (buft != ggml_backend_cpu_buffer_type()) {

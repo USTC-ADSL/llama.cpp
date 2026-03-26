@@ -638,7 +638,7 @@ llama_dynamic_route_decision llama_dynamic_route_decide(
                 primary.plan,
                 primary.label.c_str(),
                 is_prefill ? "phase-prefill-route" : "phase-decode-route");
-        if (decision.should_apply) {
+        if (decision.should_apply || decision.reason == "already-active") {
             return decision;
         }
     }

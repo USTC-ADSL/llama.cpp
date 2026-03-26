@@ -12,6 +12,7 @@
 #include "ggml-opt.h"
 
 #include <map>
+#include <string>
 #include <vector>
 
 struct llama_model;
@@ -372,12 +373,47 @@ private:
     // keeps those backends alive and only reroutes QNN-owned stages.
     bool aot_force_cpu_graph = false;
     bool aot_bootstrap_cpu_sched_active = false;
+    bool aot_active_route_requests_qnn = false;
 
     llama_hetero_execution_plan hetero_plan;
     llama_hetero_execution_plan hetero_plan_base;
     llama_hetero_kv_contract    hetero_kv_contract_allocated;
     llama_dynamic_route_runtime_config dynamic_route_config;
     llama_dynamic_route_runtime_state  dynamic_route_state;
+
+    struct hetero_phase_timing_trace {
+        bool active = false;
+        bool route_applied = false;
+        bool route_noop = false;
+        bool bootstrap_ran = false;
+
+        uint32_t n_tokens = 0;
+
+        int64_t batch_start_us = 0;
+        int64_t route_decide_us = 0;
+        int64_t route_apply_us = 0;
+        int64_t reserve_us = 0;
+        int64_t memory_update_us = 0;
+        int64_t kv_migration_us = 0;
+        int64_t process_ubatch_us = 0;
+        int64_t bootstrap_sync_us = 0;
+        int64_t bootstrap_sched_rebuild_us = 0;
+
+        int32_t process_ubatches = 0;
+        int32_t graph_runs_reused = 0;
+        int32_t graph_runs_rebuilt = 0;
+
+        std::string route_label;
+        std::string route_reason;
+        std::string target_route;
+
+        void reset() {
+            *this = {};
+        }
+    };
+
+    hetero_phase_timing_trace hetero_phase_trace;
+    bool hetero_phase_trace_suppress_sync_log = false;
 
     // perf
     mutable int64_t t_start_us  = 0;

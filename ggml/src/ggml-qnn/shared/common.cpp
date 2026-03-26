@@ -1,6 +1,7 @@
 
 #include "common.hpp"
 
+#include <cstring>
 #include <memory>
 
 #include "ggml-backend-impl.h"
@@ -13,6 +14,9 @@
 #    include <sys/sysinfo.h>
 #    include <unistd.h>
 #endif
+
+bool ggml_backend_qnn_aot_has_pending_generic_kv_writeback(ggml_backend_t backend);
+bool ggml_backend_qnn_aot_flush_pending_generic_kv_writeback(ggml_backend_t backend);
 
 namespace {
 
@@ -79,11 +83,27 @@ ggml_backend_dev_t ggml_backend_qnn_reg_get_device(ggml_backend_reg_t reg, size_
     return &(ctx->devices[index]);
 }
 
+void * ggml_backend_qnn_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+    if (name == nullptr) {
+        return nullptr;
+    }
+
+    if (std::strcmp(name, "ggml_backend_qnn_aot_has_pending_generic_kv_writeback") == 0) {
+        return reinterpret_cast<void *>(ggml_backend_qnn_aot_has_pending_generic_kv_writeback);
+    }
+    if (std::strcmp(name, "ggml_backend_qnn_aot_flush_pending_generic_kv_writeback") == 0) {
+        return reinterpret_cast<void *>(ggml_backend_qnn_aot_flush_pending_generic_kv_writeback);
+    }
+
+    return nullptr;
+}
+
 const ggml_backend_reg_i ggml_backend_qnn_reg_interface = {
     /* .get_name         = */ ggml_backend_qnn_reg_get_name,
     /* .get_device_count = */ ggml_backend_qnn_reg_get_device_count,
     /* .get_device_get   = */ ggml_backend_qnn_reg_get_device,
-    /* .get_proc_address = */ nullptr,
+    /* .get_proc_address = */ ggml_backend_qnn_reg_get_proc_address,
 };
 
 }  // namespace

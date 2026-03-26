@@ -275,6 +275,7 @@ static inline bool llama_hetero_name_has_prefix(const char * value, const char *
 
 static inline bool llama_hetero_is_output_tensor_name(const char * tensor_name) {
     return tensor_name != nullptr && (
+        std::strcmp(tensor_name, "norm") == 0 ||
         std::strcmp(tensor_name, "result_norm") == 0 ||
         std::strcmp(tensor_name, "result_output") == 0);
 }

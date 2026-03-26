@@ -3317,6 +3317,10 @@ static bool ggml_backend_opencl_can_create_aligned_sub_buffer(const ggml_tensor_
     return extra != nullptr && extra->data_device != nullptr && alignment != 0 && (extra->offset % alignment) == 0;
 }
 
+static bool ggml_backend_opencl_can_create_aligned_sub_buffer_at_offset(const ggml_tensor_extra_cl * extra, size_t offset, size_t alignment) {
+    return extra != nullptr && extra->data_device != nullptr && alignment != 0 && (offset % alignment) == 0;
+}
+
 static ggml_tensor_extra_cl * ggml_backend_opencl_ensure_tensor_extra_from_host_buffer(
         ggml_backend_t backend,
         ggml_tensor * tensor) {
@@ -9993,7 +9997,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     }
 
     // q4_0 x fp32
-    if(src0t == GGML_TYPE_Q4_0 && src1t == GGML_TYPE_F32) {
+    if (src0t == GGML_TYPE_Q4_0 && src1t == GGML_TYPE_F32 &&
+        ggml_backend_opencl_can_create_aligned_sub_buffer_at_offset(extra1, offset1, backend_ctx->alignment) &&
+        (N == 1 || ggml_backend_opencl_can_create_aligned_sub_buffer_at_offset(extrad, offsetd, backend_ctx->alignment))) {
         // TODO: remove duplicate definitions of image description + format -- move to top
 
         // create an image for A
@@ -10020,7 +10026,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
         // create a sub_buffer for B
         // <--------------------------------------------> //
-        region.origin = (extra1->offset);
+        region.origin = offset1;
         region.size = K * N * sizeof(float);
         B_sub_buffer = clCreateSubBuffer(
             extra1->data_device,
@@ -10169,9 +10175,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(cl_mem),   &A_image1d));
             CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(cl_mem),   &extra0_q4_0->d));
             CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(cl_mem),   &B_image1d));
-            CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(cl_ulong), &extra1->offset));
+            CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(cl_ulong), &offset1));
             CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(cl_mem),   &extrad->data_device));
-            CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(cl_ulong), &extrad->offset));
+            CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(cl_ulong), &offsetd));
             CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(int),      &ne00));
             CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(int),      &ne01));
             CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(int),      &ne02));
@@ -10182,7 +10188,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(int),      &r2));
             CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(int),      &r3));
         } else {
-            region.origin = extrad->offset; // Specify the starting offset (in bytes)
+            region.origin = offsetd; // Specify the starting offset (in bytes)
             region.size = M * N * sizeof(float); // Specify the size of the sub-buffer
             C_d = clCreateSubBuffer(extrad->data_device, CL_MEM_WRITE_ONLY, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
             CL_CHECK(status);

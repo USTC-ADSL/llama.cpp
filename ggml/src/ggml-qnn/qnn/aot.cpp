@@ -225,11 +225,76 @@ bool tensor_rows_are_packed_f32(const ggml_tensor * tensor, size_t row_elems) {
            ggml_is_contiguous_rows(tensor);
 }
 
+ggml_backend_buffer_t tensor_access_buffer(const ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return nullptr;
+    }
+
+    return tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+}
+
+void backend_tensor_get_view_aware(const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    ggml_backend_buffer_t buffer = tensor_access_buffer(tensor);
+    GGML_ASSERT(tensor != nullptr);
+    GGML_ASSERT(buffer != nullptr);
+    GGML_ASSERT(tensor->data != nullptr);
+
+    if (size == 0) {
+        return;
+    }
+
+    GGML_ASSERT(buffer->iface.get_tensor != nullptr);
+    buffer->iface.get_tensor(buffer, tensor, data, offset, size);
+}
+
+void backend_tensor_set_view_aware(ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_backend_buffer_t buffer = tensor_access_buffer(tensor);
+    GGML_ASSERT(tensor != nullptr);
+    GGML_ASSERT(buffer != nullptr);
+    GGML_ASSERT(tensor->data != nullptr);
+
+    if (size == 0) {
+        return;
+    }
+
+    GGML_ASSERT(buffer->iface.set_tensor != nullptr);
+    buffer->iface.set_tensor(buffer, tensor, data, offset, size);
+}
+
+bool tensor_has_host_accessible_data(const ggml_tensor * tensor) {
+    ggml_backend_buffer_t buffer = tensor_access_buffer(tensor);
+    if (tensor == nullptr || tensor->data == nullptr || buffer == nullptr || !ggml_backend_buffer_is_host(buffer)) {
+        return false;
+    }
+
+    void * base = ggml_backend_buffer_get_base(buffer);
+    if (base == nullptr) {
+        return false;
+    }
+
+    const uintptr_t data_addr = reinterpret_cast<uintptr_t>(tensor->data);
+    const uintptr_t base_addr = reinterpret_cast<uintptr_t>(base);
+    const uintptr_t end_addr  = base_addr + ggml_backend_buffer_get_size(buffer);
+    return data_addr >= base_addr && data_addr < end_addr;
+}
+
 void copy_ggml_rows_to_contiguous(const ggml_tensor * src, size_t row_offset, size_t n_rows, size_t row_elems, float * dst) {
     const size_t row_bytes = row_elems * sizeof(float);
-    if (tensor_rows_are_packed_f32(src, row_elems)) {
+    if (tensor_has_host_accessible_data(src) && tensor_rows_are_packed_f32(src, row_elems)) {
         const auto * src_ptr = reinterpret_cast<const char *>(src->data) + row_offset * row_bytes;
         std::memcpy(dst, src_ptr, n_rows * row_bytes);
+        return;
+    }
+
+    if (!tensor_has_host_accessible_data(src)) {
+        if (tensor_rows_are_packed_f32(src, row_elems)) {
+            backend_tensor_get_view_aware(src, dst, row_offset * row_bytes, n_rows * row_bytes);
+            return;
+        }
+
+        for (size_t i = 0; i < n_rows; ++i) {
+            backend_tensor_get_view_aware(src, dst + i * row_elems, (row_offset + i) * src->nb[1], row_bytes);
+        }
         return;
     }
 
@@ -242,9 +307,21 @@ void copy_ggml_rows_to_contiguous(const ggml_tensor * src, size_t row_offset, si
 
 void copy_contiguous_rows_to_ggml(ggml_tensor * dst, size_t row_offset, size_t n_rows, size_t row_elems, const float * src) {
     const size_t row_bytes = row_elems * sizeof(float);
-    if (tensor_rows_are_packed_f32(dst, row_elems)) {
+    if (tensor_has_host_accessible_data(dst) && tensor_rows_are_packed_f32(dst, row_elems)) {
         auto * dst_ptr = reinterpret_cast<char *>(dst->data) + row_offset * row_bytes;
         std::memcpy(dst_ptr, src, n_rows * row_bytes);
+        return;
+    }
+
+    if (!tensor_has_host_accessible_data(dst)) {
+        if (tensor_rows_are_packed_f32(dst, row_elems)) {
+            backend_tensor_set_view_aware(dst, src, row_offset * row_bytes, n_rows * row_bytes);
+            return;
+        }
+
+        for (size_t i = 0; i < n_rows; ++i) {
+            backend_tensor_set_view_aware(dst, src + i * row_elems, (row_offset + i) * dst->nb[1], row_bytes);
+        }
         return;
     }
 
@@ -292,7 +369,11 @@ bool copy_contiguous_tensor_bytes(const ggml_tensor * tensor, void * dst, size_t
         return false;
     }
 
-    std::memcpy(dst, tensor->data, dst_size);
+    if (tensor_has_host_accessible_data(tensor)) {
+        std::memcpy(dst, tensor->data, dst_size);
+    } else {
+        backend_tensor_get_view_aware(tensor, dst, 0, dst_size);
+    }
     return true;
 }
 
@@ -391,9 +472,25 @@ bool write_f32_token_block_to_cache(ggml_tensor * cache,
     const size_t idx_count = static_cast<size_t>(idxs->ne[0]);
     const size_t cache_row_values = static_cast<size_t>(cache->ne[0]);
 
-    const auto * src_base = static_cast<const float *>(cur->data);
-    const auto * idx_base = static_cast<const int64_t *>(idxs->data);
-    auto * dst_base = static_cast<char *>(cache->data);
+    std::vector<float> cur_host;
+    if (!tensor_has_host_accessible_data(cur)) {
+        cur_host.resize(ggml_nbytes(cur) / sizeof(float));
+        backend_tensor_get_view_aware(cur, cur_host.data(), 0, ggml_nbytes(cur));
+    }
+
+    std::vector<int64_t> idxs_host;
+    if (!tensor_has_host_accessible_data(idxs)) {
+        idxs_host.resize(ggml_nbytes(idxs) / sizeof(int64_t));
+        backend_tensor_get_view_aware(idxs, idxs_host.data(), 0, ggml_nbytes(idxs));
+    }
+
+    const auto * src_base = tensor_has_host_accessible_data(cur)
+        ? static_cast<const float *>(cur->data)
+        : cur_host.data();
+    const auto * idx_base = tensor_has_host_accessible_data(idxs)
+        ? static_cast<const int64_t *>(idxs->data)
+        : idxs_host.data();
+    auto * dst_base = tensor_has_host_accessible_data(cache) ? static_cast<char *>(cache->data) : nullptr;
 
     size_t token_values = 0;
     size_t n_tokens = 0;
@@ -432,6 +529,7 @@ bool write_f32_token_block_to_cache(ggml_tensor * cache,
         }
 
         const size_t row_bytes = token_values * sizeof(float);
+        std::vector<ggml_fp16_t> row_fp16;
         if (ggml_nbytes(cur) != row_bytes * n_tokens) {
             return false;
         }
@@ -444,16 +542,36 @@ bool write_f32_token_block_to_cache(ggml_tensor * cache,
 
             const float * src = reinterpret_cast<const float *>(
                 reinterpret_cast<const char *>(src_base) + token * row_bytes);
-            void * dst = dst_base + slot * cache->nb[1];
+            const size_t dst_offset = slot * cache->nb[1];
+
+            if (dst_base != nullptr) {
+                void * dst = dst_base + dst_offset;
+                switch (cache->type) {
+                    case GGML_TYPE_F32:
+                        std::memcpy(dst, src, row_bytes);
+                        break;
+                    case GGML_TYPE_F16: {
+                        auto * dst_fp16 = static_cast<ggml_fp16_t *>(dst);
+                        for (size_t i = 0; i < token_values; ++i) {
+                            dst_fp16[i] = ggml_fp32_to_fp16(src[i]);
+                        }
+                    } break;
+                    default:
+                        return false;
+                }
+                continue;
+            }
+
             switch (cache->type) {
                 case GGML_TYPE_F32:
-                    std::memcpy(dst, src, row_bytes);
+                    backend_tensor_set_view_aware(cache, src, dst_offset, row_bytes);
                     break;
                 case GGML_TYPE_F16: {
-                    auto * dst_fp16 = static_cast<ggml_fp16_t *>(dst);
+                    row_fp16.resize(token_values);
                     for (size_t i = 0; i < token_values; ++i) {
-                        dst_fp16[i] = ggml_fp32_to_fp16(src[i]);
+                        row_fp16[i] = ggml_fp32_to_fp16(src[i]);
                     }
+                    backend_tensor_set_view_aware(cache, row_fp16.data(), dst_offset, row_fp16.size() * sizeof(ggml_fp16_t));
                 } break;
                 default:
                     return false;
@@ -474,7 +592,15 @@ bool write_f32_token_block_to_cache(ggml_tensor * cache,
     }
 
     if (cache->type == GGML_TYPE_F32) {
-        auto * dst = reinterpret_cast<float *>(dst_base);
+        std::vector<float> dst_host;
+        float * dst = nullptr;
+        if (dst_base != nullptr) {
+            dst = reinterpret_cast<float *>(dst_base);
+        } else {
+            dst_host.resize(cache_values);
+            backend_tensor_get_view_aware(cache, dst_host.data(), 0, ggml_nbytes(cache));
+            dst = dst_host.data();
+        }
         for (size_t i = 0; i < total_values; ++i) {
             const int64_t slot = idx_base[i];
             if (slot < 0 || static_cast<size_t>(slot) >= cache_values) {
@@ -482,17 +608,31 @@ bool write_f32_token_block_to_cache(ggml_tensor * cache,
             }
             dst[slot] = src_base[i];
         }
+        if (dst_base == nullptr) {
+            backend_tensor_set_view_aware(cache, dst_host.data(), 0, ggml_nbytes(cache));
+        }
         return true;
     }
 
     if (cache->type == GGML_TYPE_F16) {
-        auto * dst = reinterpret_cast<ggml_fp16_t *>(dst_base);
+        std::vector<ggml_fp16_t> dst_host;
+        ggml_fp16_t * dst = nullptr;
+        if (dst_base != nullptr) {
+            dst = reinterpret_cast<ggml_fp16_t *>(dst_base);
+        } else {
+            dst_host.resize(cache_values);
+            backend_tensor_get_view_aware(cache, dst_host.data(), 0, ggml_nbytes(cache));
+            dst = dst_host.data();
+        }
         for (size_t i = 0; i < total_values; ++i) {
             const int64_t slot = idx_base[i];
             if (slot < 0 || static_cast<size_t>(slot) >= cache_values) {
                 return false;
             }
             dst[slot] = ggml_fp32_to_fp16(src_base[i]);
+        }
+        if (dst_base == nullptr) {
+            backend_tensor_set_view_aware(cache, dst_host.data(), 0, ggml_nbytes(cache));
         }
         return true;
     }
@@ -589,8 +729,11 @@ bool copy_token_rows_from_cache(const ggml_tensor * cache,
         return false;
     }
 
-    const auto * src_base = static_cast<const char *>(cache->data);
     auto * dst_base = static_cast<char *>(dst);
+    const bool host_cache = tensor_has_host_accessible_data(cache);
+    const auto * src_base = host_cache ? static_cast<const char *>(cache->data) : nullptr;
+    std::vector<float> row_f32;
+    std::vector<ggml_fp16_t> row_f16;
 
     for (size_t token = 0; token < slots.size(); ++token) {
         const int64_t slot = slots[token];
@@ -598,21 +741,35 @@ bool copy_token_rows_from_cache(const ggml_tensor * cache,
             return false;
         }
 
-        const auto * src_row = src_base + slot * cache->nb[1];
+        const size_t src_offset = slot * cache->nb[1];
+        const auto * src_row = host_cache ? src_base + src_offset : nullptr;
         auto * dst_row = dst_base + token * row_bytes;
 
         if (cache->type == GGML_TYPE_F32 &&
             (dst_dtype == QNN_DATATYPE_FLOAT_32 || dst_dtype == QNN_DATATYPE_UNDEFINED)) {
-            std::memcpy(dst_row, src_row, row_bytes);
+            if (host_cache) {
+                std::memcpy(dst_row, src_row, row_bytes);
+            } else {
+                backend_tensor_get_view_aware(cache, dst_row, src_offset, row_bytes);
+            }
             continue;
         }
 
         if (cache->type == GGML_TYPE_F16 && dst_dtype == QNN_DATATYPE_FLOAT_16) {
-            std::memcpy(dst_row, src_row, row_bytes);
+            if (host_cache) {
+                std::memcpy(dst_row, src_row, row_bytes);
+            } else {
+                backend_tensor_get_view_aware(cache, dst_row, src_offset, row_bytes);
+            }
             continue;
         }
 
         if (cache->type == GGML_TYPE_F32 && dst_dtype == QNN_DATATYPE_FLOAT_16) {
+            if (!host_cache) {
+                row_f32.resize(token_values);
+                backend_tensor_get_view_aware(cache, row_f32.data(), src_offset, token_values * sizeof(float));
+                src_row = reinterpret_cast<const char *>(row_f32.data());
+            }
             const auto * src = reinterpret_cast<const float *>(src_row);
             auto * out = reinterpret_cast<ggml_fp16_t *>(dst_row);
             for (size_t i = 0; i < token_values; ++i) {
@@ -623,6 +780,11 @@ bool copy_token_rows_from_cache(const ggml_tensor * cache,
 
         if (cache->type == GGML_TYPE_F16 &&
             (dst_dtype == QNN_DATATYPE_FLOAT_32 || dst_dtype == QNN_DATATYPE_UNDEFINED)) {
+            if (!host_cache) {
+                row_f16.resize(token_values);
+                backend_tensor_get_view_aware(cache, row_f16.data(), src_offset, token_values * sizeof(ggml_fp16_t));
+                src_row = reinterpret_cast<const char *>(row_f16.data());
+            }
             const auto * src = reinterpret_cast<const ggml_fp16_t *>(src_row);
             auto * out = reinterpret_cast<float *>(dst_row);
             for (size_t i = 0; i < token_values; ++i) {
@@ -722,6 +884,183 @@ bool env_flag_enabled(const char * name) {
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
+std::string trim_copy(std::string_view value) {
+    size_t begin = 0;
+    size_t end = value.size();
+
+    while (begin < end && std::isspace(static_cast<unsigned char>(value[begin]))) {
+        ++begin;
+    }
+    while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
+        --end;
+    }
+
+    return std::string(value.substr(begin, end - begin));
+}
+
+std::string canonical_route_backend(std::string_view value) {
+    std::string normalized = trim_copy(value);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+
+    if (normalized.empty()) {
+        return {};
+    }
+
+    if (normalized == "cpu") {
+        return "cpu";
+    }
+    if (normalized == "opencl" || normalized == "gpuopencl" || normalized == "gpu") {
+        return "opencl";
+    }
+    if (normalized == "qnn" || normalized == "qnn-npu" || normalized == "npu" || normalized == "htp0" || normalized == "htp") {
+        return "qnn-npu";
+    }
+    if (normalized == "qnn-gpu") {
+        return "qnn-gpu";
+    }
+    if (normalized == "qnn-cpu") {
+        return "qnn-cpu";
+    }
+
+    return normalized;
+}
+
+bool is_qnn_route_backend(const std::string & value) {
+    return value == "qnn-npu" || value == "qnn-gpu" || value == "qnn-cpu";
+}
+
+struct aot_phase_route_spec {
+    std::string attn;
+    std::string attn_proj;
+    std::string attn_core;
+    std::string attn_out;
+    std::string ffn;
+    std::string output;
+
+    bool has_any_route() const {
+        return !attn.empty() ||
+               !attn_proj.empty() ||
+               !attn_core.empty() ||
+               !attn_out.empty() ||
+               !ffn.empty() ||
+               !output.empty();
+    }
+
+    std::string backend_for_attn_proj() const {
+        return !attn_proj.empty() ? attn_proj : attn;
+    }
+
+    std::string backend_for_attn_core() const {
+        return !attn_core.empty() ? attn_core : attn;
+    }
+
+    std::string backend_for_attn_out() const {
+        if (!attn_out.empty()) {
+            return attn_out;
+        }
+        if (!attn_core.empty()) {
+            return attn_core;
+        }
+        return attn;
+    }
+
+    std::string backend_for_output() const {
+        if (!output.empty()) {
+            return output;
+        }
+        if (!attn_out.empty()) {
+            return attn_out;
+        }
+        if (!attn_core.empty()) {
+            return attn_core;
+        }
+        return attn;
+    }
+};
+
+aot_phase_route_spec parse_phase_route_spec(const char * value) {
+    aot_phase_route_spec route;
+    if (value == nullptr || value[0] == '\0') {
+        return route;
+    }
+
+    std::string_view spec(value);
+    size_t cursor = 0;
+    while (cursor < spec.size()) {
+        const size_t delim = spec.find(',', cursor);
+        const std::string_view entry = spec.substr(
+            cursor,
+            delim == std::string_view::npos ? std::string_view::npos : delim - cursor);
+        const size_t equals = entry.find('=');
+
+        if (equals != std::string_view::npos) {
+            const std::string key = canonical_route_backend(trim_copy(entry.substr(0, equals)));
+            const std::string backend = canonical_route_backend(entry.substr(equals + 1));
+
+            if (key == "attn") {
+                route.attn = backend;
+            } else if (key == "attn_proj") {
+                route.attn_proj = backend;
+            } else if (key == "attn_core") {
+                route.attn_core = backend;
+            } else if (key == "attn_out") {
+                route.attn_out = backend;
+            } else if (key == "ffn") {
+                route.ffn = backend;
+            } else if (key == "output") {
+                route.output = backend;
+            }
+        }
+
+        if (delim == std::string_view::npos) {
+            break;
+        }
+        cursor = delim + 1;
+    }
+
+    return route;
+}
+
+bool route_requests_qnn(const aot_phase_route_spec & route) {
+    return is_qnn_route_backend(route.backend_for_attn_proj()) ||
+           is_qnn_route_backend(route.backend_for_attn_core()) ||
+           is_qnn_route_backend(route.backend_for_attn_out()) ||
+           is_qnn_route_backend(route.ffn) ||
+           is_qnn_route_backend(route.backend_for_output());
+}
+
+bool route_attention_uses_non_qnn_backend(const aot_phase_route_spec & route) {
+    const std::string attn_proj = route.backend_for_attn_proj();
+    const std::string attn_core = route.backend_for_attn_core();
+    const std::string attn_out  = route.backend_for_attn_out();
+
+    return (!attn_proj.empty() && !is_qnn_route_backend(attn_proj)) ||
+           (!attn_core.empty() && !is_qnn_route_backend(attn_core)) ||
+           (!attn_out.empty()  && !is_qnn_route_backend(attn_out));
+}
+
+bool aot_generic_kv_writeback_needed_for_phase_switch() {
+    if (!env_flag_enabled("GGML_QNN_AOT_WRITE_GENERIC_KV")) {
+        return false;
+    }
+
+    const aot_phase_route_spec decode_route =
+        parse_phase_route_spec(std::getenv("GGML_HETERO_DYNAMIC_DECODE_ROUTE"));
+    if (!decode_route.has_any_route() || !route_attention_uses_non_qnn_backend(decode_route)) {
+        return false;
+    }
+
+    const aot_phase_route_spec prefill_route =
+        parse_phase_route_spec(std::getenv("GGML_HETERO_DYNAMIC_PREFILL_ROUTE"));
+    return !prefill_route.has_any_route() || route_requests_qnn(prefill_route);
+}
+
+bool aot_write_generic_kv_enabled() {
+    return env_flag_enabled("GGML_QNN_AOT_WRITE_GENERIC_KV");
+}
+
 bool aot_trace_match_enabled() {
     return env_flag_enabled("GGML_QNN_AOT_TRACE_MATCH");
 }
@@ -778,6 +1117,245 @@ bool parse_stage_layer_id(const char * name, size_t & layer_id) {
 
     layer_id = static_cast<size_t>(parsed);
     return true;
+}
+
+bool parse_cache_layer_id(const char * name, const char * prefix, size_t & layer_id) {
+    if (name == nullptr || prefix == nullptr) {
+        return false;
+    }
+
+    const size_t prefix_len = std::strlen(prefix);
+    if (std::strncmp(name, prefix, prefix_len) != 0) {
+        return false;
+    }
+
+    const char * cursor = name + prefix_len;
+    if (*cursor == '\0' || !std::isdigit(static_cast<unsigned char>(*cursor))) {
+        return false;
+    }
+
+    char * end = nullptr;
+    errno = 0;
+    const auto parsed = std::strtoll(cursor, &end, 10);
+    if (errno != 0 || end == cursor || parsed < 0) {
+        return false;
+    }
+
+    layer_id = static_cast<size_t>(parsed);
+    return true;
+}
+
+void record_layer_cache_tensor(std::map<size_t, ggml_tensor *> & tensors,
+                               ggml_tensor *                    tensor,
+                               const char *                     prefix) {
+    if (tensor == nullptr) {
+        return;
+    }
+
+    const char * name = ggml_get_name(tensor);
+    size_t layer_id = std::numeric_limits<size_t>::max();
+    if (!parse_cache_layer_id(name, prefix, layer_id)) {
+        return;
+    }
+
+    tensors[layer_id] = tensor;
+}
+
+bool copy_i64_tensor_slice(const ggml_tensor * tensor,
+                           size_t              offset,
+                           size_t              count,
+                           std::vector<int64_t> & out) {
+    if (tensor == nullptr || tensor->type != GGML_TYPE_I64 || ggml_n_dims(tensor) != 1) {
+        return false;
+    }
+
+    if (offset > static_cast<size_t>(tensor->ne[0]) ||
+        count > static_cast<size_t>(tensor->ne[0]) - offset) {
+        return false;
+    }
+
+    out.resize(count);
+    const size_t bytes = count * sizeof(int64_t);
+    if (tensor_has_host_accessible_data(tensor)) {
+        std::memcpy(out.data(), static_cast<const char *>(tensor->data) + offset * sizeof(int64_t), bytes);
+    } else {
+        backend_tensor_get_view_aware(tensor, out.data(), offset * sizeof(int64_t), bytes);
+    }
+    return true;
+}
+
+float read_fp_value(const char * src, size_t elem_size) {
+    switch (elem_size) {
+        case sizeof(float):
+            return *reinterpret_cast<const float *>(src);
+        case sizeof(ggml_fp16_t):
+            return ggml_fp16_to_fp32(*reinterpret_cast<const ggml_fp16_t *>(src));
+        default:
+            return 0.0f;
+    }
+}
+
+bool write_f32_host_token_block_to_cache(ggml_tensor *   cache,
+                                         const float *   src_base,
+                                         size_t          token_values,
+                                         size_t          n_tokens,
+                                         const int64_t * idx_base,
+                                         size_t          idx_count) {
+    if (cache == nullptr || src_base == nullptr || idx_base == nullptr ||
+        token_values == 0 || n_tokens == 0 ||
+        ggml_n_dims(cache) < 2 || cache->ne[2] != 1 || cache->ne[3] != 1) {
+        return false;
+    }
+
+    const size_t cache_row_values = static_cast<size_t>(cache->ne[0]);
+    auto * dst_base = tensor_has_host_accessible_data(cache) ? static_cast<char *>(cache->data) : nullptr;
+
+    if (idx_count == n_tokens && cache_row_values == token_values) {
+        if (cache->nb[1] != (ptrdiff_t) ggml_row_size(cache->type, cache->ne[0])) {
+            return false;
+        }
+
+        const size_t row_bytes = token_values * sizeof(float);
+        bool contiguous_slots = true;
+        for (size_t token = 0; token < n_tokens; ++token) {
+            const int64_t slot = idx_base[token];
+            if (slot < 0 || slot >= cache->ne[1]) {
+                return false;
+            }
+            if (token > 0 && slot != idx_base[0] + static_cast<int64_t>(token)) {
+                contiguous_slots = false;
+            }
+        }
+
+        if (contiguous_slots) {
+            const size_t dst_offset = idx_base[0] * cache->nb[1];
+            switch (cache->type) {
+                case GGML_TYPE_F32: {
+                    const size_t total_row_bytes = n_tokens * row_bytes;
+                    if (dst_base != nullptr) {
+                        std::memcpy(dst_base + dst_offset, src_base, total_row_bytes);
+                    } else {
+                        backend_tensor_set_view_aware(cache, src_base, dst_offset, total_row_bytes);
+                    }
+                    return true;
+                }
+                case GGML_TYPE_F16: {
+                    std::vector<ggml_fp16_t> block_fp16(token_values * n_tokens);
+                    for (size_t i = 0; i < token_values * n_tokens; ++i) {
+                        block_fp16[i] = ggml_fp32_to_fp16(src_base[i]);
+                    }
+                    const size_t total_row_bytes = block_fp16.size() * sizeof(ggml_fp16_t);
+                    if (dst_base != nullptr) {
+                        std::memcpy(dst_base + dst_offset, block_fp16.data(), total_row_bytes);
+                    } else {
+                        backend_tensor_set_view_aware(cache, block_fp16.data(), dst_offset, total_row_bytes);
+                    }
+                    return true;
+                }
+                default:
+                    return false;
+            }
+        }
+
+        std::vector<ggml_fp16_t> row_fp16;
+        for (size_t token = 0; token < n_tokens; ++token) {
+            const int64_t slot = idx_base[token];
+            const float * src = src_base + token * token_values;
+            const size_t dst_offset = slot * cache->nb[1];
+
+            if (dst_base != nullptr) {
+                void * dst = dst_base + dst_offset;
+                switch (cache->type) {
+                    case GGML_TYPE_F32:
+                        std::memcpy(dst, src, row_bytes);
+                        break;
+                    case GGML_TYPE_F16: {
+                        auto * dst_fp16 = static_cast<ggml_fp16_t *>(dst);
+                        for (size_t i = 0; i < token_values; ++i) {
+                            dst_fp16[i] = ggml_fp32_to_fp16(src[i]);
+                        }
+                    } break;
+                    default:
+                        return false;
+                }
+                continue;
+            }
+
+            switch (cache->type) {
+                case GGML_TYPE_F32:
+                    backend_tensor_set_view_aware(cache, src, dst_offset, row_bytes);
+                    break;
+                case GGML_TYPE_F16: {
+                    row_fp16.resize(token_values);
+                    for (size_t i = 0; i < token_values; ++i) {
+                        row_fp16[i] = ggml_fp32_to_fp16(src[i]);
+                    }
+                    backend_tensor_set_view_aware(cache, row_fp16.data(), dst_offset, row_fp16.size() * sizeof(ggml_fp16_t));
+                } break;
+                default:
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    const size_t total_values = token_values * n_tokens;
+    if (idx_count != total_values || !ggml_is_contiguous(cache)) {
+        return false;
+    }
+
+    const size_t cache_values = ggml_nelements(cache);
+    if (cache_values == 0) {
+        return false;
+    }
+
+    if (cache->type == GGML_TYPE_F32) {
+        std::vector<float> dst_host;
+        float * dst = nullptr;
+        if (dst_base != nullptr) {
+            dst = reinterpret_cast<float *>(dst_base);
+        } else {
+            dst_host.resize(cache_values);
+            backend_tensor_get_view_aware(cache, dst_host.data(), 0, ggml_nbytes(cache));
+            dst = dst_host.data();
+        }
+        for (size_t i = 0; i < total_values; ++i) {
+            const int64_t slot = idx_base[i];
+            if (slot < 0 || static_cast<size_t>(slot) >= cache_values) {
+                return false;
+            }
+            dst[slot] = src_base[i];
+        }
+        if (dst_base == nullptr) {
+            backend_tensor_set_view_aware(cache, dst_host.data(), 0, ggml_nbytes(cache));
+        }
+        return true;
+    }
+
+    if (cache->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> dst_host;
+        ggml_fp16_t * dst = nullptr;
+        if (dst_base != nullptr) {
+            dst = reinterpret_cast<ggml_fp16_t *>(dst_base);
+        } else {
+            dst_host.resize(cache_values);
+            backend_tensor_get_view_aware(cache, dst_host.data(), 0, ggml_nbytes(cache));
+            dst = dst_host.data();
+        }
+        for (size_t i = 0; i < total_values; ++i) {
+            const int64_t slot = idx_base[i];
+            if (slot < 0 || static_cast<size_t>(slot) >= cache_values) {
+                return false;
+            }
+            dst[slot] = ggml_fp32_to_fp16(src_base[i]);
+        }
+        if (dst_base == nullptr) {
+            backend_tensor_set_view_aware(cache, dst_host.data(), 0, ggml_nbytes(cache));
+        }
+        return true;
+    }
+
+    return false;
 }
 
 }  // namespace
@@ -2044,10 +2622,60 @@ qnn_aot_runtime::aot_match_result qnn_aot_runtime::match_attention_graph(ggml_cg
     }
 
     const auto io = get_io_tensors_from_graph(cgraph);
-    for (auto * input : io.inputs) {
-        if (is_activation_input(input)) {
+    std::vector<ggml_tensor *> idx_inputs;
+    auto collect_external_input = [&](ggml_tensor * input) {
+        if (input == nullptr) {
+            return;
+        }
+        if (result.embd == nullptr && is_activation_input(input)) {
             result.embd = input;
-            break;
+        }
+        const char * name = ggml_get_name(input);
+        if (name != nullptr) {
+            if (std::strcmp(name, "self_kq_mask") == 0 || std::strcmp(name, "self_kq_mask_cnv") == 0) {
+                result.kq_mask = input;
+                return;
+            }
+            record_layer_cache_tensor(result.cache_k_layers, input, "cache_k_l");
+            record_layer_cache_tensor(result.cache_v_layers, input, "cache_v_l");
+        }
+
+        if (input->type == GGML_TYPE_I64 && ggml_n_dims(input) == 1) {
+            idx_inputs.push_back(input);
+        }
+    };
+
+    for (auto * input : io.inputs) {
+        collect_external_input(input);
+    }
+    for (int i = 0; i < cgraph->n_leafs; ++i) {
+        collect_external_input(cgraph->leafs[i]);
+    }
+
+    if (idx_inputs.size() >= 1) {
+        result.k_idxs = idx_inputs[0];
+        result.v_idxs = idx_inputs[0];
+    }
+    if (idx_inputs.size() >= 2) {
+        result.v_idxs = idx_inputs[1];
+    }
+
+    if (result.kq_mask == nullptr) {
+        result.kq_mask = ggml_graph_get_tensor(cgraph, "self_kq_mask");
+    }
+    if (result.kq_mask == nullptr) {
+        result.kq_mask = ggml_graph_get_tensor(cgraph, "self_kq_mask_cnv");
+    }
+    if (result.cache_k_layers.empty() || result.cache_v_layers.empty()) {
+        for (size_t layer = 0; layer < _config.model.n_layers; ++layer) {
+            if (result.cache_k_layers.count(layer) == 0) {
+                const std::string name = std::string("cache_k_l") + std::to_string(layer);
+                record_layer_cache_tensor(result.cache_k_layers, ggml_graph_get_tensor(cgraph, name.c_str()), "cache_k_l");
+            }
+            if (result.cache_v_layers.count(layer) == 0) {
+                const std::string name = std::string("cache_v_l") + std::to_string(layer);
+                record_layer_cache_tensor(result.cache_v_layers, ggml_graph_get_tensor(cgraph, name.c_str()), "cache_v_l");
+            }
         }
     }
 
@@ -2180,8 +2808,13 @@ qnn_aot_runtime::aot_match_result qnn_aot_runtime::match_attn_core_graph(ggml_cg
     }
     const bool trace_match = aot_trace_match_enabled();
 
+    auto is_residual_tail_name = [&](const char * name) {
+        return name != nullptr && has_prefix(name, "l_out-tail-");
+    };
+
     auto is_ffn_compute_stage_name = [&](const char * name) {
         return name != nullptr &&
+               !is_residual_tail_name(name) &&
                !has_prefix(name, "ffn_inp-") &&
                (has_prefix(name, "ffn") || has_prefix(name, "l_out-"));
     };
@@ -2234,6 +2867,19 @@ qnn_aot_runtime::aot_match_result qnn_aot_runtime::match_attn_core_graph(ggml_cg
     }
 
     if (!seen_core || !seen_core_out || seen_ffn_compute || layer_id == std::numeric_limits<size_t>::max()) {
+        if (trace_match) {
+            const char * first_name = cgraph->n_nodes > 0 ? ggml_get_name(cgraph->nodes[0]) : nullptr;
+            const char * last_name  = cgraph->n_nodes > 0 ? ggml_get_name(cgraph->nodes[cgraph->n_nodes - 1]) : nullptr;
+            std::fprintf(stderr,
+                         "[aot-match] attn_core reject-early: seen_core=%d seen_core_out=%d seen_ffn_compute=%d layer=%s n_nodes=%d first=%s last=%s\n",
+                         (int) seen_core,
+                         (int) seen_core_out,
+                         (int) seen_ffn_compute,
+                         layer_id != std::numeric_limits<size_t>::max() ? std::to_string(layer_id).c_str() : "<none>",
+                         cgraph->n_nodes,
+                         first_name ? first_name : "<null>",
+                         last_name ? last_name : "<null>");
+        }
         return result;
     }
 
@@ -2282,13 +2928,6 @@ qnn_aot_runtime::aot_match_result qnn_aot_runtime::match_attn_core_graph(ggml_cg
         }
     }
 
-    if (idx_inputs.size() >= 1) {
-        result.k_idxs = idx_inputs[0];
-    }
-    if (idx_inputs.size() >= 2) {
-        result.v_idxs = idx_inputs[1];
-    }
-
     if (ffn_inp_node != nullptr) {
         result.out = ffn_inp_node;
         for (size_t i = 0; i < GGML_MAX_SRC && ffn_inp_node->src[i]; ++i) {
@@ -2302,6 +2941,44 @@ qnn_aot_runtime::aot_match_result qnn_aot_runtime::match_attn_core_graph(ggml_cg
                 break;
             }
         }
+    }
+
+    size_t expected_idx_count = 0;
+    if (result.embd != nullptr) {
+        expected_idx_count = std::max<size_t>(1, static_cast<size_t>(result.embd->ne[1]));
+    } else if (result.out != nullptr) {
+        expected_idx_count = std::max<size_t>(1, static_cast<size_t>(result.out->ne[1]));
+    }
+
+    std::vector<ggml_tensor *> filtered_idx_inputs;
+    if (expected_idx_count > 0) {
+        filtered_idx_inputs.reserve(idx_inputs.size());
+        for (auto * idx_input : idx_inputs) {
+            if (idx_input != nullptr && ggml_n_dims(idx_input) == 1 &&
+                static_cast<size_t>(idx_input->ne[0]) == expected_idx_count) {
+                filtered_idx_inputs.push_back(idx_input);
+            }
+        }
+    }
+
+    const auto & selected_idx_inputs = filtered_idx_inputs.empty() ? idx_inputs : filtered_idx_inputs;
+    if (selected_idx_inputs.size() >= 1) {
+        result.k_idxs = selected_idx_inputs[0];
+        result.v_idxs = selected_idx_inputs[0];
+    }
+    if (selected_idx_inputs.size() >= 2) {
+        result.v_idxs = selected_idx_inputs[1];
+    }
+
+    if (trace_match && !idx_inputs.empty() && selected_idx_inputs.size() != idx_inputs.size()) {
+        std::fprintf(stderr,
+                     "[aot-match] attn_core filtered idx inputs: layer=%s expected=%zu before=%zu after=%zu first_after=%s second_after=%s\n",
+                     layer_id != std::numeric_limits<size_t>::max() ? std::to_string(layer_id).c_str() : "<none>",
+                     expected_idx_count,
+                     idx_inputs.size(),
+                     selected_idx_inputs.size(),
+                     selected_idx_inputs.size() >= 1 && ggml_get_name(selected_idx_inputs[0]) ? ggml_get_name(selected_idx_inputs[0]) : "<unnamed>",
+                     selected_idx_inputs.size() >= 2 && ggml_get_name(selected_idx_inputs[1]) ? ggml_get_name(selected_idx_inputs[1]) : "<unnamed>");
     }
 
     if (result.out == nullptr) {
@@ -2365,12 +3042,92 @@ qnn_aot_runtime::aot_match_result qnn_aot_runtime::match_transformer_graph(ggml_
     }
 
     const auto io = get_io_tensors_from_graph(cgraph);
-    for (auto * input : io.inputs) {
-        const char * name = ggml_get_name(input);
-        if (name && std::strcmp(name, "embd") == 0) {
-            result.embd = input;
-            break;
+    std::vector<ggml_tensor *> idx_inputs;
+    auto collect_external_input = [&](ggml_tensor * input) {
+        if (input == nullptr) {
+            return;
         }
+        const char * name = ggml_get_name(input);
+        if (result.embd == nullptr && name && std::strcmp(name, "embd") == 0) {
+            result.embd = input;
+        }
+
+        if (name != nullptr) {
+            if (std::strcmp(name, "self_kq_mask") == 0 || std::strcmp(name, "self_kq_mask_cnv") == 0) {
+                result.kq_mask = input;
+                return;
+            }
+            record_layer_cache_tensor(result.cache_k_layers, input, "cache_k_l");
+            record_layer_cache_tensor(result.cache_v_layers, input, "cache_v_l");
+        }
+
+        if (input->type == GGML_TYPE_I64 && ggml_n_dims(input) == 1) {
+            idx_inputs.push_back(input);
+        }
+    };
+
+    for (auto * input : io.inputs) {
+        collect_external_input(input);
+    }
+    for (int i = 0; i < cgraph->n_leafs; ++i) {
+        collect_external_input(cgraph->leafs[i]);
+    }
+
+    if (idx_inputs.size() >= 1) {
+        result.k_idxs = idx_inputs[0];
+        result.v_idxs = idx_inputs[0];
+    }
+    if (idx_inputs.size() >= 2) {
+        result.v_idxs = idx_inputs[1];
+    }
+
+    if (result.kq_mask == nullptr) {
+        result.kq_mask = ggml_graph_get_tensor(cgraph, "self_kq_mask");
+    }
+    if (result.kq_mask == nullptr) {
+        result.kq_mask = ggml_graph_get_tensor(cgraph, "self_kq_mask_cnv");
+    }
+    if (result.cache_k_layers.empty() || result.cache_v_layers.empty()) {
+        for (size_t layer = 0; layer < _config.model.n_layers; ++layer) {
+            if (result.cache_k_layers.count(layer) == 0) {
+                const std::string name = std::string("cache_k_l") + std::to_string(layer);
+                record_layer_cache_tensor(result.cache_k_layers, ggml_graph_get_tensor(cgraph, name.c_str()), "cache_k_l");
+            }
+            if (result.cache_v_layers.count(layer) == 0) {
+                const std::string name = std::string("cache_v_l") + std::to_string(layer);
+                record_layer_cache_tensor(result.cache_v_layers, ggml_graph_get_tensor(cgraph, name.c_str()), "cache_v_l");
+            }
+        }
+    }
+
+    if (aot_generic_kv_writeback_needed_for_phase_switch() &&
+        (result.kq_mask == nullptr || result.cache_k_layers.empty() || result.cache_v_layers.empty())) {
+        auto append_tensor_name = [](std::string & out, ggml_tensor * tensor) {
+            if (!out.empty()) {
+                out += ",";
+            }
+            const char * name = tensor ? ggml_get_name(tensor) : nullptr;
+            out += name != nullptr ? name : "<unnamed>";
+        };
+
+        std::string input_names;
+        for (auto * input : io.inputs) {
+            append_tensor_name(input_names, input);
+        }
+
+        std::string leaf_names;
+        for (int i = 0; i < cgraph->n_leafs; ++i) {
+            append_tensor_name(leaf_names, cgraph->leafs[i]);
+        }
+
+        QNN_LOG_INFO("[aot] transformer generic-KV discovery miss: kq_mask=%d k_idxs=%d v_idxs=%d cache_k_layers=%zu cache_v_layers=%zu inputs=[%s] leafs=[%s]\n",
+                     result.kq_mask != nullptr ? 1 : 0,
+                     result.k_idxs != nullptr ? 1 : 0,
+                     result.v_idxs != nullptr ? 1 : 0,
+                     result.cache_k_layers.size(),
+                     result.cache_v_layers.size(),
+                     input_names.c_str(),
+                     leaf_names.c_str());
     }
 
     if (seen_result_norm && norm_node != nullptr) {
@@ -3030,6 +3787,258 @@ void qnn_aot_runtime::save_kv(qnn_aot_graph & graph, size_t n_tokens) {
     }
 }
 
+bool qnn_aot_runtime::should_write_generic_kv(const aot_match_result & match) const {
+    return aot_generic_kv_writeback_needed_for_phase_switch() &&
+           match.n_tokens > 1 &&
+           match.kq_mask != nullptr &&
+           !match.cache_k_layers.empty() &&
+           !match.cache_v_layers.empty();
+}
+
+bool qnn_aot_runtime::should_defer_generic_kv_writeback() const {
+    return aot_generic_kv_writeback_needed_for_phase_switch();
+}
+
+bool qnn_aot_runtime::collect_generic_kv_from_graph(qnn_aot_graph & graph,
+                                                    const aot_match_result & match,
+                                                    size_t token_offset,
+                                                    size_t n_tokens,
+                                                    std::vector<pending_generic_kv_writeback_layer> & payloads) const {
+    std::vector<int64_t> inferred_slots;
+    if ((match.k_idxs == nullptr || match.v_idxs == nullptr) &&
+        !infer_current_token_slots_from_kq_mask(match.kq_mask,
+                                                match.n_tokens,
+                                                _config.model.attention_mask_value,
+                                                inferred_slots)) {
+        QNN_LOG_WARN("[aot] failed to infer current token slots for generic KV writeback: tokens=%zu\n",
+                     match.n_tokens);
+        return false;
+    }
+
+    std::vector<int64_t> k_idx_slice;
+    if (match.k_idxs != nullptr) {
+        if (!copy_i64_tensor_slice(match.k_idxs, token_offset, n_tokens, k_idx_slice)) {
+            QNN_LOG_WARN("[aot] failed to slice k_idxs for generic KV writeback: offset=%zu n_tokens=%zu total=%lld\n",
+                         token_offset, n_tokens, (long long) match.k_idxs->ne[0]);
+            return false;
+        }
+    } else {
+        k_idx_slice.assign(inferred_slots.begin() + token_offset, inferred_slots.begin() + token_offset + n_tokens);
+    }
+
+    std::vector<int64_t> v_idx_slice;
+    size_t v_indices_per_token = 1;
+    if (match.v_idxs != nullptr) {
+        const size_t total_v_indices = static_cast<size_t>(match.v_idxs->ne[0]);
+        const size_t total_match_tokens = std::max<size_t>(1, match.n_tokens);
+        if (total_v_indices == 0 || total_v_indices % total_match_tokens != 0) {
+            QNN_LOG_WARN("[aot] invalid v_idxs shape for generic KV writeback: total=%zu tokens=%zu\n",
+                         total_v_indices, total_match_tokens);
+            return false;
+        }
+
+        v_indices_per_token = total_v_indices / total_match_tokens;
+        if (!copy_i64_tensor_slice(match.v_idxs, token_offset * v_indices_per_token, n_tokens * v_indices_per_token, v_idx_slice)) {
+            QNN_LOG_WARN("[aot] failed to slice v_idxs for generic KV writeback: offset=%zu n_tokens=%zu per_token=%zu total=%lld\n",
+                         token_offset, n_tokens, v_indices_per_token, (long long) match.v_idxs->ne[0]);
+            return false;
+        }
+    } else {
+        v_idx_slice = k_idx_slice;
+    }
+
+    const auto & graph_config = graph.config();
+    for (size_t layer = graph_config.start_layer_id; layer < graph_config.end_layer_id; ++layer) {
+        auto cache_k_it = match.cache_k_layers.find(layer);
+        auto cache_v_it = match.cache_v_layers.find(layer);
+        if (cache_k_it == match.cache_k_layers.end() || cache_v_it == match.cache_v_layers.end()) {
+            QNN_LOG_WARN("[aot] missing generic KV tensors for layer=%zu during full-graph writeback\n", layer);
+            return false;
+        }
+
+        ggml_tensor * cache_k = cache_k_it->second;
+        ggml_tensor * cache_v = cache_v_it->second;
+        const size_t key_row_values = static_cast<size_t>(cache_k->ne[0]);
+        const size_t value_row_values = static_cast<size_t>(cache_v->ne[0]);
+        if (key_row_values == 0 || value_row_values == 0) {
+            QNN_LOG_WARN("[aot] empty generic KV tensor for layer=%zu during full-graph writeback\n", layer);
+            return false;
+        }
+
+        pending_generic_kv_writeback_layer payload;
+        payload.cache_k = cache_k;
+        payload.cache_v = cache_v;
+        payload.k_idxs = k_idx_slice;
+        payload.v_idxs = v_idx_slice;
+        payload.key_token_values = key_row_values;
+        payload.value_token_values = value_row_values;
+        payload.n_tokens = n_tokens;
+        payload.key_rows.assign(n_tokens * key_row_values, 0.0f);
+        payload.value_rows.assign(n_tokens * value_row_values, 0.0f);
+
+        size_t key_cursor = 0;
+        size_t value_cursor = 0;
+
+        for (size_t head = 0; head < _config.model.n_kv_heads; ++head) {
+            const auto key_out_name = std::string("layer_") + std::to_string(layer) + "_key_" + std::to_string(head);
+            const auto value_out_name = std::string("layer_") + std::to_string(layer) + "_value_" + std::to_string(head);
+
+            const auto * key_out = static_cast<const char *>(graph.buffer_data(key_out_name));
+            const auto * value_out = static_cast<const char *>(graph.buffer_data(value_out_name));
+            if (key_out == nullptr || value_out == nullptr) {
+                QNN_LOG_WARN("[aot] missing full-graph KV output buffers for layer=%zu head=%zu during generic KV writeback\n",
+                             layer, head);
+                return false;
+            }
+
+            const size_t graph_batch = std::max<size_t>(1, graph.batch_size());
+            const size_t key_total_bytes = graph.buffer_size(key_out_name);
+            const size_t value_total_bytes = graph.buffer_size(value_out_name);
+            if (key_total_bytes % graph_batch != 0 || value_total_bytes % graph_batch != 0) {
+                QNN_LOG_WARN("[aot] invalid full-graph KV output size for layer=%zu head=%zu during generic KV writeback\n",
+                             layer, head);
+                return false;
+            }
+
+            const Qnn_DataType_t key_dtype = graph.tensor_data_type(key_out_name);
+            const Qnn_DataType_t value_dtype = graph.tensor_data_type(value_out_name);
+            const size_t key_elem_size = qnn::qnn_datatype_size(key_dtype == QNN_DATATYPE_UNDEFINED ? QNN_DATATYPE_FLOAT_16 : key_dtype);
+            const size_t value_elem_size = qnn::qnn_datatype_size(value_dtype == QNN_DATATYPE_UNDEFINED ? QNN_DATATYPE_FLOAT_16 : value_dtype);
+            if ((key_elem_size != sizeof(float) && key_elem_size != sizeof(ggml_fp16_t)) ||
+                (value_elem_size != sizeof(float) && value_elem_size != sizeof(ggml_fp16_t))) {
+                QNN_LOG_WARN("[aot] unsupported full-graph KV output dtype for layer=%zu head=%zu during generic KV writeback: key=%s value=%s\n",
+                             layer, head,
+                             qnn::qnn_datatype_to_string(key_dtype),
+                             qnn::qnn_datatype_to_string(value_dtype));
+                return false;
+            }
+
+            const size_t key_head_values = key_total_bytes / (graph_batch * key_elem_size);
+            const size_t value_head_values = value_total_bytes / (graph_batch * value_elem_size);
+            if (key_cursor + key_head_values > key_row_values || value_cursor + value_head_values > value_row_values) {
+                QNN_LOG_WARN("[aot] generic KV row size mismatch for layer=%zu head=%zu during full-graph writeback: key_cursor=%zu key_head=%zu key_row=%zu value_cursor=%zu value_head=%zu value_row=%zu\n",
+                             layer, head,
+                             key_cursor, key_head_values, key_row_values,
+                             value_cursor, value_head_values, value_row_values);
+                return false;
+            }
+
+            for (size_t token = 0; token < n_tokens; ++token) {
+                const auto * key_src = key_out + token * key_head_values * key_elem_size;
+                const auto * value_src = value_out + token * value_head_values * value_elem_size;
+                float * key_dst = payload.key_rows.data() + token * key_row_values + key_cursor;
+                float * value_dst = payload.value_rows.data() + token * value_row_values + value_cursor;
+                for (size_t i = 0; i < key_head_values; ++i) {
+                    key_dst[i] = read_fp_value(key_src + i * key_elem_size, key_elem_size);
+                }
+                for (size_t i = 0; i < value_head_values; ++i) {
+                    value_dst[i] = read_fp_value(value_src + i * value_elem_size, value_elem_size);
+                }
+            }
+
+            key_cursor += key_head_values;
+            value_cursor += value_head_values;
+        }
+
+        if (key_cursor != key_row_values || value_cursor != value_row_values) {
+            QNN_LOG_WARN("[aot] incomplete generic KV row assembly for layer=%zu during full-graph writeback: key=%zu/%zu value=%zu/%zu\n",
+                         layer, key_cursor, key_row_values, value_cursor, value_row_values);
+            return false;
+        }
+
+        payloads.emplace_back(std::move(payload));
+    }
+
+    return true;
+}
+
+bool qnn_aot_runtime::stage_generic_kv_from_graph(qnn_aot_graph & graph,
+                                                  const aot_match_result & match,
+                                                  size_t token_offset,
+                                                  size_t n_tokens) {
+    if (token_offset == 0 && !_pending_generic_kv_writeback.empty()) {
+        _pending_generic_kv_writeback.clear();
+    }
+
+    if (!collect_generic_kv_from_graph(graph, match, token_offset, n_tokens, _pending_generic_kv_writeback)) {
+        return false;
+    }
+
+    if (aot_trace_bind_enabled()) {
+        const auto & graph_config = graph.config();
+        QNN_LOG_INFO("[aot] staged full-graph generic KV for deferred migration: layers=[%zu,%zu) offset=%zu tokens=%zu pending_layers=%zu\n",
+                     graph_config.start_layer_id,
+                     graph_config.end_layer_id,
+                     token_offset,
+                     n_tokens,
+                     _pending_generic_kv_writeback.size());
+    }
+
+    return true;
+}
+
+bool qnn_aot_runtime::write_generic_kv_from_graph(qnn_aot_graph & graph,
+                                                  const aot_match_result & match,
+                                                  size_t token_offset,
+                                                  size_t n_tokens) {
+    if (!aot_write_generic_kv_enabled() || n_tokens == 0) {
+        return true;
+    }
+
+    if (!should_write_generic_kv(match)) {
+        if (aot_trace_bind_enabled()) {
+            QNN_LOG_INFO("[aot] skip generic KV writeback: tokens=%zu match_tokens=%zu k_idxs=%d v_idxs=%d cache_k_layers=%zu cache_v_layers=%zu\n",
+                         n_tokens,
+                         match.n_tokens,
+                         match.k_idxs != nullptr ? 1 : 0,
+                         match.v_idxs != nullptr ? 1 : 0,
+                         match.cache_k_layers.size(),
+                         match.cache_v_layers.size());
+        }
+        return true;
+    }
+
+    if (should_defer_generic_kv_writeback()) {
+        return stage_generic_kv_from_graph(graph, match, token_offset, n_tokens);
+    }
+
+    std::vector<pending_generic_kv_writeback_layer> payloads;
+    if (!collect_generic_kv_from_graph(graph, match, token_offset, n_tokens, payloads)) {
+        return false;
+    }
+
+    for (size_t i = 0; i < payloads.size(); ++i) {
+        auto & payload = payloads[i];
+        if (!write_f32_host_token_block_to_cache(payload.cache_k,
+                                                 payload.key_rows.data(),
+                                                 payload.key_token_values,
+                                                 payload.n_tokens,
+                                                 payload.k_idxs.data(),
+                                                 payload.k_idxs.size()) ||
+            !write_f32_host_token_block_to_cache(payload.cache_v,
+                                                 payload.value_rows.data(),
+                                                 payload.value_token_values,
+                                                 payload.n_tokens,
+                                                 payload.v_idxs.data(),
+                                                 payload.v_idxs.size())) {
+            const size_t layer = graph.config().start_layer_id + i;
+            QNN_LOG_WARN("[aot] failed to write generic KV cache for layer=%zu during full-graph writeback\n", layer);
+            return false;
+        }
+    }
+
+    if (aot_trace_bind_enabled()) {
+        const auto & graph_config = graph.config();
+        QNN_LOG_INFO("[aot] wrote full-graph generic KV: layers=[%zu,%zu) offset=%zu tokens=%zu\n",
+                     graph_config.start_layer_id,
+                     graph_config.end_layer_id,
+                     token_offset,
+                     n_tokens);
+    }
+
+    return true;
+}
+
 std::string qnn_aot_runtime::resolve_model_path(const std::string & relative_path) const {
     std::filesystem::path rel_path(relative_path);
     if (rel_path.is_absolute()) {
@@ -3371,6 +4380,9 @@ bool qnn_aot_runtime::execute_attention(ggml_cgraph * cgraph, const aot_match_re
 
         copy_contiguous_rows_to_ggml(match.out, offset, step, embed_dim, out_buffer);
         save_kv(*graph, step);
+        if (!write_generic_kv_from_graph(*graph, match, offset, step)) {
+            return false;
+        }
 
         _kv_position += step;
         offset += step;
@@ -3439,6 +4451,9 @@ bool qnn_aot_runtime::execute_transformer(ggml_cgraph * cgraph, const aot_match_
         copy_contiguous_rows_to_ggml(match.out, offset, step, embed_dim, out_buffer);
 
         save_kv(*graph, step);
+        if (!write_generic_kv_from_graph(*graph, match, offset, step)) {
+            return false;
+        }
 
         _kv_position += step;
         offset += step;
@@ -3552,9 +4567,14 @@ bool qnn_aot_runtime::execute_attn_proj(ggml_cgraph * cgraph, const aot_match_re
 
         const size_t dst_row_bytes = ggml_nbytes(tensor) / match.n_tokens;
         const size_t src_row_bytes = graph->buffer_size(name) / graph->batch_size();
-        auto *       dst           = static_cast<char *>(tensor->data) + row_offset * dst_row_bytes;
         const auto * src           = static_cast<const char *>(graph->buffer_data(name));
-        std::memcpy(dst, src, n_rows * src_row_bytes);
+
+        if (tensor_has_host_accessible_data(tensor)) {
+            auto * dst = static_cast<char *>(tensor->data) + row_offset * dst_row_bytes;
+            std::memcpy(dst, src, n_rows * src_row_bytes);
+        } else {
+            backend_tensor_set_view_aware(tensor, src, row_offset * dst_row_bytes, n_rows * src_row_bytes);
+        }
         return true;
     };
 
@@ -3599,8 +4619,26 @@ bool qnn_aot_runtime::execute_attn_proj(ggml_cgraph * cgraph, const aot_match_re
 bool qnn_aot_runtime::execute_attn_core(ggml_cgraph * cgraph, const aot_match_result & match) {
     GGML_UNUSED(cgraph);
     auto * graph = select_attn_core_graph(match.n_tokens, match.layer_id);
-    if (!graph || !match.embd || !match.q_out ||
-        !match.cache_k || !match.cache_v || !match.kq_mask || !match.out) {
+    if (graph == nullptr) {
+        std::fprintf(stderr,
+                     "[aot] execute_attn_core missing graph: layer=%zu tokens=%zu available_graphs=%zu\n",
+                     match.layer_id,
+                     match.n_tokens,
+                     _config.attn_core_graphs.size());
+        return false;
+    }
+
+    if (!match.embd || !match.q_out || !match.cache_k || !match.cache_v || !match.kq_mask || !match.out) {
+        std::fprintf(stderr,
+                     "[aot] execute_attn_core missing tensors: layer=%zu tokens=%zu embd=%p q=%p cache_k=%p cache_v=%p mask=%p out=%p\n",
+                     match.layer_id,
+                     match.n_tokens,
+                     (void *) match.embd,
+                     (void *) match.q_out,
+                     (void *) match.cache_k,
+                     (void *) match.cache_v,
+                     (void *) match.kq_mask,
+                     (void *) match.out);
         return false;
     }
 
@@ -3922,6 +4960,17 @@ bool qnn_aot_runtime::execute_attn_core(ggml_cgraph * cgraph, const aot_match_re
 
     const bool ok = graph->execute();
     if (!ok) {
+        std::fprintf(stderr,
+                     "[aot] execute_attn_core graph->execute failed: layer=%zu tokens=%zu graph=%s model=%s batch=%zu out_bound=%d q_bound=%d cache_k_bound=%d cache_v_bound=%d\n",
+                     match.layer_id,
+                     match.n_tokens,
+                     config.graph_name.c_str(),
+                     config.model_path.c_str(),
+                     graph->batch_size(),
+                     bound_out ? 1 : 0,
+                     bound_q ? 1 : 0,
+                     bound_cache_k ? 1 : 0,
+                     bound_cache_v ? 1 : 0);
         graph->clear_external_tensor_bindings();
         return false;
     }
@@ -3929,6 +4978,13 @@ bool qnn_aot_runtime::execute_attn_core(ggml_cgraph * cgraph, const aot_match_re
     if (!bound_out) {
         auto * out_buffer = static_cast<float *>(graph->buffer_data(config.out_name));
         if (out_buffer == nullptr) {
+            std::fprintf(stderr,
+                         "[aot] execute_attn_core missing output buffer: layer=%zu tokens=%zu graph=%s out=%s model=%s\n",
+                         match.layer_id,
+                         match.n_tokens,
+                         config.graph_name.c_str(),
+                         config.out_name.c_str(),
+                         config.model_path.c_str());
             graph->clear_external_tensor_bindings();
             return false;
         }
@@ -3990,6 +5046,20 @@ bool qnn_aot_runtime::execute_attn_core(ggml_cgraph * cgraph, const aot_match_re
             const std::string k_idxs_desc  = describe_tensor(match.k_idxs);
             const std::string v_idxs_desc  = describe_tensor(match.v_idxs);
 
+            std::fprintf(stderr,
+                         "[aot] execute_attn_core KV writeback failed: layer=%zu wrote_k=%d wrote_v=%d graph=%s cache_k={%s} cache_v={%s} kcur={%s} vcur={%s} k_idxs={%s first=%lld} v_idxs={%s first=%lld}\n",
+                         match.layer_id,
+                         wrote_k ? 1 : 0,
+                         wrote_v ? 1 : 0,
+                         config.graph_name.c_str(),
+                         cache_k_desc.c_str(),
+                         cache_v_desc.c_str(),
+                         cur_k_desc.c_str(),
+                         cur_v_desc.c_str(),
+                         k_idxs_desc.c_str(),
+                         (long long) k_idx0,
+                         v_idxs_desc.c_str(),
+                         (long long) v_idx0);
             QNN_LOG_WARN("[aot] attn_core failed to update shared KV cache for layer=%zu wrote_k=%d wrote_v=%d cache_k={%s} cache_v={%s} kcur={%s} vcur={%s} k_idxs={%s first=%lld} v_idxs={%s first=%lld}\n",
                          match.layer_id,
                          wrote_k ? 1 : 0,
@@ -4005,6 +5075,14 @@ bool qnn_aot_runtime::execute_attn_core(ggml_cgraph * cgraph, const aot_match_re
             return false;
         }
     } else if ((match.k_out != nullptr || match.v_out != nullptr || match.k_idxs != nullptr || match.v_idxs != nullptr)) {
+        std::fprintf(stderr,
+                     "[aot] execute_attn_core missing KV writeback inputs: layer=%zu graph=%s k=%p v=%p k_idxs=%p v_idxs=%p\n",
+                     match.layer_id,
+                     config.graph_name.c_str(),
+                     (void *) cache_write_k,
+                     (void *) cache_write_v,
+                     (void *) match.k_idxs,
+                     (void *) match.v_idxs);
         QNN_LOG_WARN("[aot] attn_core missing explicit KV writeback inputs for layer=%zu k=%p v=%p k_idxs=%p v_idxs=%p\n",
                      match.layer_id,
                      (void *) cache_write_k,
@@ -4255,20 +5333,60 @@ bool qnn_aot_runtime::execute_fragment_view(ggml_cgraph * cgraph, int i0, int i1
     }
 
     ggml_cgraph view = ggml_graph_view(cgraph, i0, i1);
+    const bool   trace_match = aot_trace_match_enabled();
+    const char * first_name  = view.n_nodes > 0 ? ggml_get_name(view.nodes[0]) : nullptr;
+    const char * last_name   = view.n_nodes > 0 ? ggml_get_name(view.nodes[view.n_nodes - 1]) : nullptr;
 
     const auto attn_proj_match = match_attn_proj_graph(&view);
     if (attn_proj_match.is_attn_proj) {
-        return execute_attn_proj(&view, attn_proj_match);
+        const bool ok = execute_attn_proj(&view, attn_proj_match);
+        if (trace_match) {
+            std::fprintf(stderr,
+                         "[aot] fragment execute attn_proj: nodes=[%d,%d) first=%s last=%s layer=%zu tokens=%zu ok=%d\n",
+                         i0,
+                         i1,
+                         first_name ? first_name : "<null>",
+                         last_name ? last_name : "<null>",
+                         attn_proj_match.layer_id,
+                         attn_proj_match.n_tokens,
+                         ok ? 1 : 0);
+        }
+        return ok;
     }
 
     const auto attn_core_match = match_attn_core_graph(&view);
     if (attn_core_match.is_attn_core) {
-        return execute_attn_core(&view, attn_core_match);
+        const bool ok = execute_attn_core(&view, attn_core_match);
+        if (trace_match) {
+            std::fprintf(stderr,
+                         "[aot] fragment execute attn_core: nodes=[%d,%d) first=%s last=%s layer=%zu tokens=%zu ok=%d\n",
+                         i0,
+                         i1,
+                         first_name ? first_name : "<null>",
+                         last_name ? last_name : "<null>",
+                         attn_core_match.layer_id,
+                         attn_core_match.n_tokens,
+                         ok ? 1 : 0);
+        }
+        return ok;
     }
 
     const auto attention_match = match_attention_graph(&view);
     if (attention_match.is_attention) {
-        return execute_attention(&view, attention_match);
+        const bool ok = execute_attention(&view, attention_match);
+        if (trace_match) {
+            std::fprintf(stderr,
+                         "[aot] fragment execute attention: nodes=[%d,%d) first=%s last=%s layers=[%zu,%zu) tokens=%zu ok=%d\n",
+                         i0,
+                         i1,
+                         first_name ? first_name : "<null>",
+                         last_name ? last_name : "<null>",
+                         attention_match.start_layer_id,
+                         attention_match.end_layer_id,
+                         attention_match.n_tokens,
+                         ok ? 1 : 0);
+        }
+        return ok;
     }
 
     const auto transformer_match = match_transformer_graph(&view);
@@ -4278,10 +5396,9 @@ bool qnn_aot_runtime::execute_fragment_view(ggml_cgraph * cgraph, int i0, int i1
 
     const auto ffn_match = match_ffn_graph(&view);
     if (ffn_match.is_ffn) {
-        if (aot_trace_match_enabled()) {
-            const char * first_name = view.n_nodes > 0 ? ggml_get_name(view.nodes[0]) : nullptr;
-            const char * last_name  = view.n_nodes > 0 ? ggml_get_name(view.nodes[view.n_nodes - 1]) : nullptr;
-            QNN_LOG_INFO("[aot] fragment execute ffn: nodes=[%d,%d) first=%s last=%s layer=%zu tokens=%zu\n",
+        if (trace_match) {
+            std::fprintf(stderr,
+                         "[aot] fragment execute ffn: nodes=[%d,%d) first=%s last=%s layer=%zu tokens=%zu\n",
                          i0,
                          i1,
                          first_name ? first_name : "<null>",
@@ -4290,8 +5407,9 @@ bool qnn_aot_runtime::execute_fragment_view(ggml_cgraph * cgraph, int i0, int i1
                          ffn_match.n_tokens);
         }
         const bool ok = execute_ffn(&view, ffn_match);
-        if (aot_trace_match_enabled()) {
-            QNN_LOG_INFO("[aot] fragment execute ffn result: nodes=[%d,%d) layer=%zu ok=%d\n",
+        if (trace_match) {
+            std::fprintf(stderr,
+                         "[aot] fragment execute ffn result: nodes=[%d,%d) layer=%zu ok=%d\n",
                          i0,
                          i1,
                          ffn_match.layer_id,
@@ -4305,10 +5423,9 @@ bool qnn_aot_runtime::execute_fragment_view(ggml_cgraph * cgraph, int i0, int i1
         return execute_lm_head(&view, lm_head_match);
     }
 
-    if (aot_trace_match_enabled()) {
-        const char * first_name = view.n_nodes > 0 ? ggml_get_name(view.nodes[0]) : nullptr;
-        const char * last_name  = view.n_nodes > 0 ? ggml_get_name(view.nodes[view.n_nodes - 1]) : nullptr;
-        QNN_LOG_INFO("[aot] fragment view unmatched: nodes=[%d,%d) first=%s last=%s\n",
+    if (trace_match) {
+        std::fprintf(stderr,
+                     "[aot] fragment view unmatched: nodes=[%d,%d) first=%s last=%s\n",
                      i0,
                      i1,
                      first_name ? first_name : "<null>",
@@ -4395,20 +5512,51 @@ bool qnn_aot_runtime::try_execute_fragmented_transformer(ggml_cgraph * cgraph) {
     if (aot_trace_match_enabled()) {
         const char * first_name = cgraph->n_nodes > 0 ? ggml_get_name(cgraph->nodes[0]) : nullptr;
         const char * last_name  = cgraph->n_nodes > 0 ? ggml_get_name(cgraph->nodes[cgraph->n_nodes - 1]) : nullptr;
-        QNN_LOG_INFO("[aot] decompose transformer cgraph into %zu fragment chains: first=%s last=%s\n",
+        std::fprintf(stderr,
+                     "[aot] decompose transformer cgraph into %zu fragment chains: first=%s last=%s\n",
                      layers.size(),
                      first_name ? first_name : "<null>",
                      last_name ? last_name : "<null>");
     }
 
     for (const auto & bounds : layers) {
+        if (aot_trace_match_enabled()) {
+            std::fprintf(stderr,
+                         "[aot] layer fragment bounds: layer=%zu begin=%d core_begin=%d ffn_inp=%d l_out=%d\n",
+                         bounds.layer_id,
+                         bounds.begin,
+                         bounds.core_begin,
+                         bounds.ffn_inp,
+                         bounds.l_out);
+        }
         if (!execute_fragment_view(cgraph, bounds.begin, bounds.core_begin)) {
+            if (aot_trace_match_enabled()) {
+                std::fprintf(stderr,
+                             "[aot] layer=%zu fragment stage=attn_proj failed: nodes=[%d,%d)\n",
+                             bounds.layer_id,
+                             bounds.begin,
+                             bounds.core_begin);
+            }
             return false;
         }
         if (!execute_fragment_view(cgraph, bounds.core_begin, bounds.ffn_inp + 1)) {
+            if (aot_trace_match_enabled()) {
+                std::fprintf(stderr,
+                             "[aot] layer=%zu fragment stage=attn_core failed: nodes=[%d,%d)\n",
+                             bounds.layer_id,
+                             bounds.core_begin,
+                             bounds.ffn_inp + 1);
+            }
             return false;
         }
         if (!execute_fragment_view(cgraph, bounds.ffn_inp + 1, bounds.l_out + 1)) {
+            if (aot_trace_match_enabled()) {
+                std::fprintf(stderr,
+                             "[aot] layer=%zu fragment stage=ffn failed: nodes=[%d,%d)\n",
+                             bounds.layer_id,
+                             bounds.ffn_inp + 1,
+                             bounds.l_out + 1);
+            }
             return false;
         }
     }
@@ -4459,12 +5607,95 @@ bool qnn_aot_runtime::maybe_execute(ggml_cgraph * cgraph) {
         }
 
         const auto io = get_io_tensors_from_graph(graph);
-        for (auto * input : io.inputs) {
-            const char * name = ggml_get_name(input);
-            if (name && std::strcmp(name, "embd") == 0) {
-                combined.transformer.embd = input;
-                break;
+        std::vector<ggml_tensor *> idx_inputs;
+        auto collect_transformer_external_input = [&](ggml_tensor * input) {
+            if (input == nullptr) {
+                return;
             }
+
+            const char * name = ggml_get_name(input);
+            if (combined.transformer.embd == nullptr && name && std::strcmp(name, "embd") == 0) {
+                combined.transformer.embd = input;
+            }
+
+            if (name != nullptr) {
+                if (std::strcmp(name, "self_kq_mask") == 0 || std::strcmp(name, "self_kq_mask_cnv") == 0) {
+                    combined.transformer.kq_mask = input;
+                    return;
+                }
+                record_layer_cache_tensor(combined.transformer.cache_k_layers, input, "cache_k_l");
+                record_layer_cache_tensor(combined.transformer.cache_v_layers, input, "cache_v_l");
+            }
+
+            if (input->type == GGML_TYPE_I64 && ggml_n_dims(input) == 1) {
+                idx_inputs.push_back(input);
+            }
+        };
+
+        for (auto * input : io.inputs) {
+            collect_transformer_external_input(input);
+        }
+        for (int i = 0; i < graph->n_leafs; ++i) {
+            collect_transformer_external_input(graph->leafs[i]);
+        }
+
+        if (idx_inputs.size() >= 1) {
+            combined.transformer.k_idxs = idx_inputs[0];
+            combined.transformer.v_idxs = idx_inputs[0];
+        }
+        if (idx_inputs.size() >= 2) {
+            combined.transformer.v_idxs = idx_inputs[1];
+        }
+
+        if (combined.transformer.kq_mask == nullptr) {
+            combined.transformer.kq_mask = ggml_graph_get_tensor(graph, "self_kq_mask");
+        }
+        if (combined.transformer.kq_mask == nullptr) {
+            combined.transformer.kq_mask = ggml_graph_get_tensor(graph, "self_kq_mask_cnv");
+        }
+        if (combined.transformer.cache_k_layers.empty() || combined.transformer.cache_v_layers.empty()) {
+            for (size_t layer = 0; layer < _config.model.n_layers; ++layer) {
+                if (combined.transformer.cache_k_layers.count(layer) == 0) {
+                    const std::string name = std::string("cache_k_l") + std::to_string(layer);
+                    record_layer_cache_tensor(combined.transformer.cache_k_layers, ggml_graph_get_tensor(graph, name.c_str()), "cache_k_l");
+                }
+                if (combined.transformer.cache_v_layers.count(layer) == 0) {
+                    const std::string name = std::string("cache_v_l") + std::to_string(layer);
+                    record_layer_cache_tensor(combined.transformer.cache_v_layers, ggml_graph_get_tensor(graph, name.c_str()), "cache_v_l");
+                }
+            }
+        }
+
+        if (aot_generic_kv_writeback_needed_for_phase_switch() &&
+            (combined.transformer.kq_mask == nullptr ||
+             combined.transformer.cache_k_layers.empty() ||
+             combined.transformer.cache_v_layers.empty())) {
+            auto append_tensor_name = [](std::string & out, ggml_tensor * tensor) {
+                if (!out.empty()) {
+                    out += ",";
+                }
+                const char * name = tensor ? ggml_get_name(tensor) : nullptr;
+                out += name != nullptr ? name : "<unnamed>";
+            };
+
+            std::string input_names;
+            for (auto * input : io.inputs) {
+                append_tensor_name(input_names, input);
+            }
+
+            std::string leaf_names;
+            for (int i = 0; i < graph->n_leafs; ++i) {
+                append_tensor_name(leaf_names, graph->leafs[i]);
+            }
+
+            QNN_LOG_INFO("[aot] combined transformer generic-KV discovery miss: kq_mask=%d k_idxs=%d v_idxs=%d cache_k_layers=%zu cache_v_layers=%zu inputs=[%s] leafs=[%s]\n",
+                         combined.transformer.kq_mask != nullptr ? 1 : 0,
+                         combined.transformer.k_idxs != nullptr ? 1 : 0,
+                         combined.transformer.v_idxs != nullptr ? 1 : 0,
+                         combined.transformer.cache_k_layers.size(),
+                         combined.transformer.cache_v_layers.size(),
+                         input_names.c_str(),
+                         leaf_names.c_str());
         }
 
         if (seen_result_norm && norm_node != nullptr) {
@@ -4638,9 +5869,47 @@ bool qnn_aot_runtime::maybe_execute(ggml_cgraph * cgraph) {
     return false;
 }
 
+bool qnn_aot_runtime::has_pending_generic_kv_writeback() const {
+    return !_pending_generic_kv_writeback.empty();
+}
+
+bool qnn_aot_runtime::flush_pending_generic_kv_writeback() {
+    if (_pending_generic_kv_writeback.empty()) {
+        return true;
+    }
+
+    for (size_t i = 0; i < _pending_generic_kv_writeback.size(); ++i) {
+        auto & payload = _pending_generic_kv_writeback[i];
+        if (!write_f32_host_token_block_to_cache(payload.cache_k,
+                                                 payload.key_rows.data(),
+                                                 payload.key_token_values,
+                                                 payload.n_tokens,
+                                                 payload.k_idxs.data(),
+                                                 payload.k_idxs.size()) ||
+            !write_f32_host_token_block_to_cache(payload.cache_v,
+                                                 payload.value_rows.data(),
+                                                 payload.value_token_values,
+                                                 payload.n_tokens,
+                                                 payload.v_idxs.data(),
+                                                 payload.v_idxs.size())) {
+            QNN_LOG_WARN("[aot] deferred generic KV migration flush failed at pending_index=%zu\n", i);
+            return false;
+        }
+    }
+
+    if (aot_trace_bind_enabled()) {
+        QNN_LOG_INFO("[aot] flushed deferred generic KV migration: pending_layers=%zu\n",
+                     _pending_generic_kv_writeback.size());
+    }
+
+    _pending_generic_kv_writeback.clear();
+    return true;
+}
+
 void qnn_aot_runtime::reset_state() {
     zero_transformer_state();
     _kv_position = 0;
+    _pending_generic_kv_writeback.clear();
     if (_seed_kv_size > 0 && load_seed_kv()) {
         _kv_position = _seed_kv_size;
     }

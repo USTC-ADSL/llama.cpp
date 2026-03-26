@@ -321,6 +321,124 @@ bool is_aot_trace_name(const char * name) {
            std::strcmp(name, "result_output") == 0;
 }
 
+bool tensor_has_named_ancestor(const ggml_tensor * tensor, int depth, const char * prefix) {
+    if (tensor == nullptr || depth < 0 || prefix == nullptr) {
+        return false;
+    }
+
+    const char * name = ggml_get_name(tensor);
+    if (name != nullptr && std::strncmp(name, prefix, std::strlen(prefix)) == 0) {
+        return true;
+    }
+
+    for (size_t i = 0; i < GGML_MAX_SRC && tensor->src[i]; ++i) {
+        if (tensor_has_named_ancestor(tensor->src[i], depth - 1, prefix)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool op_has_ffn_lineage_norm(const ggml_tensor * op) {
+    if (op == nullptr) {
+        return false;
+    }
+
+    const char * name = ggml_get_name(op);
+    if (name == nullptr || std::strncmp(name, "norm-", 5) != 0) {
+        return false;
+    }
+
+    return tensor_has_named_ancestor(op->src[0], 2, "ffn_inp-");
+}
+
+bool is_routed_attn_proj_stage_op(const ggml_tensor * op) {
+    const char * name = ggml_get_name(op);
+    if (name == nullptr) {
+        return false;
+    }
+
+    return ((std::strncmp(name, "norm-", 5) == 0) && !op_has_ffn_lineage_norm(op)) ||
+           std::strncmp(name, "attn_norm-", 10) == 0 ||
+           std::strncmp(name, "Qcur-", 5) == 0 ||
+           std::strncmp(name, "Qcur_normed-", 12) == 0 ||
+           std::strncmp(name, "Kcur-", 5) == 0 ||
+           std::strncmp(name, "Kcur_normed-", 12) == 0 ||
+           std::strncmp(name, "Vcur-", 5) == 0;
+}
+
+bool is_routed_attn_core_stage_op(const ggml_tensor * op) {
+    const char * name = ggml_get_name(op);
+    if (name == nullptr) {
+        return false;
+    }
+
+    return std::strncmp(name, "__fattn__-", 10) == 0 ||
+           std::strncmp(name, "fattn", 5) == 0 ||
+           std::strncmp(name, "cache_k_", 8) == 0 ||
+           std::strncmp(name, "cache_v_", 8) == 0 ||
+           std::strncmp(name, "kq-", 3) == 0 ||
+           std::strncmp(name, "kq_soft_max-", 12) == 0 ||
+           std::strncmp(name, "kqv-", 4) == 0 ||
+           std::strncmp(name, "kqv_out-", 8) == 0 ||
+           std::strncmp(name, "v_cont-", 7) == 0 ||
+           std::strcmp(name, "self_kq_mask_cnv") == 0 ||
+           std::strcmp(name, "self_kq_mask_swa_cnv") == 0;
+}
+
+bool is_routed_attn_out_stage_op(const ggml_tensor * op) {
+    const char * name = ggml_get_name(op);
+    if (name == nullptr) {
+        return false;
+    }
+
+    return std::strncmp(name, "attn_out-", 9) == 0 ||
+           std::strncmp(name, "ffn_inp-", 8) == 0;
+}
+
+bool is_routed_ffn_stage_op(const ggml_tensor * op) {
+    const char * name = ggml_get_name(op);
+    if (name == nullptr) {
+        return false;
+    }
+
+    return (((std::strncmp(name, "ffn", 3) == 0) && std::strncmp(name, "ffn_inp-", 8) != 0) ||
+            std::strncmp(name, "l_out-", 6) == 0) ||
+           op_has_ffn_lineage_norm(op);
+}
+
+std::string route_backend_for_transformer_stage_op(const hetero_route_spec & route, const ggml_tensor * op) {
+    if (is_routed_attn_out_stage_op(op)) {
+        if (!route.attn_out.empty()) {
+            return route.attn_out;
+        }
+        if (!route.attn_core.empty()) {
+            return route.attn_core;
+        }
+        return route.attn;
+    }
+
+    if (is_routed_attn_core_stage_op(op)) {
+        return !route.attn_core.empty() ? route.attn_core : route.attn;
+    }
+
+    if (is_routed_attn_proj_stage_op(op)) {
+        return !route.attn_proj.empty() ? route.attn_proj : route.attn;
+    }
+
+    if (is_routed_ffn_stage_op(op)) {
+        return route.ffn;
+    }
+
+    return {};
+}
+
+bool route_requests_qnn_for_transformer_stage_op(const hetero_route_spec & route, const ggml_tensor * op) {
+    const std::string backend = route_backend_for_transformer_stage_op(route, op);
+    return !backend.empty() && normalized_backend_is_qnn(backend.c_str());
+}
+
 bool is_aot_transformer_stage_name(const char * name) {
     if (name == nullptr) {
         return false;
@@ -923,22 +1041,28 @@ namespace qnn {
 
 bool device_supports_op(qnn::ggml_backend_qnn_device_context * ctx, const ggml_tensor * op) {
     // Note that this function could be called before the device context is initialized
+    // Keep leaf tensors assignable even during bootstrap correction. They are not
+    // executable ops, but the scheduler still needs to recognize their pre-allocated
+    // QNN buffers while the correction pass temporarily disables QNN execution.
+    if (op->op == GGML_OP_NONE) {
+        trace_aot_support(op, "none", true);
+        return true;
+    }
+
     if (qnn_backend_temporarily_disabled()) {
         trace_aot_support(op, "env-disabled", false);
         return false;
     }
 
-    if (op->op == GGML_OP_NONE) {
-        trace_aot_support(op, "none", true);
-        return true;
-    }
+    const bool mixed_stage_requested = hetero_mixed_stage_requested();
+    const hetero_route_spec mixed_route = mixed_stage_requested ? parse_hetero_route_from_env() : hetero_route_spec {};
 
     const bool qnn_backend_initialized = qnn_backend_initialized_for_aot(ctx);
     if (ctx && ctx->device == QNN_BACKEND_NPU &&
         qnn_backend_initialized &&
         ctx->aot_runtime == nullptr &&
         aot_env_enabled() &&
-        hetero_mixed_stage_requested() &&
+        mixed_stage_requested &&
         op_touches_aot_stage_boundary(op)) {
         warn_mixed_stage_aot_runtime_unavailable_once();
         trace_aot_support(op, "aot-runtime-unavailable", false);
@@ -962,7 +1086,8 @@ bool device_supports_op(qnn::ggml_backend_qnn_device_context * ctx, const ggml_t
     }
 
     if (ctx && ctx->device == QNN_BACKEND_CPU &&
-        aot_env_enabled() && hetero_mixed_stage_requested() && aot_mixed_stage_guard_enabled() &&
+        aot_env_enabled() && mixed_stage_requested && aot_mixed_stage_guard_enabled() &&
+        route_requests_qnn_for_transformer_stage_op(mixed_route, op) &&
         !route_explicitly_requests_qnn_cpu() &&
         op_touches_aot_stage_boundary(op)) {
         warn_mixed_stage_qnn_cpu_guard_once();
@@ -975,10 +1100,13 @@ bool device_supports_op(qnn::ggml_backend_qnn_device_context * ctx, const ggml_t
     }
 
     if (ctx && ctx->device == QNN_BACKEND_NPU && ctx->aot_mode &&
-        hetero_mixed_stage_requested() && aot_mixed_stage_guard_enabled() &&
+        mixed_stage_requested && aot_mixed_stage_guard_enabled() &&
         is_aot_transformer_stage_name(ggml_get_name(op)) &&
-        (!ctx->aot_runtime ||
-         (!ctx->aot_runtime->supports_op(op) && !ctx->aot_runtime->supports_fragment_op(op)))) {
+        route_requests_qnn_for_transformer_stage_op(mixed_route, op) &&
+        ctx->aot_runtime != nullptr &&
+        !ctx->aot_runtime->prefers_cpu_op(op) &&
+        !ctx->aot_runtime->supports_op(op) &&
+        !ctx->aot_runtime->supports_fragment_op(op)) {
         warn_mixed_stage_aot_guard_once();
         trace_aot_support(op, "aot-mixed-stage-guard", false);
 #ifndef NDEBUG

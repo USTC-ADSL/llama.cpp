@@ -141,6 +141,8 @@ class qnn_aot_runtime {
     bool supports_fragment_op(const ggml_tensor * op) const;
     bool prefers_cpu_op(const ggml_tensor * op) const;
     bool maybe_execute(ggml_cgraph * cgraph);
+    bool has_pending_generic_kv_writeback() const;
+    bool flush_pending_generic_kv_writeback();
     void reset_state();
 
     bool is_enabled() const { return _enabled; }
@@ -167,6 +169,8 @@ class qnn_aot_runtime {
         ggml_tensor * kq_mask = nullptr;
         ggml_tensor * k_idxs = nullptr;
         ggml_tensor * v_idxs = nullptr;
+        std::map<size_t, ggml_tensor *> cache_k_layers;
+        std::map<size_t, ggml_tensor *> cache_v_layers;
         size_t        n_tokens = 0;
         size_t        inferred_pos = 0;
         size_t        start_layer_id = 0;
@@ -178,6 +182,18 @@ class qnn_aot_runtime {
         bool          is_transformer = false;
         bool          is_ffn         = false;
         bool          is_lm_head     = false;
+    };
+
+    struct pending_generic_kv_writeback_layer {
+        ggml_tensor * cache_k = nullptr;
+        ggml_tensor * cache_v = nullptr;
+        std::vector<int64_t> k_idxs;
+        std::vector<int64_t> v_idxs;
+        std::vector<float>   key_rows;
+        std::vector<float>   value_rows;
+        size_t               key_token_values = 0;
+        size_t               value_token_values = 0;
+        size_t               n_tokens = 0;
     };
 
     static bool has_prefix(const char * name, const char * prefix);
@@ -224,6 +240,15 @@ class qnn_aot_runtime {
     void fill_rope_embeds(qnn_aot_graph & graph, size_t start_pos, size_t n_tokens);
     void fill_attention_bias(qnn_aot_graph & graph, size_t n_tokens);
     void save_kv(qnn_aot_graph & graph, size_t n_tokens);
+    bool should_write_generic_kv(const aot_match_result & match) const;
+    bool should_defer_generic_kv_writeback() const;
+    bool collect_generic_kv_from_graph(qnn_aot_graph & graph,
+                                       const aot_match_result & match,
+                                       size_t token_offset,
+                                       size_t n_tokens,
+                                       std::vector<pending_generic_kv_writeback_layer> & payloads) const;
+    bool stage_generic_kv_from_graph(qnn_aot_graph & graph, const aot_match_result & match, size_t token_offset, size_t n_tokens);
+    bool write_generic_kv_from_graph(qnn_aot_graph & graph, const aot_match_result & match, size_t token_offset, size_t n_tokens);
     bool load_seed_kv();
     std::string resolve_model_path(const std::string & relative_path) const;
 
@@ -253,6 +278,7 @@ class qnn_aot_runtime {
     size_t _kv_position = 0;
     size_t _seed_kv_size = 0;
     bool _seed_kv_missing_warned = false;
+    std::vector<pending_generic_kv_writeback_layer> _pending_generic_kv_writeback;
 };
 
 }  // namespace qnn

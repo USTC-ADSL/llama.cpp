@@ -263,6 +263,30 @@ void ggml_backend_qnn_free(ggml_backend_t backend) {
     delete backend;
 }
 
+bool ggml_backend_qnn_aot_has_pending_generic_kv_writeback(ggml_backend_t backend) {
+    if (backend == nullptr) {
+        return false;
+    }
+
+    auto * device_ctx = get_device_context(backend->device);
+    return device_ctx != nullptr &&
+           device_ctx->aot_runtime != nullptr &&
+           device_ctx->aot_runtime->has_pending_generic_kv_writeback();
+}
+
+bool ggml_backend_qnn_aot_flush_pending_generic_kv_writeback(ggml_backend_t backend) {
+    if (backend == nullptr) {
+        return false;
+    }
+
+    auto * device_ctx = get_device_context(backend->device);
+    if (device_ctx == nullptr || device_ctx->aot_runtime == nullptr) {
+        return false;
+    }
+
+    return device_ctx->aot_runtime->flush_pending_generic_kv_writeback();
+}
+
 ggml_guid_t ggml_backend_qnn_guid() {
     static ggml_guid guid = { 0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81,
                               0x92, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0x09 };
@@ -615,6 +639,30 @@ class qnn_device_proxy : public backend_device_proxy {
 };
 
 }  // namespace
+
+bool ggml_backend_qnn_aot_has_pending_generic_kv_writeback(ggml_backend_t backend) {
+    if (backend == nullptr || backend->device == nullptr) {
+        return false;
+    }
+
+    auto * device_ctx = reinterpret_cast<qnn::ggml_backend_qnn_device_context *>(backend->device->context);
+    return device_ctx != nullptr &&
+           device_ctx->aot_runtime != nullptr &&
+           device_ctx->aot_runtime->has_pending_generic_kv_writeback();
+}
+
+bool ggml_backend_qnn_aot_flush_pending_generic_kv_writeback(ggml_backend_t backend) {
+    if (backend == nullptr || backend->device == nullptr) {
+        return false;
+    }
+
+    auto * device_ctx = reinterpret_cast<qnn::ggml_backend_qnn_device_context *>(backend->device->context);
+    if (device_ctx == nullptr || device_ctx->aot_runtime == nullptr) {
+        return false;
+    }
+
+    return device_ctx->aot_runtime->flush_pending_generic_kv_writeback();
+}
 
 backend_device_proxy_ptr create_qnn_backend_context(backend_index_type device) {
     if (device >= QNN_BACKEND_COUNT) {

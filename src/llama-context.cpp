@@ -24,6 +24,23 @@
 
 namespace {
 
+using ggml_backend_qnn_aot_has_pending_generic_kv_writeback_t = bool (*)(ggml_backend_t backend);
+using ggml_backend_qnn_aot_flush_pending_generic_kv_writeback_t = bool (*)(ggml_backend_t backend);
+
+bool hetero_dynamic_trace_timing_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * value = std::getenv("GGML_HETERO_DYNAMIC_TRACE_TIMING");
+        enabled = (value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0) ? 1 : 0;
+    }
+
+    return enabled != 0;
+}
+
+const char * hetero_phase_name(uint32_t n_tokens) {
+    return n_tokens > 1 ? "prefill" : "decode";
+}
+
 const char * canonicalize_hetero_backend_device_name(const char * value) {
     const std::string normalized = llama_hetero_canonical_backend(value != nullptr ? value : "");
     if (normalized.empty() || normalized == "cpu") {
@@ -43,6 +60,24 @@ const char * canonicalize_hetero_backend_device_name(const char * value) {
     }
 
     return value;
+}
+
+bool hetero_route_requests_qnn(const llama_hetero_route_spec & route) {
+    static constexpr std::array<llama_hetero_route_stage, 5> kStages = {{
+        llama_hetero_route_stage::ATTN_PROJ,
+        llama_hetero_route_stage::ATTN_CORE,
+        llama_hetero_route_stage::ATTN_OUT,
+        llama_hetero_route_stage::FFN,
+        llama_hetero_route_stage::OUTPUT,
+    }};
+
+    for (const auto stage : kStages) {
+        if (llama_hetero_is_qnn_backend(route.backend_for(stage))) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 } // namespace
@@ -256,6 +291,7 @@ llama_context::llama_context(
         ? llama_hetero_build_execution_plan(params.hetero_stage_route, params.hetero_kv_layout)
         : model.get_hetero_plan();
     hetero_plan_base   = hetero_plan;
+    aot_active_route_requests_qnn = hetero_route_requests_qnn(hetero_plan.route);
     dynamic_route_config = llama_dynamic_route_config_from_env();
 
     if (hetero_plan_from_params && !llama_hetero_execution_plan_equals(hetero_plan, model.get_hetero_plan())) {
@@ -294,6 +330,14 @@ llama_context::llama_context(
     bool hetero_qnn_shared_host_compute = false;
     bool hetero_shared_host_compute = hetero_cpu_opencl_zero_copy;
     ggml_backend_buffer_type_t shared_host_buft = nullptr;
+    const bool qnn_backend_requested =
+        std::any_of(model.devices.begin(), model.devices.end(), [](ggml_backend_dev_t dev) {
+            return dev != nullptr && llama_hetero_is_qnn_backend(ggml_backend_dev_name(dev));
+        }) ||
+        hetero_route_requests_qnn(hetero_route) ||
+        hetero_route_requests_qnn(dynamic_route_config.prefill.plan.route) ||
+        hetero_route_requests_qnn(dynamic_route_config.decode.plan.route) ||
+        hetero_route_requests_qnn(dynamic_route_config.fallback.plan.route);
 
     if (!hparams.vocab_only) {
         // GPU backends
@@ -315,6 +359,9 @@ llama_context::llama_context(
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
             if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+                if (!qnn_backend_requested && llama_hetero_is_qnn_backend(ggml_backend_dev_name(dev))) {
+                    continue;
+                }
                 if (backend_device_already_added(dev)) {
                     continue;
                 }
@@ -806,7 +853,21 @@ bool llama_context::apply_hetero_plan(llama_hetero_execution_plan plan, bool upd
         return false;
     }
 
+    if (llama_hetero_execution_plan_equals(hetero_plan, plan)) {
+        if (update_base_plan) {
+            hetero_plan_base = plan;
+        }
+        aot_active_route_requests_qnn = hetero_route_requests_qnn(hetero_plan.route);
+        if (hetero_dynamic_trace_timing_enabled()) {
+            LLAMA_LOG_INFO("%s: skipped no-op hetero plan update via %s\n",
+                    __func__,
+                    source != nullptr ? source : "unknown");
+        }
+        return true;
+    }
+
     hetero_plan = std::move(plan);
+    aot_active_route_requests_qnn = hetero_route_requests_qnn(hetero_plan.route);
     if (update_base_plan) {
         hetero_plan_base = hetero_plan;
     }
@@ -884,7 +945,16 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         /*.allocated_kv_contract =*/ &hetero_kv_contract_allocated,
     };
 
+    const bool trace_timing = hetero_dynamic_trace_timing_enabled();
+    const int64_t t_decide_start_us = trace_timing ? ggml_time_us() : 0;
     llama_dynamic_route_decision decision = llama_dynamic_route_decide(dynamic_route_config, request);
+    const int64_t t_decide_end_us = trace_timing ? ggml_time_us() : 0;
+
+    if (trace_timing && hetero_phase_trace.active) {
+        hetero_phase_trace.route_decide_us = t_decide_end_us - t_decide_start_us;
+        hetero_phase_trace.route_reason = decision.reason;
+    }
+
     if (!decision.should_apply) {
         if (dynamic_route_config.trace_enabled) {
             LLAMA_LOG_INFO("%s: dynamic route skip phase=%s reason=%s\n",
@@ -892,11 +962,86 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                     n_tokens > 1 ? "prefill" : "decode",
                     decision.reason.empty() ? "<none>" : decision.reason.c_str());
         }
+        if (trace_timing) {
+            LLAMA_LOG_INFO("%s: timing phase=%s n_tokens=%u route_apply=false reason=%s decide_us=%" PRId64 "\n",
+                    __func__,
+                    hetero_phase_name(n_tokens),
+                    n_tokens,
+                    decision.reason.empty() ? "<none>" : decision.reason.c_str(),
+                    t_decide_end_us - t_decide_start_us);
+        }
         return;
     }
 
-    if (apply_hetero_plan(std::move(decision.plan), /* update_base_plan = */ false, decision.plan_label.c_str())) {
+    const std::string target_route = llama_hetero_format_route_spec(decision.plan.route);
+    const bool should_flush_pending_qnn_kv =
+        n_tokens == 1 &&
+        hetero_route_requests_qnn(hetero_plan.route) &&
+        !hetero_route_requests_qnn(decision.plan.route);
+
+    if (should_flush_pending_qnn_kv) {
+        ggml_backend_t qnn_backend = nullptr;
+        for (const auto & backend : backends) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+            if (dev != nullptr && std::strcmp(ggml_backend_dev_name(dev), "qnn-npu") == 0) {
+                qnn_backend = backend.get();
+                break;
+            }
+        }
+
+        if (qnn_backend != nullptr) {
+            auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(qnn_backend));
+            auto * has_pending_fn =
+                (ggml_backend_qnn_aot_has_pending_generic_kv_writeback_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_qnn_aot_has_pending_generic_kv_writeback");
+            auto * flush_pending_fn =
+                (ggml_backend_qnn_aot_flush_pending_generic_kv_writeback_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_qnn_aot_flush_pending_generic_kv_writeback");
+
+            if (has_pending_fn != nullptr && flush_pending_fn != nullptr && has_pending_fn(qnn_backend)) {
+                LLAMA_LOG_INFO("%s: starting KV migration after prefill before decode route switch\n", __func__);
+                const int64_t t_kv_migration_start_us = trace_timing ? ggml_time_us() : 0;
+                const bool flushed = flush_pending_fn(qnn_backend);
+                const int64_t t_kv_migration_end_us = trace_timing ? ggml_time_us() : 0;
+                if (trace_timing && hetero_phase_trace.active) {
+                    hetero_phase_trace.kv_migration_us += t_kv_migration_end_us - t_kv_migration_start_us;
+                }
+                if (!flushed) {
+                    LLAMA_LOG_ERROR("%s: deferred QNN KV migration failed; keeping existing route and skipping decode backend switch\n",
+                            __func__);
+                    return;
+                }
+            }
+        }
+    }
+
+    const int64_t t_apply_start_us = trace_timing ? ggml_time_us() : 0;
+    const bool applied = apply_hetero_plan(std::move(decision.plan), /* update_base_plan = */ false, decision.plan_label.c_str());
+    const int64_t t_apply_end_us = trace_timing ? ggml_time_us() : 0;
+
+    if (trace_timing && hetero_phase_trace.active) {
+        hetero_phase_trace.route_applied = applied;
+        hetero_phase_trace.route_noop = !sched_need_reserve;
+        hetero_phase_trace.route_apply_us = t_apply_end_us - t_apply_start_us;
+        hetero_phase_trace.route_label = decision.plan_label;
+        hetero_phase_trace.target_route = target_route;
+    }
+
+    if (applied) {
         dynamic_route_state.route_switches++;
+    }
+
+    if (trace_timing) {
+        LLAMA_LOG_INFO("%s: timing phase=%s n_tokens=%u route_apply=%s label=%s reason=%s decide_us=%" PRId64 " apply_us=%" PRId64 " target=%s\n",
+                __func__,
+                hetero_phase_name(n_tokens),
+                n_tokens,
+                applied ? "true" : "false",
+                decision.plan_label.empty() ? "<none>" : decision.plan_label.c_str(),
+                decision.reason.empty() ? "<none>" : decision.reason.c_str(),
+                t_decide_end_us - t_decide_start_us,
+                t_apply_end_us - t_apply_start_us,
+                target_route.empty() ? "<default>" : target_route.c_str());
     }
 }
 
@@ -929,7 +1074,9 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
+    hetero_phase_trace_suppress_sync_log = true;
     synchronize();
+    hetero_phase_trace_suppress_sync_log = false;
 
     const int64_t t_start_us = ggml_time_us();
 
@@ -1158,9 +1305,14 @@ void llama_context::sched_reserve() {
     }
 
     const int64_t t_end_us = ggml_time_us();
+    const int64_t reserve_us = t_end_us - t_start_us;
+
+    if (hetero_dynamic_trace_timing_enabled() && hetero_phase_trace.active) {
+        hetero_phase_trace.reserve_us += reserve_us;
+    }
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
-            __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+            __func__, reserve_us/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
 void llama_context::synchronize() {
@@ -1169,6 +1321,36 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+
+    if (!hetero_phase_trace_suppress_sync_log &&
+        hetero_dynamic_trace_timing_enabled() &&
+        hetero_phase_trace.active &&
+        hetero_phase_trace.batch_start_us > 0) {
+        const int64_t total_us = ggml_time_us() - hetero_phase_trace.batch_start_us;
+        LLAMA_LOG_INFO("%s: timing phase=%s n_tokens=%u total_wall_us=%" PRId64 " decide_us=%" PRId64 " apply_us=%" PRId64 " reserve_us=%" PRId64 " memory_update_us=%" PRId64 " kv_migration_us=%" PRId64 " process_ubatch_us=%" PRId64 " bootstrap_sync_us=%" PRId64 " bootstrap_sched_rebuild_us=%" PRId64 " ubatches=%d graph_runs_reused=%d graph_runs_rebuilt=%d route_applied=%s route_noop=%s bootstrap_ran=%s label=%s reason=%s target=%s\n",
+                __func__,
+                hetero_phase_name(hetero_phase_trace.n_tokens),
+                hetero_phase_trace.n_tokens,
+                total_us,
+                hetero_phase_trace.route_decide_us,
+                hetero_phase_trace.route_apply_us,
+                hetero_phase_trace.reserve_us,
+                hetero_phase_trace.memory_update_us,
+                hetero_phase_trace.kv_migration_us,
+                hetero_phase_trace.process_ubatch_us,
+                hetero_phase_trace.bootstrap_sync_us,
+                hetero_phase_trace.bootstrap_sched_rebuild_us,
+                hetero_phase_trace.process_ubatches,
+                hetero_phase_trace.graph_runs_reused,
+                hetero_phase_trace.graph_runs_rebuilt,
+                hetero_phase_trace.route_applied ? "true" : "false",
+                hetero_phase_trace.route_noop ? "true" : "false",
+                hetero_phase_trace.bootstrap_ran ? "true" : "false",
+                hetero_phase_trace.route_label.empty() ? "<none>" : hetero_phase_trace.route_label.c_str(),
+                hetero_phase_trace.route_reason.empty() ? "<none>" : hetero_phase_trace.route_reason.c_str(),
+                hetero_phase_trace.target_route.empty() ? "<default>" : hetero_phase_trace.target_route.c_str());
+        hetero_phase_trace.reset();
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1716,10 +1898,15 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    const bool trace_timing = hetero_dynamic_trace_timing_enabled() && hetero_phase_trace.active;
+    const int64_t t_process_start_us = trace_timing ? ggml_time_us() : 0;
+
     if (aot_bootstrap_cpu_sched_active) {
         // Keep the bootstrap CPU-only scheduler alive until any async output fetches
         // from the correction graph have been synchronized, then restore the main one.
+        hetero_phase_trace_suppress_sync_log = true;
         synchronize();
+        hetero_phase_trace_suppress_sync_log = false;
     }
 
     if (mctx && !mctx->apply()) {
@@ -1736,6 +1923,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         };
 
         auto * gf = res->get_gf();
+        bool reused_graph = false;
 
         // the new graph parameters
         // in order to correctly reuse a graph, its full topology has to be uniquely determined by these parameters
@@ -1743,6 +1931,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         if (!graph_reuse_disable && allow_reuse && res->can_reuse(gparams)) {
             n_reused++;
+            reused_graph = true;
         } else {
             res->reset();
 
@@ -1768,11 +1957,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->set_inputs(&ubatch);
 
         restore_force_cpu();
+        if (trace_timing) {
+            if (reused_graph) {
+                hetero_phase_trace.graph_runs_reused++;
+            } else {
+                hetero_phase_trace.graph_runs_rebuilt++;
+            }
+        }
         return graph_compute(res->get_gf(), ubatch, ubatch.n_tokens > 1);
     };
 
     const bool aot_single_token_pos0 =
         std::getenv("GGML_QNN_AOT_CONFIG") != nullptr &&
+        aot_active_route_requests_qnn &&
         ubatch.n_tokens == 1 &&
         ubatch.n_pos > 0 &&
         ubatch.pos != nullptr &&
@@ -1788,9 +1985,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     if (aot_single_token_pos0) {
         LLAMA_LOG_INFO("%s: running AoT bootstrap CPU correction for initial decode token\n", __func__);
+        if (trace_timing) {
+            hetero_phase_trace.bootstrap_ran = true;
+        }
 
         // Finish the seed run before rebuilding the scheduler for the correction graph.
+        const int64_t t_bootstrap_sync_start_us = trace_timing ? ggml_time_us() : 0;
         ggml_backend_sched_synchronize(sched.get());
+        if (trace_timing) {
+            hetero_phase_trace.bootstrap_sync_us += ggml_time_us() - t_bootstrap_sync_start_us;
+        }
 
         // The scheduler will be rebound to the correction graph below, so rebuild the
         // steady-state QNN graph on the next decode rather than reusing stale splits.
@@ -1815,6 +2019,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ggml_backend_buffer_type_t cpu_backend_bufts[] = { cpu_buft };
 
             aot_saved_sched = std::move(sched);
+            const int64_t t_bootstrap_sched_start_us = trace_timing ? ggml_time_us() : 0;
             sched.reset(ggml_backend_sched_new(
                     cpu_backend_ptrs,
                     cpu_backend_bufts,
@@ -1822,6 +2027,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     cpu_res->get_max_nodes(),
                     /* parallel = */ false,
                     cparams.op_offload));
+            if (trace_timing) {
+                hetero_phase_trace.bootstrap_sched_rebuild_us += ggml_time_us() - t_bootstrap_sched_start_us;
+            }
 
             if (!sched) {
                 sched = std::move(aot_saved_sched);
@@ -1856,8 +2064,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        if (trace_timing) {
+            hetero_phase_trace.process_ubatches++;
+            hetero_phase_trace.process_ubatch_us += ggml_time_us() - t_process_start_us;
+        }
+
         ret = GGML_STATUS_SUCCESS;
         return cpu_res;
+    }
+
+    if (trace_timing) {
+        hetero_phase_trace.process_ubatches++;
+        hetero_phase_trace.process_ubatch_us += ggml_time_us() - t_process_start_us;
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -2232,6 +2450,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
     n_queued_tokens += n_tokens_all;
 
+    if (hetero_dynamic_trace_timing_enabled()) {
+        if (hetero_phase_trace.active) {
+            LLAMA_LOG_WARN("%s: overwriting pending hetero phase trace for phase=%s n_tokens=%u before synchronize() completed\n",
+                    __func__,
+                    hetero_phase_name(hetero_phase_trace.n_tokens),
+                    hetero_phase_trace.n_tokens);
+        }
+        hetero_phase_trace.reset();
+        hetero_phase_trace.active = true;
+        hetero_phase_trace.n_tokens = n_tokens_all;
+        hetero_phase_trace.batch_start_us = t_compute_start_us;
+    }
+
     // TODO: this clear of the buffer can easily be forgotten - need something better
     embd_seq.clear();
     output_swaps.clear();
@@ -2242,7 +2473,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
     bool did_optimize = false;
 
     // handle any pending shifts/copies
+    const int64_t t_memory_update_start_us = (hetero_dynamic_trace_timing_enabled() && hetero_phase_trace.active) ? ggml_time_us() : 0;
     memory_update(false);
+    if (hetero_dynamic_trace_timing_enabled() && hetero_phase_trace.active) {
+        hetero_phase_trace.memory_update_us += ggml_time_us() - t_memory_update_start_us;
+    }
 
     llama_memory_context_ptr mctx;
 
@@ -2914,7 +3149,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
         }
         static bool logged_hetero_output_route = false;
         if (hetero_output_backend != nullptr && !logged_hetero_output_route) {
-            LLAMA_LOG_INFO("%s: routing decode output tail (result_norm/result_output) via %s\n",
+            LLAMA_LOG_INFO("%s: routing decode output tail (norm/result_norm/result_output) via %s\n",
                     __func__, ggml_backend_name(hetero_output_backend));
             logged_hetero_output_route = true;
         }

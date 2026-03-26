@@ -42,9 +42,9 @@ If `--system-prompt-file` is provided, the script also snapshots seed KV files i
 - input `attn_bias`: the fixed-size attention bias buffer the runtime materializes from `self_kq_mask`
 - output `out`: `ffn_inp`, i.e. the post-attention residual that should cross the `attn_core -> ffn` boundary
 
-Current attn-core export uses `F32` for `attn_bias`, `cache_k`, and `cache_v`.
-This is an intentional workaround for the current QNN converter path, which fails to calibrate graphs that expose those external inputs as `F16`.
-For zero-copy `attn_proj <-> attn_core` KV sharing across CPU / OpenCL / QNN AoT, the runtime KV layout therefore also needs to be `F32` for the experimental `type=attn_core` path.
+Current attn-core export uses `float16` for the shared external inputs `attn_bias`, `cache_k`, and `cache_v` by default so the split graph matches the main `W4A16` route more closely.
+If the current QNN converter/calibration path still rejects those external inputs as `F16` on a given model/toolchain, pass `--shared-input-dtype float32` to fall back to the legacy workaround.
+For zero-copy `attn_proj <-> attn_core` KV sharing across CPU / OpenCL / QNN AoT, the runtime KV layout must match the exported graph input dtype; the runtime now validates this against the actual AoT graph metadata instead of assuming `F32`.
 
 Example:
 
@@ -53,6 +53,7 @@ python tools/qnn-aot-export/export_attn_core_to_onnx.py \
   --model-folder /path/to/hf-model \
   --model-name qwen2.5_0.5b \
   --graph-name batch_1 \
+  --shared-input-dtype float16 \
   --prompt-file ref/PowerServe/tools/qnn_converter/prompt/lab_intro_qwen.md \
   --output-folder /tmp/qnn-attn-core-export \
   --max-n-tokens 128 \
@@ -98,4 +99,4 @@ Current limitation:
 - `type=attention` still follows the PowerServe full-attention contract and keeps its own QNN-side KV state.
 - `type=attn_core` is intentionally scoped to the 3-way split where `attn_out` is folded into `attn_core`; it is not the old 4-way `attn_core + attn_out` route.
 - The current `attn_core` runtime path is scoped to the single-stream shared-KV layout that decode/prefill currently use in this tree; it is not yet a generic replacement for every historical attention layout variant.
-- The current QNN `attn_core` path is zero-copy only when the shared KV layout is `F32`. If the context still uses the default `F16` KV cache, the route is not a valid no-copy attn-core experiment.
+- The current QNN `attn_core` path is zero-copy only when the runtime KV cache dtype matches the exported `attn_core` graph inputs for `cache_k/cache_v`. The runtime checks this at graph load time.
