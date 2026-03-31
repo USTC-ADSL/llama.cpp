@@ -336,8 +336,8 @@ struct llama_model::impl {
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
-    hetero_plan = (params.hetero_stage_route != nullptr || params.hetero_kv_layout != nullptr)
-        ? llama_hetero_build_execution_plan(params.hetero_stage_route, params.hetero_kv_layout)
+    hetero_plan = (params.hetero_phase_route != nullptr || params.hetero_kv_layout != nullptr)
+        ? llama_hetero_build_execution_plan(params.hetero_phase_route, params.hetero_kv_layout)
         : llama_hetero_build_execution_plan_from_env();
 }
 
@@ -8718,7 +8718,7 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
-        /*.hetero_stage_route          =*/ nullptr,
+        /*.hetero_phase_route          =*/ nullptr,
         /*.hetero_kv_layout            =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,

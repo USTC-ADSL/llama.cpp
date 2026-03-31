@@ -10,21 +10,6 @@
 
 namespace {
 
-static constexpr std::array<llama_hetero_route_stage, 5> kStages = {{
-    llama_hetero_route_stage::ATTN_PROJ,
-    llama_hetero_route_stage::ATTN_CORE,
-    llama_hetero_route_stage::ATTN_OUT,
-    llama_hetero_route_stage::FFN,
-    llama_hetero_route_stage::OUTPUT,
-}};
-
-static constexpr std::array<std::pair<llama_hetero_route_stage, llama_hetero_route_stage>, 4> kAdjacentStagePairs = {{
-    { llama_hetero_route_stage::ATTN_PROJ, llama_hetero_route_stage::ATTN_CORE },
-    { llama_hetero_route_stage::ATTN_CORE, llama_hetero_route_stage::ATTN_OUT  },
-    { llama_hetero_route_stage::ATTN_OUT,  llama_hetero_route_stage::FFN       },
-    { llama_hetero_route_stage::FFN,       llama_hetero_route_stage::OUTPUT    },
-}};
-
 std::string to_lower_trimmed(const char * value) {
     return llama_hetero_to_lower(llama_hetero_trim(value != nullptr ? value : ""));
 }
@@ -50,12 +35,9 @@ int64_t env_i64_value(const char * name, int64_t default_value) {
 bool candidate_uses_backend(
         const llama_hetero_execution_plan & plan,
         bool (*predicate)(const std::string &)) {
-    for (const auto stage : kStages) {
-        if (predicate(plan.route.backend_for(stage))) {
-            return true;
-        }
+    if (predicate(llama_hetero_phase_backend_for_route(plan.route))) {
+        return true;
     }
-
     return predicate(plan.attn_kv.producer_backend) ||
            predicate(plan.attn_kv.consumer_backend) ||
            predicate(plan.attn_kv.storage_backend);
@@ -164,92 +146,31 @@ route_latency_bucket bucket_for_kv_contract(const llama_hetero_execution_plan & 
         return route_latency_bucket::CPU;
     }
 
-    return bucket_for_backend_name(plan.route.backend_for(llama_hetero_route_stage::ATTN_CORE));
+    return bucket_for_backend_name(llama_hetero_phase_backend_for_route(plan.route));
 }
 
-double decode_stage_cost_us(llama_hetero_route_stage stage, route_latency_bucket bucket) {
-    switch (stage) {
-        case llama_hetero_route_stage::ATTN_PROJ:
-            switch (bucket) {
-                case route_latency_bucket::CPU:    return 906.0;
-                case route_latency_bucket::OPENCL: return 950.0;
-                case route_latency_bucket::QNN:    return 871.0;
-            }
-            break;
-        case llama_hetero_route_stage::ATTN_CORE:
-            switch (bucket) {
-                case route_latency_bucket::CPU:    return 111.0;
-                case route_latency_bucket::OPENCL: return 250.0;
-                case route_latency_bucket::QNN:    return 580.0;
-            }
-            break;
-        case llama_hetero_route_stage::ATTN_OUT:
-            switch (bucket) {
-                case route_latency_bucket::CPU:    return 28.0;
-                case route_latency_bucket::OPENCL: return 60.0;
-                case route_latency_bucket::QNN:    return 28.0;
-            }
-            break;
-        case llama_hetero_route_stage::FFN:
-            switch (bucket) {
-                case route_latency_bucket::CPU:    return 864.0;
-                case route_latency_bucket::OPENCL: return 1050.0;
-                case route_latency_bucket::QNN:    return 1235.0;
-            }
-            break;
-        case llama_hetero_route_stage::OUTPUT:
-            switch (bucket) {
-                case route_latency_bucket::CPU:    return 2910.0;
-                case route_latency_bucket::OPENCL: return 6200.0;
-                case route_latency_bucket::QNN:    return 3000.0;
-            }
-            break;
-        case llama_hetero_route_stage::ATTN:
-            break;
+route_latency_bucket bucket_for_plan_backend(const llama_hetero_execution_plan & plan) {
+    return bucket_for_backend_name(llama_hetero_phase_backend_for_route(plan.route));
+}
+
+// Phase-level placeholders derived from the current static observations.
+// The goal here is to keep the first-cut cost model aligned with the phase-only
+// design, not to provide a high-fidelity latency predictor.
+double decode_phase_cost_us(route_latency_bucket bucket) {
+    switch (bucket) {
+        case route_latency_bucket::CPU:    return 1000.0;
+        case route_latency_bucket::OPENCL: return 1200.0;
+        case route_latency_bucket::QNN:    return 1400.0;
     }
 
     return 0.0;
 }
 
-double prefill_stage_cost_us(llama_hetero_route_stage stage, route_latency_bucket bucket) {
-    switch (stage) {
-        case llama_hetero_route_stage::ATTN_PROJ:
-            switch (bucket) {
-                case route_latency_bucket::CPU:    return 195.0;
-                case route_latency_bucket::OPENCL: return 45.0;
-                case route_latency_bucket::QNN:    return 180.0;
-            }
-            break;
-        case llama_hetero_route_stage::ATTN_CORE:
-            switch (bucket) {
-                case route_latency_bucket::CPU:    return 312.0;
-                case route_latency_bucket::OPENCL: return 120.0;
-                case route_latency_bucket::QNN:    return 4017.0;
-            }
-            break;
-        case llama_hetero_route_stage::ATTN_OUT:
-            switch (bucket) {
-                case route_latency_bucket::CPU:    return 20.0;
-                case route_latency_bucket::OPENCL: return 12.0;
-                case route_latency_bucket::QNN:    return 20.0;
-            }
-            break;
-        case llama_hetero_route_stage::FFN:
-            switch (bucket) {
-                case route_latency_bucket::CPU:    return 5843.0;
-                case route_latency_bucket::OPENCL: return 350.0;
-                case route_latency_bucket::QNN:    return 1991.0;
-            }
-            break;
-        case llama_hetero_route_stage::OUTPUT:
-            switch (bucket) {
-                case route_latency_bucket::CPU:    return 0.0;
-                case route_latency_bucket::OPENCL: return 0.0;
-                case route_latency_bucket::QNN:    return 0.0;
-            }
-            break;
-        case llama_hetero_route_stage::ATTN:
-            break;
+double prefill_phase_cost_us(route_latency_bucket bucket) {
+    switch (bucket) {
+        case route_latency_bucket::CPU:    return 6500.0;
+        case route_latency_bucket::OPENCL: return 900.0;
+        case route_latency_bucket::QNN:    return 500.0;
     }
 
     return 0.0;
@@ -272,24 +193,6 @@ double kv_cost_us(bool is_prefill, const llama_hetero_execution_plan & plan) {
     }
 
     return 0.0;
-}
-
-double adjacent_boundary_penalty_us(
-        bool is_prefill,
-        route_latency_bucket lhs,
-        route_latency_bucket rhs) {
-    if (lhs == rhs) {
-        return 0.0;
-    }
-
-    const bool touches_qnn =
-        lhs == route_latency_bucket::QNN ||
-        rhs == route_latency_bucket::QNN;
-    if (is_prefill) {
-        return touches_qnn ? 90.0 : 25.0;
-    }
-
-    return touches_qnn ? 100.0 : 50.0;
 }
 
 double kv_boundary_penalty_us(bool is_prefill, const llama_hetero_execution_plan & plan) {
@@ -355,34 +258,12 @@ int64_t estimate_plan_latency_us(
     const bool is_prefill = request.n_tokens > 1;
     const double layer_count = std::max<int64_t>(1, env_i64_value("GGML_HETERO_DYNAMIC_LAYER_COUNT", 24));
     const double phase_scale = is_prefill ? prefill_scale_for_tokens(request.n_tokens) : 1.0;
-
-    double repeated_stage_total = 0.0;
-    double single_stage_total = 0.0;
-
-    for (const auto stage : kStages) {
-        const route_latency_bucket bucket = bucket_for_backend_name(plan.route.backend_for(stage));
-        const double stage_cost = is_prefill
-            ? prefill_stage_cost_us(stage, bucket)
-            : decode_stage_cost_us(stage, bucket);
-
-        if (stage == llama_hetero_route_stage::OUTPUT) {
-            single_stage_total += stage_cost;
-        } else {
-            repeated_stage_total += stage_cost;
-        }
-    }
-
-    repeated_stage_total += kv_cost_us(is_prefill, plan);
-
-    for (const auto & [producer_stage, consumer_stage] : kAdjacentStagePairs) {
-        const route_latency_bucket lhs = bucket_for_backend_name(plan.route.backend_for(producer_stage));
-        const route_latency_bucket rhs = bucket_for_backend_name(plan.route.backend_for(consumer_stage));
-        repeated_stage_total += adjacent_boundary_penalty_us(is_prefill, lhs, rhs);
-    }
-
-    repeated_stage_total += kv_boundary_penalty_us(is_prefill, plan);
-
-    const double total_us = repeated_stage_total * layer_count * phase_scale + single_stage_total;
+    const route_latency_bucket bucket = bucket_for_plan_backend(plan);
+    const double phase_compute_us = is_prefill
+        ? prefill_phase_cost_us(bucket)
+        : decode_phase_cost_us(bucket);
+    const double repeated_phase_total = phase_compute_us + kv_cost_us(is_prefill, plan) + kv_boundary_penalty_us(is_prefill, plan);
+    const double total_us = repeated_phase_total * layer_count * phase_scale;
     return std::max<int64_t>(1, static_cast<int64_t>(total_us + 0.5));
 }
 

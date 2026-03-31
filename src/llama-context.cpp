@@ -285,10 +285,10 @@ llama_context::llama_context(
     }
 
     const bool hetero_plan_from_params =
-        params.hetero_stage_route != nullptr || params.hetero_kv_layout != nullptr;
+        params.hetero_phase_route != nullptr || params.hetero_kv_layout != nullptr;
 
     hetero_plan = hetero_plan_from_params
-        ? llama_hetero_build_execution_plan(params.hetero_stage_route, params.hetero_kv_layout)
+        ? llama_hetero_build_execution_plan(params.hetero_phase_route, params.hetero_kv_layout)
         : model.get_hetero_plan();
     hetero_plan_base   = hetero_plan;
     aot_active_route_requests_qnn = hetero_route_requests_qnn(hetero_plan.route);
@@ -297,7 +297,7 @@ llama_context::llama_context(
     if (hetero_plan_from_params && !llama_hetero_execution_plan_equals(hetero_plan, model.get_hetero_plan())) {
         const std::string ctx_route = llama_hetero_format_route_spec(hetero_plan.route);
         const std::string model_route = llama_hetero_format_route_spec(model.get_hetero_plan().route);
-        LLAMA_LOG_WARN("%s: context hetero route overrides the model-load plan. Graph routing will use route=%s, but tensor residency was chosen with model route=%s. For lower switching / staging overhead and future QNN integration, prefer setting llama_model_params.hetero_stage_route / hetero_kv_layout before model load.\n",
+        LLAMA_LOG_WARN("%s: context hetero route overrides the model-load plan. Graph routing will use route=%s, but tensor residency was chosen with model route=%s. For lower switching / staging overhead and future QNN integration, prefer setting llama_model_params.hetero_phase_route / hetero_kv_layout before model load.\n",
                 __func__,
                 ctx_route.empty() ? "<default>" : ctx_route.c_str(),
                 model_route.empty() ? "<default>" : model_route.c_str());
@@ -873,14 +873,11 @@ bool llama_context::apply_hetero_plan(llama_hetero_execution_plan plan, bool upd
     }
     sched_need_reserve = true;
 
-    LLAMA_LOG_INFO("%s: updated hetero plan via %s: attn_proj=%s attn_core=%s attn_out=%s ffn=%s output=%s\n",
+    LLAMA_LOG_INFO("%s: updated hetero plan via %s: backend=%s route=%s\n",
             __func__,
             source != nullptr ? source : "unknown",
-            hetero_plan.route.backend_for(llama_hetero_route_stage::ATTN_PROJ).c_str(),
-            hetero_plan.route.backend_for(llama_hetero_route_stage::ATTN_CORE).c_str(),
-            hetero_plan.route.backend_for(llama_hetero_route_stage::ATTN_OUT ).c_str(),
-            hetero_plan.route.backend_for(llama_hetero_route_stage::FFN      ).c_str(),
-            hetero_plan.route.backend_for(llama_hetero_route_stage::OUTPUT   ).c_str());
+            llama_hetero_phase_backend_for_route(hetero_plan.route).c_str(),
+            llama_hetero_format_route_spec(hetero_plan.route).c_str());
 
     return true;
 }
@@ -3127,36 +3124,23 @@ llm_graph_cb llama_context::graph_get_cb() const {
     };
 
     const auto & hetero_route = hetero_plan.route;
-    const ggml_backend_t hetero_attn_proj_backend = parse_hetero_backend(hetero_route.backend_for(llama_hetero_route_stage::ATTN_PROJ));
-    const ggml_backend_t hetero_attn_core_backend = parse_hetero_backend(hetero_route.backend_for(llama_hetero_route_stage::ATTN_CORE));
-    const ggml_backend_t hetero_attn_out_backend  = parse_hetero_backend(hetero_route.backend_for(llama_hetero_route_stage::ATTN_OUT));
-    const ggml_backend_t hetero_ffn_backend       = parse_hetero_backend(hetero_route.backend_for(llama_hetero_route_stage::FFN));
-    const ggml_backend_t hetero_output_backend    = parse_hetero_backend(hetero_route.backend_for(llama_hetero_route_stage::OUTPUT));
+    const std::string hetero_phase_backend_name = llama_hetero_phase_backend_for_route(hetero_route);
+    const ggml_backend_t hetero_phase_backend = parse_hetero_backend(hetero_phase_backend_name);
+    const ggml_backend_t hetero_output_backend    = hetero_phase_backend;
     const bool hetero_stage_enabled = hetero_route.has_any_route();
-    const bool hetero_route_uses_opencl =
-        llama_hetero_is_opencl_backend(hetero_route.backend_for(llama_hetero_route_stage::ATTN_PROJ)) ||
-        llama_hetero_is_opencl_backend(hetero_route.backend_for(llama_hetero_route_stage::ATTN_CORE)) ||
-        llama_hetero_is_opencl_backend(hetero_route.backend_for(llama_hetero_route_stage::ATTN_OUT )) ||
-        llama_hetero_is_opencl_backend(hetero_route.backend_for(llama_hetero_route_stage::FFN      )) ||
-        llama_hetero_is_opencl_backend(hetero_route.backend_for(llama_hetero_route_stage::OUTPUT   ));
+    const bool hetero_route_uses_opencl = llama_hetero_is_opencl_backend(hetero_phase_backend_name);
 
     if (hetero_stage_enabled) {
-        const auto backend_name_or = [](ggml_backend_t backend) -> const char * {
-            return backend ? ggml_backend_name(backend) : "<null>";
-        };
         const auto value_or = [](const std::string & value) -> const char * {
             return value.empty() ? "<unset>" : value.c_str();
         };
 
         static bool logged_hetero_route_api = false;
         if (!logged_hetero_route_api) {
-            LLAMA_LOG_INFO("%s: hetero route api attn_proj=%s -> %s, attn_core=%s -> %s, attn_out=%s -> %s, ffn=%s -> %s, output=%s -> %s\n",
+            LLAMA_LOG_INFO("%s: phase-only hetero route backend=%s route=%s\n",
                     __func__,
-                    value_or(hetero_route.backend_for(llama_hetero_route_stage::ATTN_PROJ)), backend_name_or(hetero_attn_proj_backend),
-                    value_or(hetero_route.backend_for(llama_hetero_route_stage::ATTN_CORE)), backend_name_or(hetero_attn_core_backend),
-                    value_or(hetero_route.backend_for(llama_hetero_route_stage::ATTN_OUT )), backend_name_or(hetero_attn_out_backend),
-                    value_or(hetero_route.backend_for(llama_hetero_route_stage::FFN      )), backend_name_or(hetero_ffn_backend),
-                    value_or(hetero_route.backend_for(llama_hetero_route_stage::OUTPUT   )), backend_name_or(hetero_output_backend));
+                    value_or(hetero_phase_backend_name),
+                    llama_hetero_format_route_spec(hetero_route).c_str());
             logged_hetero_route_api = true;
         }
         static bool logged_hetero_output_route = false;
@@ -3193,8 +3177,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
 
     return [&, qnn_aot_enabled, qnn_aot_backend, qnn_gpu_backend, qnn_cpu_backend,
             hetero_stage_enabled, hetero_route_uses_opencl,
-            hetero_attn_proj_backend, hetero_attn_core_backend, hetero_attn_out_backend,
-            hetero_ffn_backend, hetero_output_backend](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
+            hetero_phase_backend, hetero_output_backend](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
         if (il >= 0) {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
@@ -3282,31 +3265,14 @@ llm_graph_cb llama_context::graph_get_cb() const {
         const bool attn_out_stage  = llama_hetero_is_attn_out_tensor_name(tensor_name);
         const bool attn_stage      = attn_proj_stage || attn_core_stage || attn_out_stage;
         const bool ffn_stage       = llama_hetero_is_ffn_tensor_name(tensor_name) || ffn_lineage_norm;
-        const bool last_layer_attention_cpu_tail_fallback =
-            qnn_aot_enabled &&
-            hetero_stage_enabled &&
-            backend_cpu != nullptr &&
-            il >= 0 &&
-            static_cast<uint32_t>(il + 1) == model.hparams.n_layer &&
-            attn_stage &&
-            hetero_ffn_backend != nullptr &&
-            hetero_ffn_backend != qnn_aot_backend &&
-            hetero_ffn_backend != qnn_cpu_backend &&
-            hetero_ffn_backend != qnn_gpu_backend &&
-            ((hetero_attn_proj_backend != nullptr && hetero_attn_proj_backend == qnn_aot_backend) ||
-             (hetero_attn_core_backend != nullptr && hetero_attn_core_backend == qnn_aot_backend) ||
-             (hetero_attn_out_backend  != nullptr && hetero_attn_out_backend  == qnn_aot_backend));
-
         const bool aot_transformer_stage = attn_stage || ffn_stage;
         const bool aot_lm_head_stage = tensor_name != nullptr && (
             std::strcmp(tensor_name, "norm") == 0 ||
             std::strcmp(tensor_name, "result_norm") == 0 ||
             std::strcmp(tensor_name, "result_output") == 0);
-        const bool explicit_hetero_stage = route_output_to_backend ||
-            (attn_out_stage  && hetero_attn_out_backend  != nullptr) ||
-            (attn_core_stage && hetero_attn_core_backend != nullptr) ||
-            (attn_proj_stage && hetero_attn_proj_backend != nullptr) ||
-            (ffn_stage       && hetero_ffn_backend       != nullptr);
+        const bool explicit_hetero_stage =
+            (route_output_to_backend || attn_stage || ffn_stage) &&
+            hetero_phase_backend != nullptr;
         const bool preserve_stage_purity_on_cpu =
             hetero_stage_enabled &&
             !hetero_route_uses_opencl &&
@@ -3314,20 +3280,8 @@ llm_graph_cb llama_context::graph_get_cb() const {
             llama_hetero_is_stage_tensor_name(tensor_name);
 
         auto resolve_stage_backend = [&]() -> ggml_backend_t {
-            if (route_output_to_backend) {
-                return hetero_output_backend;
-            }
-            if (attn_out_stage && hetero_attn_out_backend != nullptr) {
-                return hetero_attn_out_backend;
-            }
-            if (attn_core_stage && hetero_attn_core_backend != nullptr) {
-                return hetero_attn_core_backend;
-            }
-            if (attn_proj_stage && hetero_attn_proj_backend != nullptr) {
-                return hetero_attn_proj_backend;
-            }
-            if (ffn_stage && hetero_ffn_backend != nullptr) {
-                return hetero_ffn_backend;
+            if ((route_output_to_backend || attn_stage || ffn_stage) && hetero_phase_backend != nullptr) {
+                return hetero_phase_backend;
             }
             if (qnn_aot_enabled && qnn_aot_backend != nullptr && (aot_transformer_stage || aot_lm_head_stage)) {
                 return qnn_aot_backend;
@@ -3381,16 +3335,6 @@ llm_graph_cb llama_context::graph_get_cb() const {
             if (qnn_force_cpu) {
                 set_tensor_backend(backend_cpu, explicit_hetero_stage);
                 trace_tensor("force-cpu", backend_cpu, true);
-                return;
-            }
-
-            // The final decode layer inserts output-tail GET_ROWS nodes that are not covered by
-            // the current attn_core AoT binaries. If the downstream FFN leaves qnn-npu, force the
-            // final attention stage onto plain CPU so the tail does not fragment into unmatched
-            // QNN residual splits before crossing into CPU/OpenCL.
-            if (last_layer_attention_cpu_tail_fallback) {
-                set_tensor_backend(backend_cpu, true);
-                trace_tensor("hetero-last-layer-attn-cpu-tail-fallback", backend_cpu, true);
                 return;
             }
 
@@ -4140,7 +4084,7 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
-        /*.hetero_stage_route          =*/ nullptr,
+        /*.hetero_phase_route          =*/ nullptr,
         /*.hetero_kv_layout            =*/ nullptr,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
@@ -4304,7 +4248,7 @@ void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void *
     ctx->set_abort_callback(abort_callback, abort_callback_data);
 }
 
-bool llama_set_hetero_stage_route(
+bool llama_set_hetero_phase_route(
         llama_context * ctx,
         const char * route_spec,
         const char * kv_layout) {
@@ -4316,7 +4260,7 @@ bool llama_set_hetero_stage_route(
     return ctx->set_hetero_plan(llama_hetero_build_execution_plan(route_spec, kv_layout));
 }
 
-int32_t llama_get_hetero_stage_route(
+int32_t llama_get_hetero_phase_route(
         const llama_context * ctx,
         char * buf,
         size_t buf_size) {

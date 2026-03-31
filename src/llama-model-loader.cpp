@@ -1063,36 +1063,34 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const auto & hetero_route = hetero_plan.route;
-    const bool hetero_stage_route_active = hetero_route.has_any_route();
-    const int hetero_ffn_backend_kind       = llama_hetero_backend_kind(hetero_route.backend_for(llama_hetero_route_stage::FFN));
-    const int hetero_attn_proj_backend_kind = llama_hetero_backend_kind(hetero_route.backend_for(llama_hetero_route_stage::ATTN_PROJ));
-    const int hetero_attn_out_backend_kind  = llama_hetero_backend_kind(hetero_route.backend_for(llama_hetero_route_stage::ATTN_OUT));
-    const int hetero_output_backend_kind    = llama_hetero_backend_kind(hetero_route.backend_for(llama_hetero_route_stage::OUTPUT));
+    const bool hetero_phase_route_active = hetero_route.has_any_route();
+    const int hetero_phase_backend_kind =
+        llama_hetero_backend_kind(llama_hetero_phase_backend_for_route(hetero_route));
 
     const bool hetero_ffn_cpu_weights =
-        hetero_stage_route_active && hetero_ffn_backend_kind == 1;
+        hetero_phase_route_active && hetero_phase_backend_kind == 1;
     const bool hetero_attn_proj_cpu_weights =
-        hetero_stage_route_active && hetero_attn_proj_backend_kind == 1;
+        hetero_phase_route_active && hetero_phase_backend_kind == 1;
     const bool hetero_attn_out_cpu_weights =
-        hetero_stage_route_active && hetero_attn_out_backend_kind == 1;
+        hetero_phase_route_active && hetero_phase_backend_kind == 1;
     const bool hetero_output_cpu_weights =
-        hetero_stage_route_active && hetero_output_backend_kind == 1;
+        hetero_phase_route_active && hetero_phase_backend_kind == 1;
 
     const bool hetero_ffn_qnn_host_weights =
-        hetero_stage_route_active && hetero_ffn_backend_kind == 3;
+        hetero_phase_route_active && hetero_phase_backend_kind == 3;
     const bool hetero_attn_proj_qnn_host_weights =
-        hetero_stage_route_active && hetero_attn_proj_backend_kind == 3;
+        hetero_phase_route_active && hetero_phase_backend_kind == 3;
     const bool hetero_attn_out_qnn_host_weights =
-        hetero_stage_route_active && hetero_attn_out_backend_kind == 3;
+        hetero_phase_route_active && hetero_phase_backend_kind == 3;
 
     const bool hetero_ffn_opencl_weights =
-        hetero_stage_route_active && hetero_ffn_backend_kind == 2;
+        hetero_phase_route_active && hetero_phase_backend_kind == 2;
     const bool hetero_attn_proj_opencl_weights =
-        hetero_stage_route_active && hetero_attn_proj_backend_kind == 2;
+        hetero_phase_route_active && hetero_phase_backend_kind == 2;
     const bool hetero_attn_out_opencl_weights =
-        hetero_stage_route_active && hetero_attn_out_backend_kind == 2;
+        hetero_phase_route_active && hetero_phase_backend_kind == 2;
     const bool hetero_output_opencl_weights =
-        hetero_stage_route_active && hetero_output_backend_kind == 2;
+        hetero_phase_route_active && hetero_phase_backend_kind == 2;
 
     static bool logged_hetero_cpu_opencl_ffn_cpu_weights = false;
     if (hetero_ffn_cpu_weights && !logged_hetero_cpu_opencl_ffn_cpu_weights) {
@@ -1391,7 +1389,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
-        if (hetero_stage_route_active && info.layer == LLM_TENSOR_LAYER_REPEATING) {
+        if (hetero_phase_route_active && info.layer == LLM_TENSOR_LAYER_REPEATING) {
             const bool is_ffn_tensor =
                 tn_tensor == LLM_TENSOR_FFN_NORM ||
                 tn_tensor == LLM_TENSOR_FFN_GATE ||
@@ -1468,7 +1466,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         // avoid using a host buffer when using mmap
         auto * buft_dev = ggml_backend_buft_get_device(buft);
         const bool preserve_opencl_host_buft_for_hetero =
-            hetero_stage_route_active &&
+            hetero_phase_route_active &&
             buft_dev != nullptr &&
             std::strcmp(ggml_backend_dev_name(buft_dev), "GPUOpenCL") == 0 &&
             buft == ggml_backend_dev_host_buffer_type(buft_dev);

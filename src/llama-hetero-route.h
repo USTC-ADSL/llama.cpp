@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -378,17 +379,73 @@ static inline bool llama_hetero_route_spec_equals(const llama_hetero_route_spec 
 }
 
 static inline const char * llama_hetero_route_env_value() {
-    const char * value = std::getenv("GGML_HETERO_STAGE_ROUTE");
-    if (value != nullptr && value[0] != '\0') {
-        return value;
-    }
-
-    value = std::getenv("GGML_HETERO_ROUTE");
+    const char * value = std::getenv("GGML_HETERO_PHASE_ROUTE");
     if (value != nullptr && value[0] != '\0') {
         return value;
     }
 
     return nullptr;
+}
+
+static inline std::string llama_hetero_phase_backend_for_route(const llama_hetero_route_spec & spec) {
+    static constexpr std::array<llama_hetero_route_stage, 5> kStages = {{
+        llama_hetero_route_stage::ATTN_PROJ,
+        llama_hetero_route_stage::ATTN_CORE,
+        llama_hetero_route_stage::ATTN_OUT,
+        llama_hetero_route_stage::FFN,
+        llama_hetero_route_stage::OUTPUT,
+    }};
+
+    for (const auto stage : kStages) {
+        const std::string backend = spec.backend_for(stage);
+        if (!backend.empty()) {
+            return backend;
+        }
+    }
+
+    return {};
+}
+
+static inline bool llama_hetero_route_is_phase_homogeneous(const llama_hetero_route_spec & spec) {
+    static constexpr std::array<llama_hetero_route_stage, 5> kStages = {{
+        llama_hetero_route_stage::ATTN_PROJ,
+        llama_hetero_route_stage::ATTN_CORE,
+        llama_hetero_route_stage::ATTN_OUT,
+        llama_hetero_route_stage::FFN,
+        llama_hetero_route_stage::OUTPUT,
+    }};
+
+    std::string phase_backend;
+    for (const auto stage : kStages) {
+        const std::string backend = spec.backend_for(stage);
+        if (backend.empty()) {
+            continue;
+        }
+
+        if (phase_backend.empty()) {
+            phase_backend = backend;
+            continue;
+        }
+
+        if (backend != phase_backend) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static inline llama_hetero_route_spec llama_hetero_canonicalize_phase_route_spec(const llama_hetero_route_spec & spec) {
+    llama_hetero_route_spec canonical;
+    const std::string backend = llama_hetero_phase_backend_for_route(spec);
+    if (backend.empty()) {
+        return canonical;
+    }
+
+    canonical.attn   = backend;
+    canonical.ffn    = backend;
+    canonical.output = backend;
+    return canonical;
 }
 
 static inline llama_hetero_route_spec llama_hetero_parse_route_spec(const char * route_value) {
@@ -425,7 +482,14 @@ static inline llama_hetero_route_spec llama_hetero_parse_route_spec(const char *
 
     }
 
-    return spec;
+    if (!llama_hetero_route_is_phase_homogeneous(spec)) {
+        std::fprintf(stderr,
+                     "[hetero] mixed-stage routes are disabled on this branch; ignoring route=%s\n",
+                     route_value != nullptr ? route_value : "<null>");
+        return {};
+    }
+
+    return llama_hetero_canonicalize_phase_route_spec(spec);
 }
 
 static inline llama_hetero_route_spec llama_hetero_parse_route_spec_from_env() {

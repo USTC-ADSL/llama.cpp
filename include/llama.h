@@ -309,11 +309,11 @@ extern "C" {
         const struct llama_model_kv_override * kv_overrides;
 
         // [EXPERIMENTAL]
-        // workflow2 hetero decode route, for example:
-        //   "attn_proj=cpu,attn_core=opencl,attn_out=cpu,ffn=cpu,output=cpu"
+        // workflow2 phase-level route, for example:
+        //   "opencl", "qnn-npu", "cpu"
         // Set this before model load if you want weight placement / residency to
-        // follow the same stage routing plan.
-        const char * hetero_stage_route;
+        // follow the same phase backend plan.
+        const char * hetero_phase_route;
 
         // [EXPERIMENTAL]
         // workflow2 attention KV layout / transfer policy, for example:
@@ -414,10 +414,10 @@ extern "C" {
         void *              abort_callback_data;
 
         // [EXPERIMENTAL]
-        // workflow2 hetero decode route. This controls graph-side stage routing
+        // workflow2 phase-level route. This controls graph-side phase routing
         // for the context. For the lowest overhead, prefer setting the same plan
         // in llama_model_params before model load as well.
-        const char * hetero_stage_route;
+        const char * hetero_phase_route;
 
         // [EXPERIMENTAL]
         // workflow2 attention KV layout / transfer policy. This can request
@@ -1037,20 +1037,20 @@ extern "C" {
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 
     // [EXPERIMENTAL]
-    // Update workflow2 hetero decode routing for an existing context using the
-    // same grammar as llama_model_params::hetero_stage_route.
+    // Update workflow2 phase-level routing for an existing context using the
+    // same grammar as llama_model_params::hetero_phase_route.
     // Returns false if the requested route requires a KV layout / transport
     // contract that the current context cannot satisfy without rebuild/migration.
-    LLAMA_API bool llama_set_hetero_stage_route(
+    LLAMA_API bool llama_set_hetero_phase_route(
             struct llama_context * ctx,
             const char * route_spec,
             const char * kv_layout);
 
     // [EXPERIMENTAL]
-    // Serialize the current workflow2 hetero stage route into buf and return the
+    // Serialize the current workflow2 phase route into buf and return the
     // number of characters that would have been written (excluding the NUL), as
     // with snprintf().
-    LLAMA_API int32_t llama_get_hetero_stage_route(
+    LLAMA_API int32_t llama_get_hetero_phase_route(
             const struct llama_context * ctx,
             char * buf,
             size_t buf_size);
