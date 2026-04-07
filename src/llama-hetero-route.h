@@ -474,6 +474,13 @@ static inline llama_hetero_route_spec llama_hetero_parse_route_spec(const char *
                     if (!key.empty() && !value.empty()) {
                         llama_hetero_set_route_field(spec, key, value);
                     }
+                } else {
+                    const std::string backend = llama_hetero_canonical_backend(token);
+                    if (!backend.empty()) {
+                        spec.attn = backend;
+                        spec.ffn = backend;
+                        spec.output = backend;
+                    }
                 }
             }
 

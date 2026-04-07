@@ -277,6 +277,9 @@ llama_kv_cache::llama_kv_cache(
             if (dynamic_decode_consumer_backend == "cpu") {
                 consumer_kv_buft = ggml_backend_cpu_buffer_type();
                 consumer_kv_dev_name = "CPU";
+            } else if (dynamic_decode_consumer_backend == "opencl") {
+                consumer_kv_buft = nullptr;
+                consumer_kv_dev_name = nullptr;
             } else if (!dynamic_decode_consumer_backend.empty()) {
                 ggml_backend_dev_t consumer_dev = ggml_backend_dev_by_name(dynamic_decode_consumer_backend.c_str());
                 if (consumer_dev == nullptr && dynamic_decode_consumer_backend == "opencl") {

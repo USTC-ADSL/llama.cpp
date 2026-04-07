@@ -980,6 +980,50 @@ struct aot_phase_route_spec {
     }
 };
 
+std::string route_phase_backend(const aot_phase_route_spec & route) {
+    if (!route.attn.empty()) {
+        return route.attn;
+    }
+    if (!route.attn_proj.empty()) {
+        return route.attn_proj;
+    }
+    if (!route.attn_core.empty()) {
+        return route.attn_core;
+    }
+    if (!route.attn_out.empty()) {
+        return route.attn_out;
+    }
+    if (!route.ffn.empty()) {
+        return route.ffn;
+    }
+    return route.output;
+}
+
+bool route_is_phase_homogeneous(const aot_phase_route_spec & route) {
+    std::string backend;
+    for (const std::string * candidate : {
+             &route.attn,
+             &route.attn_proj,
+             &route.attn_core,
+             &route.attn_out,
+             &route.ffn,
+             &route.output,
+         }) {
+        if (candidate->empty()) {
+            continue;
+        }
+        if (backend.empty()) {
+            backend = *candidate;
+            continue;
+        }
+        if (*candidate != backend) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 aot_phase_route_spec parse_phase_route_spec(const char * value) {
     aot_phase_route_spec route;
     if (value == nullptr || value[0] == '\0') {
@@ -1010,6 +1054,13 @@ aot_phase_route_spec parse_phase_route_spec(const char * value) {
             } else if (key == "ffn") {
                 route.ffn = backend;
             } else if (key == "output") {
+                route.output = backend;
+            }
+        } else {
+            const std::string backend = canonical_route_backend(entry);
+            if (!backend.empty()) {
+                route.attn = backend;
+                route.ffn = backend;
                 route.output = backend;
             }
         }
@@ -1054,7 +1105,32 @@ bool aot_generic_kv_writeback_needed_for_phase_switch() {
 
     const aot_phase_route_spec prefill_route =
         parse_phase_route_spec(std::getenv("GGML_HETERO_DYNAMIC_PREFILL_ROUTE"));
-    return !prefill_route.has_any_route() || route_requests_qnn(prefill_route);
+    const bool prefill_uses_qnn =
+        !prefill_route.has_any_route() || route_requests_qnn(prefill_route);
+    if (!prefill_uses_qnn) {
+        return false;
+    }
+
+    // Phase-only QNN -> CPU/OpenCL routes can keep legacy KV on the future
+    // decode consumer placement, so generic KV writeback is unnecessary there.
+    // Keep an opt-in override for OpenCL in case a driver stack still needs the
+    // older generic-KV phase-switch path.
+    if (prefill_route.has_any_route() &&
+        route_is_phase_homogeneous(prefill_route) &&
+        route_is_phase_homogeneous(decode_route)) {
+        const std::string prefill_backend = route_phase_backend(prefill_route);
+        const std::string decode_backend = route_phase_backend(decode_route);
+        const bool decode_uses_non_qnn_consumer_owned_legacy =
+            decode_backend == "cpu" ||
+            (decode_backend == "opencl" &&
+             !env_flag_enabled("GGML_QNN_AOT_FORCE_QNN_OPENCL_GENERIC_KV"));
+        if (is_qnn_route_backend(prefill_backend) &&
+            decode_uses_non_qnn_consumer_owned_legacy) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 bool aot_write_generic_kv_enabled() {
@@ -3918,8 +3994,32 @@ bool qnn_aot_runtime::should_write_generic_kv(const aot_match_result & match) co
            !match.cache_v_layers.empty();
 }
 
-bool qnn_aot_runtime::should_defer_generic_kv_writeback() const {
-    return aot_generic_kv_writeback_needed_for_phase_switch();
+bool qnn_aot_runtime::should_defer_generic_kv_writeback(const aot_match_result & match) const {
+    if (!aot_generic_kv_writeback_needed_for_phase_switch()) {
+        return false;
+    }
+
+    // If the generic KV tensors are already host-accessible, write them eagerly
+    // during prefill so decode-entry does not need a deferred flush.
+    bool host_accessible = true;
+    for (const auto & [layer, cache_k] : match.cache_k_layers) {
+        auto cache_v_it = match.cache_v_layers.find(layer);
+        if (cache_k == nullptr || cache_v_it == match.cache_v_layers.end() || cache_v_it->second == nullptr) {
+            host_accessible = false;
+            break;
+        }
+        if (!tensor_has_host_accessible_data(cache_k) ||
+            !tensor_has_host_accessible_data(cache_v_it->second)) {
+            host_accessible = false;
+            break;
+        }
+    }
+
+    if (host_accessible && aot_trace_bind_enabled()) {
+        QNN_LOG_INFO("[aot] eager generic KV writeback enabled: host-accessible generic cache tensors detected\n");
+    }
+
+    return !host_accessible;
 }
 
 bool qnn_aot_runtime::collect_generic_kv_from_graph(qnn_aot_graph & graph,
@@ -4121,7 +4221,7 @@ bool qnn_aot_runtime::write_generic_kv_from_graph(qnn_aot_graph & graph,
         return true;
     }
 
-    if (should_defer_generic_kv_writeback()) {
+    if (should_defer_generic_kv_writeback(match)) {
         return stage_generic_kv_from_graph(graph, match, token_offset, n_tokens);
     }
 

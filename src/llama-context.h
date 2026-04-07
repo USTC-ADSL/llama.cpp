@@ -335,6 +335,7 @@ private:
     ggml_backend_sched_ptr aot_saved_sched;
 
     bool sched_need_reserve = true;
+    std::vector<llama_hetero_execution_plan> hetero_dynamic_pre_reserved_plans;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

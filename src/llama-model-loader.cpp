@@ -1045,6 +1045,20 @@ static ggml_backend_buffer_type_t select_weight_cpu_buft(const llama_hparams & h
     return nullptr;
 }
 
+static ggml_backend_buffer_type_t select_weight_cpu_default_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op) {
+    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu_dev == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_buffer_type_t cpu_buft = ggml_backend_dev_buffer_type(cpu_dev);
+    if (cpu_buft == nullptr) {
+        return nullptr;
+    }
+
+    return weight_buft_supported(hparams, tensor, op, cpu_buft, cpu_dev) ? cpu_buft : nullptr;
+}
+
 static ggml_backend_buffer_type_t select_weight_device_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const char * device_name, bool use_host_buft) {
     ggml_backend_dev_t dev = ggml_backend_dev_by_name(device_name);
     if (dev == nullptr) {
@@ -1066,6 +1080,16 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     const bool hetero_phase_route_active = hetero_route.has_any_route();
     const int hetero_phase_backend_kind =
         llama_hetero_backend_kind(llama_hetero_phase_backend_for_route(hetero_route));
+    const llama_hetero_route_spec dynamic_prefill_route =
+        llama_hetero_parse_route_spec(std::getenv("GGML_HETERO_DYNAMIC_PREFILL_ROUTE"));
+    const int dynamic_prefill_backend_kind =
+        llama_hetero_backend_kind(llama_hetero_phase_backend_for_route(dynamic_prefill_route));
+    const bool dynamic_opencl_prefill_active =
+        dynamic_prefill_route.has_any_route() && dynamic_prefill_backend_kind == 2;
+    const bool hetero_portable_cpu_weights_for_opencl_prefill =
+        dynamic_opencl_prefill_active &&
+        hetero_phase_route_active &&
+        hetero_phase_backend_kind != 2;
 
     const bool hetero_ffn_cpu_weights =
         hetero_phase_route_active && hetero_phase_backend_kind == 1;
@@ -1156,6 +1180,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     if (hetero_output_opencl_weights && !logged_hetero_output_opencl_weights) {
         LLAMA_LOG_INFO("%s: preferring OpenCL buffer types for output stage weights under hetero decode\n", __func__);
         logged_hetero_output_opencl_weights = true;
+    }
+
+    static bool logged_hetero_portable_cpu_weights_for_opencl_prefill = false;
+    if (hetero_portable_cpu_weights_for_opencl_prefill && !logged_hetero_portable_cpu_weights_for_opencl_prefill) {
+        LLAMA_LOG_INFO("%s: forcing portable CPU buffer types for stage weights because dynamic prefill route requests OpenCL while the model-load phase route is non-OpenCL\n",
+                __func__);
+        logged_hetero_portable_cpu_weights_for_opencl_prefill = true;
     }
 
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
@@ -1334,7 +1365,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 // QNN AoT stages consume precompiled weights from the context binary, so the ggml weights
                 // only need to remain host-readable and scheduler-safe. Pin them to CPU bufts here rather
                 // than any accelerator or QNN RPCMEM buft to avoid token-sized mixed-route buffer hazards.
-                buft = select_weight_cpu_buft(hparams, t_meta, op, buft_list_cpu);
+                buft = hetero_portable_cpu_weights_for_opencl_prefill
+                    ? select_weight_cpu_default_buft(hparams, t_meta, op)
+                    : select_weight_cpu_buft(hparams, t_meta, op, buft_list_cpu);
                 if (!buft) {
                     throw std::runtime_error(format("failed to auto-route hetero tensor %s to a CPU-readable buffer type", tensor_name.c_str()));
                 }
@@ -1354,7 +1387,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         if (!buft && info.layer == LLM_TENSOR_LAYER_OUTPUT) {
             if (hetero_output_cpu_weights) {
-                buft = select_weight_cpu_buft(hparams, t_meta, op, buft_list_cpu);
+                buft = hetero_portable_cpu_weights_for_opencl_prefill
+                    ? select_weight_cpu_default_buft(hparams, t_meta, op)
+                    : select_weight_cpu_buft(hparams, t_meta, op, buft_list_cpu);
                 if (!buft) {
                     throw std::runtime_error(format("failed to auto-route hetero output tensor %s to a CPU-readable buffer type", tensor_name.c_str()));
                 }
@@ -1380,6 +1415,20 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                         ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
                         ggml_backend_buft_name(buft));
             }
+        }
+
+        if (!buft &&
+            info.layer == LLM_TENSOR_LAYER_OUTPUT &&
+            hetero_portable_cpu_weights_for_opencl_prefill) {
+            buft = select_weight_cpu_default_buft(hparams, t_meta, op);
+            if (!buft) {
+                throw std::runtime_error(format("failed to auto-route hetero output tensor %s to a portable CPU buffer type for dynamic OpenCL prefill", tensor_name.c_str()));
+            }
+
+            LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) auto-routed to %s for dynamic OpenCL-prefill portability\n",
+                    tensor_name.c_str(),
+                    ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
+                    ggml_backend_buft_name(buft));
         }
 
         if (!buft) {

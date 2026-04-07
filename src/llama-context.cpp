@@ -871,7 +871,23 @@ bool llama_context::apply_hetero_plan(llama_hetero_execution_plan plan, bool upd
     if (update_base_plan) {
         hetero_plan_base = hetero_plan;
     }
-    sched_need_reserve = true;
+
+    const bool source_is_dynamic_candidate =
+        source != nullptr &&
+        (std::strcmp(source, "prefill") == 0 ||
+         std::strcmp(source, "decode") == 0 ||
+         std::strcmp(source, "fallback") == 0 ||
+         std::strcmp(source, "base") == 0);
+    const bool target_plan_pre_reserved =
+        source_is_dynamic_candidate &&
+        std::any_of(
+            hetero_dynamic_pre_reserved_plans.begin(),
+            hetero_dynamic_pre_reserved_plans.end(),
+            [&](const llama_hetero_execution_plan & candidate) {
+                return llama_hetero_execution_plan_equals(candidate, hetero_plan);
+            });
+
+    sched_need_reserve = !target_plan_pre_reserved;
 
     LLAMA_LOG_INFO("%s: updated hetero plan via %s: backend=%s route=%s\n",
             __func__,
@@ -896,6 +912,7 @@ bool llama_context::set_dynamic_route_config(const llama_dynamic_route_config & 
         return false;
     }
     dynamic_route_config = std::move(runtime_config);
+    hetero_dynamic_pre_reserved_plans.clear();
 
     const std::string prefill_route  = llama_hetero_format_route_spec(dynamic_route_config.prefill.plan.route);
     const std::string decode_route   = llama_hetero_format_route_spec(dynamic_route_config.decode.plan.route);
@@ -1076,6 +1093,7 @@ void llama_context::sched_reserve() {
     }
 
     sched_need_reserve = false;
+    hetero_dynamic_pre_reserved_plans.clear();
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
@@ -1241,47 +1259,132 @@ void llama_context::sched_reserve() {
     int n_splits_tg = -1;
     int n_nodes_tg  = -1;
 
-    // reserve pp (prompt processing) graph first so that buffers are only allocated once
-    {
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(),
-                model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
-        if (!gf) {
-            if (cparams.pipeline_parallel) {
-                LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
-                cparams.pipeline_parallel = false;
-                sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
-                gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get());
-            }
+    const auto reserve_plan_buffers = [&](const llama_hetero_execution_plan & plan,
+                                          bool capture_stats) {
+        const auto saved_plan = hetero_plan;
+        const bool saved_qnn_active = aot_active_route_requests_qnn;
+        hetero_plan = plan;
+        aot_active_route_requests_qnn = hetero_route_requests_qnn(hetero_plan.route);
+
+        // reserve pp (prompt processing) graph first so that buffers are only allocated once
+        {
+            auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(),
+                    model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
             if (!gf) {
+                if (cparams.pipeline_parallel) {
+                    LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
+                    cparams.pipeline_parallel = false;
+                    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                    gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get());
+                }
+                if (!gf) {
+                    hetero_plan = saved_plan;
+                    aot_active_route_requests_qnn = saved_qnn_active;
+                    throw std::runtime_error("failed to allocate compute pp buffers");
+                }
+            }
+
+            if (capture_stats) {
+                n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
+                n_nodes_pp  = ggml_graph_n_nodes(gf);
+            }
+        }
+
+        // reserve with tg (token generation) graph to get the number of splits and nodes
+        {
+            auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
+            if (!gf) {
+                hetero_plan = saved_plan;
+                aot_active_route_requests_qnn = saved_qnn_active;
+                throw std::runtime_error("failed to allocate compute tg buffers");
+            }
+
+            if (capture_stats) {
+                n_splits_tg = ggml_backend_sched_get_n_splits(sched.get());
+                n_nodes_tg  = ggml_graph_n_nodes(gf);
+            }
+        }
+
+        // reserve again with pp graph to avoid ggml-alloc reallocations during inference
+        {
+            auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(), model.hparams.no_alloc);
+            if (!gf) {
+                hetero_plan = saved_plan;
+                aot_active_route_requests_qnn = saved_qnn_active;
                 throw std::runtime_error("failed to allocate compute pp buffers");
             }
+            (void) gf;
         }
 
-        n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
-        n_nodes_pp  = ggml_graph_n_nodes(gf);
-    }
+        hetero_plan = saved_plan;
+        aot_active_route_requests_qnn = saved_qnn_active;
+    };
 
-    // reserve with tg (token generation) graph to get the number of splits and nodes
-    {
-        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
-        if (!gf) {
-            throw std::runtime_error("failed to allocate compute tg buffers");
+    reserve_plan_buffers(hetero_plan, /* capture_stats = */ true);
+
+    const auto env_flag_enabled = [](const char * name) {
+        const char * value = std::getenv(name);
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    };
+
+    if (dynamic_route_config.enabled() && env_flag_enabled("GGML_HETERO_DYNAMIC_PRERESERVE")) {
+        const bool include_fallback = env_flag_enabled("GGML_HETERO_DYNAMIC_PRERESERVE_FALLBACK");
+        std::vector<llama_hetero_execution_plan> reserve_candidates;
+        const auto plan_is_pre_reserved = [&](const llama_hetero_execution_plan & plan) {
+            return std::any_of(
+                hetero_dynamic_pre_reserved_plans.begin(),
+                hetero_dynamic_pre_reserved_plans.end(),
+                [&](const llama_hetero_execution_plan & candidate) {
+                    return llama_hetero_execution_plan_equals(candidate, plan);
+                });
+        };
+        const auto append_reserved_plan = [&](const llama_hetero_execution_plan & plan) {
+            if (!plan.route.has_any_route()) {
+                return;
+            }
+            if (plan_is_pre_reserved(plan)) {
+                return;
+            }
+            hetero_dynamic_pre_reserved_plans.push_back(plan);
+        };
+        const auto append_unique_plan = [&](const llama_hetero_execution_plan & plan) {
+            if (!plan.route.has_any_route()) {
+                return;
+            }
+            if (plan_is_pre_reserved(plan)) {
+                return;
+            }
+            for (const auto & existing : reserve_candidates) {
+                if (llama_hetero_execution_plan_equals(existing, plan)) {
+                    return;
+                }
+            }
+            reserve_candidates.push_back(plan);
+        };
+
+        append_reserved_plan(hetero_plan);
+        if (dynamic_route_config.prefill.configured) {
+            append_unique_plan(dynamic_route_config.prefill.plan);
+        }
+        if (dynamic_route_config.decode.configured) {
+            append_unique_plan(dynamic_route_config.decode.plan);
+        }
+        if (include_fallback && dynamic_route_config.fallback.configured) {
+            append_unique_plan(dynamic_route_config.fallback.plan);
         }
 
-        n_splits_tg = ggml_backend_sched_get_n_splits(sched.get());
-        n_nodes_tg  = ggml_graph_n_nodes(gf);
-    }
-
-    // reserve again with pp graph to avoid ggml-alloc reallocations during inference
-    {
-        // TODO: not sure if the following graph would be worster case for multi-stream KV caches:
-        //
-        // auto * gf = graph_reserve(n_tokens, 1, n_tokens, mctx.get());
-        //
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(), model.hparams.no_alloc);
-        if (!gf) {
-            throw std::runtime_error("failed to allocate compute pp buffers");
+        for (const auto & plan : reserve_candidates) {
+            if (llama_hetero_execution_plan_equals(plan, hetero_plan)) {
+                continue;
+            }
+            reserve_plan_buffers(plan, /* capture_stats = */ false);
+            append_reserved_plan(plan);
         }
+
+        LLAMA_LOG_INFO("%s: pre-reserved %zu dynamic hot plans%s\n",
+                __func__,
+                hetero_dynamic_pre_reserved_plans.size(),
+                include_fallback ? " (including fallback)" : "");
     }
 
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
