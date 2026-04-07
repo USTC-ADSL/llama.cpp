@@ -1,7 +1,11 @@
 
 #include "qnn-lib.hpp"
 
+#include <cctype>
+#include <cerrno>
+#include <cstdlib>
 #include <filesystem>
+#include <limits>
 
 #include "common.hpp"
 #include "rpc-mem.hpp"
@@ -183,6 +187,388 @@ const op_package_lib_info & get_op_package_lib_info(uint32_t soc_model, size_t h
     }
 }
 
+using qnn_htp_voltage_corner_t = decltype(QnnHtpPerfInfrastructure_PowerConfig_t{}.dcvsV3Config.busVoltageCornerMin);
+using qnn_htp_power_mode_t = decltype(QnnHtpPerfInfrastructure_PowerConfig_t{}.dcvsV3Config.powerMode);
+
+struct qnn_htp_power_workpoint {
+    std::string workpoint = "burst";
+
+    bool     apply_rpc_polling      = true;
+    uint32_t rpc_polling_us         = 9999;
+    bool     apply_rpc_control      = true;
+    uint32_t rpc_control_latency_us = 100;
+
+    bool     apply_dcvs       = true;
+    uint32_t dcvs_enable      = 0;
+    uint32_t sleep_latency_us = 40;
+    uint32_t sleep_disable    = 1;
+    qnn_htp_power_mode_t power_mode = QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_PERFORMANCE_MODE;
+
+    qnn_htp_voltage_corner_t bus_min     = DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER;
+    qnn_htp_voltage_corner_t bus_target  = DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER;
+    qnn_htp_voltage_corner_t bus_max     = DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER;
+    qnn_htp_voltage_corner_t core_min    = DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER;
+    qnn_htp_voltage_corner_t core_target = DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER;
+    qnn_htp_voltage_corner_t core_max    = DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER;
+
+    std::string bus_min_name     = "max";
+    std::string bus_target_name  = "max";
+    std::string bus_max_name     = "max";
+    std::string core_min_name    = "max";
+    std::string core_target_name = "max";
+    std::string core_max_name    = "max";
+    std::string power_mode_name  = "performance";
+};
+
+const char * get_nonempty_env(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' ? value : nullptr;
+}
+
+std::string normalize_env_token(const char * value) {
+    std::string normalized;
+    if (value == nullptr) {
+        return normalized;
+    }
+
+    for (const unsigned char c : std::string(value)) {
+        if (std::isalnum(c) != 0) {
+            normalized.push_back(static_cast<char>(std::tolower(c)));
+        }
+    }
+
+    return normalized;
+}
+
+bool parse_env_u32(const char * name, uint32_t & out) {
+    const char * value = get_nonempty_env(name);
+    if (value == nullptr) {
+        return false;
+    }
+
+    errno      = 0;
+    char * end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed > std::numeric_limits<uint32_t>::max()) {
+        QNN_LOG_WARN("invalid value for %s: %s\n", name, value);
+        return false;
+    }
+
+    out = static_cast<uint32_t>(parsed);
+    return true;
+}
+
+bool parse_env_bool(const char * name, uint32_t & out) {
+    const char * value = get_nonempty_env(name);
+    if (value == nullptr) {
+        return false;
+    }
+
+    const std::string normalized = normalize_env_token(value);
+    if (normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on") {
+        out = 1;
+        return true;
+    }
+    if (normalized == "0" || normalized == "false" || normalized == "no" || normalized == "off") {
+        out = 0;
+        return true;
+    }
+
+    QNN_LOG_WARN("invalid boolean value for %s: %s\n", name, value);
+    return false;
+}
+
+bool parse_voltage_corner(const char * raw_value, qnn_htp_voltage_corner_t & out, std::string & out_name) {
+    const std::string normalized = normalize_env_token(raw_value);
+
+    if (normalized == "disable" || normalized == "off" || normalized == "none") {
+        out      = DCVS_VOLTAGE_CORNER_DISABLE;
+        out_name = "disable";
+        return true;
+    }
+    if (normalized == "min" || normalized == "minimum") {
+        out      = DCVS_VOLTAGE_VCORNER_MIN_VOLTAGE_CORNER;
+        out_name = "min";
+        return true;
+    }
+    if (normalized == "svs2") {
+        out      = DCVS_VOLTAGE_VCORNER_SVS2;
+        out_name = "svs2";
+        return true;
+    }
+    if (normalized == "svs") {
+        out      = DCVS_VOLTAGE_VCORNER_SVS;
+        out_name = "svs";
+        return true;
+    }
+    if (normalized == "svsplus") {
+        out      = DCVS_VOLTAGE_VCORNER_SVS_PLUS;
+        out_name = "svs_plus";
+        return true;
+    }
+    if (normalized == "nom" || normalized == "nominal") {
+        out      = DCVS_VOLTAGE_VCORNER_NOM;
+        out_name = "nom";
+        return true;
+    }
+    if (normalized == "nomplus" || normalized == "nominalplus") {
+        out      = DCVS_VOLTAGE_VCORNER_NOM_PLUS;
+        out_name = "nom_plus";
+        return true;
+    }
+    if (normalized == "turbo") {
+        out      = DCVS_VOLTAGE_VCORNER_TURBO;
+        out_name = "turbo";
+        return true;
+    }
+    if (normalized == "turboplus") {
+        out      = DCVS_VOLTAGE_VCORNER_TURBO_PLUS;
+        out_name = "turbo_plus";
+        return true;
+    }
+    if (normalized == "turbol2") {
+        out      = DCVS_VOLTAGE_VCORNER_TURBO_L2;
+        out_name = "turbo_l2";
+        return true;
+    }
+    if (normalized == "turbol3") {
+        out      = DCVS_VOLTAGE_VCORNER_TURBO_L3;
+        out_name = "turbo_l3";
+        return true;
+    }
+    if (normalized == "max" || normalized == "burst" || normalized == "performance") {
+        out      = DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER;
+        out_name = "max";
+        return true;
+    }
+
+    return false;
+}
+
+bool parse_power_mode(const char * raw_value, qnn_htp_power_mode_t & out, std::string & out_name) {
+    const std::string normalized = normalize_env_token(raw_value);
+    if (normalized == "adjustupdown" || normalized == "default") {
+        out      = QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_ADJUST_UP_DOWN;
+        out_name = "adjust_up_down";
+        return true;
+    }
+    if (normalized == "adjustonlyup") {
+        out      = QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_ADJUST_ONLY_UP;
+        out_name = "adjust_only_up";
+        return true;
+    }
+    if (normalized == "powersaver" || normalized == "powersavermode") {
+        out      = QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_POWER_SAVER_MODE;
+        out_name = "power_saver";
+        return true;
+    }
+    if (normalized == "powersaveraggressive" || normalized == "powersaveraggressivemode") {
+        out      = QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_POWER_SAVER_AGGRESSIVE_MODE;
+        out_name = "power_saver_aggressive";
+        return true;
+    }
+    if (normalized == "performance" || normalized == "performancemode") {
+        out      = QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_PERFORMANCE_MODE;
+        out_name = "performance";
+        return true;
+    }
+    if (normalized == "dutycycle" || normalized == "dutycyclemode") {
+        out      = QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_DUTY_CYCLE_MODE;
+        out_name = "duty_cycle";
+        return true;
+    }
+
+    return false;
+}
+
+void set_uniform_bus_corner(qnn_htp_power_workpoint & cfg, qnn_htp_voltage_corner_t value, const std::string & name) {
+    cfg.bus_min       = value;
+    cfg.bus_target    = value;
+    cfg.bus_max       = value;
+    cfg.bus_min_name  = name;
+    cfg.bus_target_name = name;
+    cfg.bus_max_name  = name;
+}
+
+void set_uniform_core_corner(qnn_htp_power_workpoint & cfg, qnn_htp_voltage_corner_t value, const std::string & name) {
+    cfg.core_min        = value;
+    cfg.core_target     = value;
+    cfg.core_max        = value;
+    cfg.core_min_name   = name;
+    cfg.core_target_name = name;
+    cfg.core_max_name   = name;
+}
+
+bool apply_uniform_corner_alias(qnn_htp_power_workpoint & cfg, const char * alias) {
+    qnn_htp_voltage_corner_t corner = cfg.bus_target;
+    std::string              name;
+    if (!parse_voltage_corner(alias, corner, name)) {
+        return false;
+    }
+
+    set_uniform_bus_corner(cfg, corner, name);
+    set_uniform_core_corner(cfg, corner, name);
+    return true;
+}
+
+void apply_workpoint_preset(qnn_htp_power_workpoint & cfg, const char * raw_value) {
+    const std::string normalized = normalize_env_token(raw_value);
+    if (normalized.empty()) {
+        return;
+    }
+
+    if (normalized == "native" || normalized == "none" || normalized == "skip") {
+        cfg.workpoint  = "native";
+        cfg.apply_dcvs = false;
+        return;
+    }
+
+    cfg.apply_dcvs = true;
+    if (normalized == "burst" || normalized == "max" || normalized == "performance") {
+        cfg.workpoint = "burst";
+        if (!apply_uniform_corner_alias(cfg, "max")) {
+            QNN_LOG_WARN("failed to resolve QNN HTP workpoint preset %s, keeping default burst corners\n", raw_value);
+        }
+        return;
+    }
+
+    bool applied = false;
+    if (normalized == "highperformance" || normalized == "sustainedhighperformance") {
+        cfg.workpoint = "high_performance";
+        applied = apply_uniform_corner_alias(cfg, "turbo") || apply_uniform_corner_alias(cfg, "max");
+    } else if (normalized == "balanced" || normalized == "default") {
+        cfg.workpoint = "balanced";
+        applied = apply_uniform_corner_alias(cfg, "nom_plus") ||
+                  apply_uniform_corner_alias(cfg, "nom") ||
+                  apply_uniform_corner_alias(cfg, "svs_plus");
+    } else if (normalized == "lowbalanced") {
+        cfg.workpoint = "low_balanced";
+        applied = apply_uniform_corner_alias(cfg, "nom") ||
+                  apply_uniform_corner_alias(cfg, "svs_plus");
+    } else if (normalized == "highpowersaver") {
+        cfg.workpoint = "high_power_saver";
+        applied = apply_uniform_corner_alias(cfg, "svs_plus") ||
+                  apply_uniform_corner_alias(cfg, "svs");
+    } else if (normalized == "powersaver") {
+        cfg.workpoint = "power_saver";
+        applied = apply_uniform_corner_alias(cfg, "svs") ||
+                  apply_uniform_corner_alias(cfg, "svs2");
+    } else if (normalized == "lowpowersaver") {
+        cfg.workpoint = "low_power_saver";
+        applied = apply_uniform_corner_alias(cfg, "svs2") ||
+                  apply_uniform_corner_alias(cfg, "disable");
+    } else if (normalized == "extremepowersaver") {
+        cfg.workpoint = "extreme_power_saver";
+        applied = apply_uniform_corner_alias(cfg, "disable");
+    } else {
+        QNN_LOG_WARN("unknown QNN HTP workpoint preset: %s\n", raw_value);
+        return;
+    }
+
+    if (!applied) {
+        QNN_LOG_WARN("QNN HTP workpoint preset %s is not supported by this QNN SDK, keeping default burst corners\n",
+                     raw_value);
+    }
+}
+
+void maybe_override_uniform_corner(const char * env_name,
+                                   qnn_htp_voltage_corner_t & min_corner,
+                                   qnn_htp_voltage_corner_t & target_corner,
+                                   qnn_htp_voltage_corner_t & max_corner,
+                                   std::string & min_name,
+                                   std::string & target_name,
+                                   std::string & max_name) {
+    const char * value = get_nonempty_env(env_name);
+    if (value == nullptr) {
+        return;
+    }
+
+    qnn_htp_voltage_corner_t parsed_corner = target_corner;
+    std::string              parsed_name;
+    if (!parse_voltage_corner(value, parsed_corner, parsed_name)) {
+        QNN_LOG_WARN("invalid voltage corner for %s: %s\n", env_name, value);
+        return;
+    }
+
+    min_corner  = parsed_corner;
+    target_corner = parsed_corner;
+    max_corner  = parsed_corner;
+    min_name    = parsed_name;
+    target_name = parsed_name;
+    max_name    = parsed_name;
+}
+
+void maybe_override_single_corner(const char * env_name,
+                                  qnn_htp_voltage_corner_t & corner,
+                                  std::string & corner_name) {
+    const char * value = get_nonempty_env(env_name);
+    if (value == nullptr) {
+        return;
+    }
+
+    if (!parse_voltage_corner(value, corner, corner_name)) {
+        QNN_LOG_WARN("invalid voltage corner for %s: %s\n", env_name, value);
+    }
+}
+
+qnn_htp_power_workpoint get_qnn_htp_power_workpoint_from_env() {
+    qnn_htp_power_workpoint cfg;
+
+    if (const char * preset = get_nonempty_env("GGML_QNN_HTP_WORKPOINT")) {
+        apply_workpoint_preset(cfg, preset);
+    } else if (const char * preset = get_nonempty_env("GGML_QNN_HTP_POWER_MODE")) {
+        apply_workpoint_preset(cfg, preset);
+    }
+
+    parse_env_u32("GGML_QNN_HTP_RPC_POLLING_US", cfg.rpc_polling_us);
+    parse_env_u32("GGML_QNN_HTP_RPC_CONTROL_LATENCY_US", cfg.rpc_control_latency_us);
+    parse_env_u32("GGML_QNN_HTP_SLEEP_LATENCY_US", cfg.sleep_latency_us);
+    parse_env_bool("GGML_QNN_HTP_SLEEP_DISABLE", cfg.sleep_disable);
+
+    uint32_t dcvs_enable = cfg.dcvs_enable;
+    if (parse_env_bool("GGML_QNN_HTP_DCVS_ENABLE", dcvs_enable)) {
+        cfg.apply_dcvs  = true;
+        cfg.dcvs_enable = dcvs_enable;
+    }
+
+    if (const char * raw_power_mode = get_nonempty_env("GGML_QNN_HTP_DCVS_POWER_MODE")) {
+        if (!parse_power_mode(raw_power_mode, cfg.power_mode, cfg.power_mode_name)) {
+            QNN_LOG_WARN("invalid QNN HTP DCVS power mode: %s\n", raw_power_mode);
+        } else {
+            cfg.apply_dcvs = true;
+        }
+    }
+
+    maybe_override_uniform_corner("GGML_QNN_HTP_BUS_VCORNER",
+                                  cfg.bus_min, cfg.bus_target, cfg.bus_max,
+                                  cfg.bus_min_name, cfg.bus_target_name, cfg.bus_max_name);
+    maybe_override_uniform_corner("GGML_QNN_HTP_CORE_VCORNER",
+                                  cfg.core_min, cfg.core_target, cfg.core_max,
+                                  cfg.core_min_name, cfg.core_target_name, cfg.core_max_name);
+
+    maybe_override_single_corner("GGML_QNN_HTP_BUS_VCORNER_MIN", cfg.bus_min, cfg.bus_min_name);
+    maybe_override_single_corner("GGML_QNN_HTP_BUS_VCORNER_TARGET", cfg.bus_target, cfg.bus_target_name);
+    maybe_override_single_corner("GGML_QNN_HTP_BUS_VCORNER_MAX", cfg.bus_max, cfg.bus_max_name);
+    maybe_override_single_corner("GGML_QNN_HTP_CORE_VCORNER_MIN", cfg.core_min, cfg.core_min_name);
+    maybe_override_single_corner("GGML_QNN_HTP_CORE_VCORNER_TARGET", cfg.core_target, cfg.core_target_name);
+    maybe_override_single_corner("GGML_QNN_HTP_CORE_VCORNER_MAX", cfg.core_max, cfg.core_max_name);
+
+    if (get_nonempty_env("GGML_QNN_HTP_BUS_VCORNER") != nullptr ||
+        get_nonempty_env("GGML_QNN_HTP_SLEEP_LATENCY_US") != nullptr ||
+        get_nonempty_env("GGML_QNN_HTP_SLEEP_DISABLE") != nullptr ||
+        get_nonempty_env("GGML_QNN_HTP_CORE_VCORNER") != nullptr ||
+        get_nonempty_env("GGML_QNN_HTP_BUS_VCORNER_MIN") != nullptr ||
+        get_nonempty_env("GGML_QNN_HTP_BUS_VCORNER_TARGET") != nullptr ||
+        get_nonempty_env("GGML_QNN_HTP_BUS_VCORNER_MAX") != nullptr ||
+        get_nonempty_env("GGML_QNN_HTP_CORE_VCORNER_MIN") != nullptr ||
+        get_nonempty_env("GGML_QNN_HTP_CORE_VCORNER_TARGET") != nullptr ||
+        get_nonempty_env("GGML_QNN_HTP_CORE_VCORNER_MAX") != nullptr) {
+        cfg.apply_dcvs = true;
+    }
+
+    return cfg;
+}
+
 }  // namespace
 
 namespace qnn {
@@ -224,6 +610,119 @@ qnn_instance::qnn_instance(const std::string & lib_path, backend_index_type devi
     } else {
         QNN_LOG_ERROR("[%s] set_qnn_lib_search_path failed\n", _backend_lib_name.c_str());
     }
+}
+
+int qnn_instance::init_htp_perfinfra() {
+    QnnDevice_Infrastructure_t device_infra = nullptr;
+    auto                       error        = _qnn_interface->qnn_device_get_infrastructure(&device_infra);
+    if (error != QNN_SUCCESS) {
+        QNN_LOG_WARN("failed to get qnn device infra\n");
+        return 1;
+    }
+
+    QNN_LOG_INFO("HTP backend perf_infrastructure creation ok\n");
+
+    QnnHtpDevice_Infrastructure_t *     htp_infra      = static_cast<QnnHtpDevice_Infrastructure_t *>(device_infra);
+    QnnHtpDevice_PerfInfrastructure_t * htp_perfinfra  = &htp_infra->perfInfra;
+    uint32_t                            power_configid = 1;
+    const uint32_t                      device_id      = 0;
+    const uint32_t                      core_id        = 0;
+    htp_perfinfra->createPowerConfigId(device_id, core_id, &power_configid);
+    if (htp_infra->infraType != QNN_HTP_DEVICE_INFRASTRUCTURE_TYPE_PERF) {
+        QNN_LOG_INFO("HTP infra type = %d, which is not perf infra type\n", htp_infra->infraType);
+    } else {
+        QNN_LOG_INFO("HTP infra type = %d, which is perf infra type\n", htp_infra->infraType);
+    }
+
+    _qnn_htp_perfinfra  = htp_perfinfra;
+    _qnn_power_configid = power_configid;
+    return 0;
+}
+
+int qnn_instance::set_htp_power_workpoint() {
+    if (_qnn_htp_perfinfra == nullptr) {
+        QNN_LOG_WARN("perf infra is null\n");
+        return 1;
+    }
+
+    const qnn_htp_power_workpoint cfg = get_qnn_htp_power_workpoint_from_env();
+
+    std::vector<QnnHtpPerfInfrastructure_PowerConfig_t> config_storage;
+    config_storage.reserve(3);
+
+    if (cfg.apply_rpc_polling) {
+        QnnHtpPerfInfrastructure_PowerConfig_t rpc_polling_time;
+        memset(&rpc_polling_time, 0, sizeof(rpc_polling_time));
+        rpc_polling_time.option               = QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_RPC_POLLING_TIME;
+        rpc_polling_time.rpcPollingTimeConfig = cfg.rpc_polling_us;
+        config_storage.push_back(rpc_polling_time);
+    }
+
+    if (cfg.apply_rpc_control) {
+        QnnHtpPerfInfrastructure_PowerConfig_t rpc_control_latency;
+        memset(&rpc_control_latency, 0, sizeof(rpc_control_latency));
+        rpc_control_latency.option                  = QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_RPC_CONTROL_LATENCY;
+        rpc_control_latency.rpcControlLatencyConfig = cfg.rpc_control_latency_us;
+        config_storage.push_back(rpc_control_latency);
+    }
+
+    if (cfg.apply_dcvs) {
+        QnnHtpPerfInfrastructure_PowerConfig_t power_config;
+        memset(&power_config, 0, sizeof(power_config));
+        power_config.option = QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_DCVS_V3;
+
+        power_config.dcvsV3Config.contextId       = _qnn_power_configid;
+        power_config.dcvsV3Config.powerMode       = cfg.power_mode;
+        power_config.dcvsV3Config.setDcvsEnable   = 1;
+        power_config.dcvsV3Config.dcvsEnable      = cfg.dcvs_enable;
+        power_config.dcvsV3Config.setSleepLatency = 1;
+        power_config.dcvsV3Config.sleepLatency    = cfg.sleep_latency_us;
+        power_config.dcvsV3Config.setSleepDisable = 1;
+        power_config.dcvsV3Config.sleepDisable    = cfg.sleep_disable;
+        power_config.dcvsV3Config.setBusParams    = 1;
+        power_config.dcvsV3Config.setCoreParams   = 1;
+
+        power_config.dcvsV3Config.busVoltageCornerMin     = cfg.bus_min;
+        power_config.dcvsV3Config.busVoltageCornerTarget  = cfg.bus_target;
+        power_config.dcvsV3Config.busVoltageCornerMax     = cfg.bus_max;
+        power_config.dcvsV3Config.coreVoltageCornerMin    = cfg.core_min;
+        power_config.dcvsV3Config.coreVoltageCornerTarget = cfg.core_target;
+        power_config.dcvsV3Config.coreVoltageCornerMax    = cfg.core_max;
+
+        config_storage.push_back(power_config);
+    }
+
+    if (config_storage.empty()) {
+        QNN_LOG_INFO("QNN HTP power workpoint requested no explicit power config update\n");
+        return 0;
+    }
+
+    std::vector<const QnnHtpPerfInfrastructure_PowerConfig_t *> power_configs;
+    power_configs.reserve(config_storage.size() + 1);
+    for (const auto & config : config_storage) {
+        power_configs.push_back(&config);
+    }
+    power_configs.push_back(nullptr);
+
+    const Qnn_ErrorHandle_t qnn_status = _qnn_htp_perfinfra->setPowerConfig(_qnn_power_configid, power_configs.data());
+    if (qnn_status != QNN_SUCCESS) {
+        QNN_LOG_WARN("set QNN HTP power workpoint failed\n");
+        return 1;
+    }
+
+    QNN_LOG_INFO("QNN HTP workpoint=%s dcvs=%u dcvs_power_mode=%s sleep_disable=%u sleep_latency_us=%u rpc_poll_us=%u rpc_ctrl_us=%u "
+                 "bus=%s/%s/%s core=%s/%s/%s\n",
+                 cfg.workpoint.c_str(),
+                 cfg.dcvs_enable,
+                 cfg.power_mode_name.c_str(),
+                 cfg.sleep_disable,
+                 cfg.sleep_latency_us,
+                 cfg.rpc_polling_us,
+                 cfg.rpc_control_latency_us,
+                 cfg.bus_min_name.c_str(), cfg.bus_target_name.c_str(), cfg.bus_max_name.c_str(),
+                 cfg.core_min_name.c_str(), cfg.core_target_name.c_str(), cfg.core_max_name.c_str());
+
+    return 0;
 }
 
 bool qnn_instance::qnn_init(const QnnSaver_Config_t ** saver_config) {
@@ -353,11 +852,8 @@ bool qnn_instance::qnn_init(const QnnSaver_Config_t ** saver_config) {
         if (init_htp_perfinfra() != 0) {
             QNN_LOG_WARN("initialize HTP performance failure\n");
         }
-        if (set_rpc_polling() != 0) {
-            QNN_LOG_WARN("set RPC polling failure\n");
-        }
-        if (set_high_performance_mode() != 0) {
-            QNN_LOG_WARN("set HTP high performance mode failure\n");
+        if (set_htp_power_workpoint() != 0) {
+            QNN_LOG_WARN("set HTP power workpoint failure\n");
         }
     }
 
