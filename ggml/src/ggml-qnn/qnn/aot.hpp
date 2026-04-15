@@ -226,7 +226,7 @@ class qnn_aot_runtime {
     qnn_aot_graph * select_attention_graph(size_t start_layer_id, size_t end_layer_id, size_t n_tokens) const;
     qnn_aot_graph * select_attn_proj_graph(size_t n_tokens, size_t layer_id);
     qnn_aot_graph * select_attn_core_graph(size_t n_tokens, size_t layer_id);
-    qnn_aot_graph * select_transformer_graph(size_t n_tokens) const;
+    const graph_bucket * select_transformer_graphs(size_t n_tokens) const;
     qnn_aot_graph * select_ffn_graph(size_t n_tokens, size_t layer_id);
     qnn_aot_graph * select_lm_head_graph(size_t n_tokens);
     qnn_aot_graph * select_graph(const std::vector<qnn_aot_graph_config> & configs,

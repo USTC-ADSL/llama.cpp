@@ -7568,8 +7568,11 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         ggml_backend_dev_get_props(dev, &props);
         bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
+        const char * dev_name = ggml_backend_dev_name(dev);
+        const bool is_opencl_dev = dev_name != nullptr && std::strcmp(dev_name, "GPUOpenCL") == 0;
 
         std::vector<ggml_backend_buffer_ptr> bufs;
+        bool fallback_to_alloc_ctx_tensors = false;
         if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
@@ -7586,12 +7589,28 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 const size_t max_size = ggml_get_max_tensor_size(ctx);
                 ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
                 if (buf == nullptr) {
+                    if (is_opencl_dev) {
+                        LLAMA_LOG_WARN(
+                                "%s: failed to map %.2f MiB of mmap weights into %s for file %u at range [%zu, %zu), falling back to copied allocation\n",
+                                __func__,
+                                (last - first) / 1024.0 / 1024.0,
+                                ggml_backend_buft_name(buft),
+                                idx,
+                                first,
+                                last);
+                        fallback_to_alloc_ctx_tensors = true;
+                        buf_map.clear();
+                        bufs.clear();
+                        break;
+                    }
                     throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
                 }
                 bufs.emplace_back(buf);
                 buf_map.emplace(idx, buf);
             }
-        } else {
+        }
+
+        if (!ml.use_mmap || !use_mmap_buffer || !buffer_from_host_ptr_supported || !is_default_buft || fallback_to_alloc_ctx_tensors) {
             ggml_backend_buffer_t buf;
             if (ml.no_alloc) {
                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer

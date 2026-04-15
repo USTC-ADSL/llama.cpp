@@ -3574,24 +3574,21 @@ qnn_aot_graph * qnn_aot_runtime::select_attention_graph(size_t start_layer_id, s
     return best_ge != nullptr ? best_ge : best_lt;
 }
 
-qnn_aot_graph * qnn_aot_runtime::select_transformer_graph(size_t n_tokens) const {
+const qnn_aot_runtime::graph_bucket * qnn_aot_runtime::select_transformer_graphs(size_t n_tokens) const {
     if (_transformer_graphs.empty()) {
         return nullptr;
     }
 
-    const auto select_from_bucket = [](const graph_bucket & bucket) -> qnn_aot_graph * {
-        for (const auto & graph : bucket) {
-            if (graph) {
-                return graph.get();
-            }
-        }
-        return nullptr;
+    const auto bucket_has_graph = [](const graph_bucket & bucket) {
+        return std::any_of(bucket.begin(), bucket.end(), [](const auto & graph) {
+            return graph != nullptr;
+        });
     };
 
     const size_t target_tokens = std::max<size_t>(1, n_tokens);
     for (auto it = _transformer_graphs.lower_bound(target_tokens); it != _transformer_graphs.end(); ++it) {
-        if (auto * graph = select_from_bucket(it->second)) {
-            return graph;
+        if (bucket_has_graph(it->second)) {
+            return &it->second;
         }
     }
 
@@ -3599,8 +3596,8 @@ qnn_aot_graph * qnn_aot_runtime::select_transformer_graph(size_t n_tokens) const
         if (it->first >= target_tokens) {
             continue;
         }
-        if (auto * graph = select_from_bucket(it->second)) {
-            return graph;
+        if (bucket_has_graph(it->second)) {
+            return &it->second;
         }
     }
 
@@ -4639,20 +4636,81 @@ bool qnn_aot_runtime::execute_attention(ggml_cgraph * cgraph, const aot_match_re
 
 bool qnn_aot_runtime::execute_transformer(ggml_cgraph * cgraph, const aot_match_result & match) {
     GGML_UNUSED(cgraph);
-    auto * graph = select_transformer_graph(match.n_tokens);
-    if (!graph || !match.embd || !match.out) {
+    const auto * graph_bucket = select_transformer_graphs(match.n_tokens);
+    if (graph_bucket == nullptr || !match.embd || !match.out) {
         return false;
     }
 
+    std::vector<qnn_aot_graph *> graphs;
+    graphs.reserve(graph_bucket->size());
+    for (const auto & graph_ptr : *graph_bucket) {
+        if (graph_ptr) {
+            graphs.push_back(graph_ptr.get());
+        }
+    }
+    if (graphs.empty()) {
+        return false;
+    }
+
+    bool use_segmented_chain = false;
+    for (size_t i = 1; i < graphs.size(); ++i) {
+        const auto & first = graphs.front()->config();
+        const auto & current = graphs[i]->config();
+        if (current.start_layer_id != first.start_layer_id || current.end_layer_id != first.end_layer_id) {
+            use_segmented_chain = true;
+            break;
+        }
+    }
+    if (!use_segmented_chain && graphs.size() > 1) {
+        graphs.resize(1);
+    }
+
+    const size_t graph_batch_size = graphs.front()->batch_size();
+    size_t expected_start_layer = 0;
+    for (size_t i = 0; i < graphs.size(); ++i) {
+        auto * graph = graphs[i];
+        const auto & config = graph->config();
+        if (graph->batch_size() != graph_batch_size) {
+            QNN_LOG_WARN("[aot] transformer graph batch mismatch in selected chain: expected=%zu got=%zu graph=%s\n",
+                         graph_batch_size,
+                         graph->batch_size(),
+                         config.graph_name.c_str());
+            return false;
+        }
+
+        if (config.end_layer_id > config.start_layer_id) {
+            if (i == 0) {
+                expected_start_layer = config.start_layer_id;
+            }
+            if (config.start_layer_id != expected_start_layer) {
+                QNN_LOG_WARN("[aot] transformer graph chain is not contiguous for batch=%zu: expected start=%zu got start=%zu end=%zu graph=%s\n",
+                             graph_batch_size,
+                             expected_start_layer,
+                             config.start_layer_id,
+                             config.end_layer_id,
+                             config.graph_name.c_str());
+                return false;
+            }
+            expected_start_layer = config.end_layer_id;
+        }
+    }
+
     if (aot_trace_match_enabled()) {
-        QNN_LOG_INFO("[aot] execute transformer graph %s tokens=%zu batch=%zu\n",
-                     graph->config().graph_name.c_str(),
-                     match.n_tokens,
-                     graph->batch_size());
+        for (size_t i = 0; i < graphs.size(); ++i) {
+            const auto & config = graphs[i]->config();
+            QNN_LOG_INFO("[aot] execute transformer graph %s layers=[%zu,%zu) tokens=%zu batch=%zu part=%zu/%zu\n",
+                         config.graph_name.c_str(),
+                         config.start_layer_id,
+                         config.end_layer_id,
+                         match.n_tokens,
+                         graphs[i]->batch_size(),
+                         i + 1,
+                         graphs.size());
+        }
     }
 
     if ((match.inferred_pos == 0 && _kv_position != 0) ||
-        (_kv_position + match.n_tokens > graph->config().cache_size && match.inferred_pos == 0)) {
+        (_kv_position + match.n_tokens > graphs.front()->config().cache_size && match.inferred_pos == 0)) {
         reset_state();
     }
 
@@ -4670,11 +4728,13 @@ bool qnn_aot_runtime::execute_transformer(ggml_cgraph * cgraph, const aot_match_
     }
 
     if (_kv_position == 0 && generic_prefix_tokens > 0) {
-        if (!import_generic_kv_prefix_to_graph(*graph, match, generic_prefix_tokens)) {
-            QNN_LOG_WARN("[aot] transformer failed to import generic KV prefix for graph=%s inferred_pos=%zu\n",
-                         graph->config().graph_name.c_str(),
-                         generic_prefix_tokens);
-            return false;
+        for (auto * graph : graphs) {
+            if (!import_generic_kv_prefix_to_graph(*graph, match, generic_prefix_tokens)) {
+                QNN_LOG_WARN("[aot] transformer failed to import generic KV prefix for graph=%s inferred_pos=%zu\n",
+                             graph->config().graph_name.c_str(),
+                             generic_prefix_tokens);
+                return false;
+            }
         }
         _kv_position = generic_prefix_tokens;
     }
@@ -4692,37 +4752,101 @@ bool qnn_aot_runtime::execute_transformer(ggml_cgraph * cgraph, const aot_match_
         return false;
     }
 
-    auto * x_buffer   = static_cast<float *>(graph->buffer_data(graph->config().x_name));
-    auto * out_buffer = static_cast<float *>(graph->buffer_data(graph->config().out_name));
-    if (!x_buffer || !out_buffer) {
-        QNN_LOG_WARN("[aot] missing transformer x/out buffers\n");
-        return false;
+    for (auto * graph : graphs) {
+        auto * x_buffer   = static_cast<float *>(graph->buffer_data(graph->config().x_name));
+        auto * out_buffer = static_cast<float *>(graph->buffer_data(graph->config().out_name));
+        if (!x_buffer || !out_buffer) {
+            QNN_LOG_WARN("[aot] missing transformer x/out buffers for graph=%s\n",
+                         graph->config().graph_name.c_str());
+            return false;
+        }
+
+        const Qnn_DataType_t x_dtype = graph->tensor_data_type(graph->config().x_name);
+        const Qnn_DataType_t out_dtype = graph->tensor_data_type(graph->config().out_name);
+        if ((x_dtype != QNN_DATATYPE_FLOAT_32 && x_dtype != QNN_DATATYPE_UNDEFINED) ||
+            (out_dtype != QNN_DATATYPE_FLOAT_32 && out_dtype != QNN_DATATYPE_UNDEFINED)) {
+            QNN_LOG_WARN("[aot] transformer graph %s uses unsupported intermediate dtype x=%s out=%s; only f32 is supported for chained full-graph execution\n",
+                         graph->config().graph_name.c_str(),
+                         qnn::qnn_datatype_to_string(x_dtype),
+                         qnn::qnn_datatype_to_string(out_dtype));
+            return false;
+        }
+
+        if (aot_trace_match_enabled()) {
+            const char * embd_name = ggml_get_name(match.embd);
+            const char * out_name = ggml_get_name(match.out);
+            QNN_LOG_INFO("[aot] transformer io graph=%s layers=[%zu,%zu) tokens=%zu batch=%zu x={dtype=%s bytes=%zu} out={dtype=%s bytes=%zu} ggml_x={name=%s type=%s bytes=%zu nb1=%zu contig=%d} ggml_out={name=%s type=%s bytes=%zu nb1=%zu contig=%d}\n",
+                         graph->config().graph_name.c_str(),
+                         graph->config().start_layer_id,
+                         graph->config().end_layer_id,
+                         match.n_tokens,
+                         graph->batch_size(),
+                         qnn::qnn_datatype_to_string(x_dtype),
+                         graph->buffer_size(graph->config().x_name),
+                         qnn::qnn_datatype_to_string(out_dtype),
+                         graph->buffer_size(graph->config().out_name),
+                         embd_name != nullptr ? embd_name : "<unnamed>",
+                         ggml_type_name(match.embd->type),
+                         ggml_nbytes(match.embd),
+                         match.embd->nb[1],
+                         ggml_is_contiguous(match.embd) ? 1 : 0,
+                         out_name != nullptr ? out_name : "<unnamed>",
+                         ggml_type_name(match.out->type),
+                         ggml_nbytes(match.out),
+                         match.out->nb[1],
+                         ggml_is_contiguous(match.out) ? 1 : 0);
+        }
     }
 
     size_t offset = 0;
     while (offset < match.n_tokens) {
-        const size_t step = std::min(match.n_tokens - offset, graph->batch_size());
+        const size_t step = std::min(match.n_tokens - offset, graph_batch_size);
+        const size_t step_bytes = step * embed_dim * sizeof(float);
+        const float * stage_input = nullptr;
 
-        if (step < graph->batch_size()) {
-            std::memset(x_buffer, 0, graph->buffer_size(graph->config().x_name));
+        for (size_t i = 0; i < graphs.size(); ++i) {
+            auto * graph = graphs[i];
+            auto * x_buffer   = static_cast<float *>(graph->buffer_data(graph->config().x_name));
+            auto * out_buffer = static_cast<float *>(graph->buffer_data(graph->config().out_name));
+
+            if (step_bytes > graph->buffer_size(graph->config().x_name) ||
+                step_bytes > graph->buffer_size(graph->config().out_name)) {
+                QNN_LOG_WARN("[aot] transformer graph %s buffer too small for step=%zu bytes=%zu x_bytes=%zu out_bytes=%zu\n",
+                             graph->config().graph_name.c_str(),
+                             step,
+                             step_bytes,
+                             graph->buffer_size(graph->config().x_name),
+                             graph->buffer_size(graph->config().out_name));
+                return false;
+            }
+
+            if (step < graph->batch_size()) {
+                std::memset(x_buffer, 0, graph->buffer_size(graph->config().x_name));
+            }
+
+            if (i == 0) {
+                copy_ggml_rows_to_contiguous(match.embd, offset, step, embed_dim, x_buffer);
+            } else {
+                std::memmove(x_buffer, stage_input, step_bytes);
+            }
+
+            fill_rope_embeds(*graph, _kv_position, step);
+            fill_attention_bias(*graph, step);
+
+            if (!graph->execute()) {
+                return false;
+            }
+
+            save_kv(*graph, step);
+            if (!write_generic_kv_from_graph(*graph, match, offset, step)) {
+                return false;
+            }
+
+            stage_input = out_buffer;
         }
 
-        copy_ggml_rows_to_contiguous(match.embd, offset, step, embed_dim, x_buffer);
-
-        fill_rope_embeds(*graph, _kv_position, step);
-
-        fill_attention_bias(*graph, step);
-
-        if (!graph->execute()) {
-            return false;
-        }
-
-        copy_contiguous_rows_to_ggml(match.out, offset, step, embed_dim, out_buffer);
-
-        save_kv(*graph, step);
-        if (!write_generic_kv_from_graph(*graph, match, offset, step)) {
-            return false;
-        }
+        GGML_ASSERT(stage_input != nullptr);
+        copy_contiguous_rows_to_ggml(match.out, offset, step, embed_dim, stage_input);
 
         _kv_position += step;
         offset += step;
