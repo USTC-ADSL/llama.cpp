@@ -1436,11 +1436,21 @@ void llama_context::sched_reserve() {
     sched_need_reserve = false;
     hetero_dynamic_pre_reserved_plans.clear();
 
+    const int64_t pending_batch_compute_start_us =
+        (n_queued_tokens == 0) ? t_compute_start_us : 0;
+
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
     hetero_phase_trace_suppress_sync_log = true;
     synchronize();
     hetero_phase_trace_suppress_sync_log = false;
+
+    if (pending_batch_compute_start_us != 0 && t_compute_start_us == 0 && n_queued_tokens == 0) {
+        // sched_reserve() synchronizes before the current batch is formally queued.
+        // Preserve its start timestamp so subsequent perf accounting measures the
+        // batch that triggered the reserve instead of time since process start.
+        t_compute_start_us = pending_batch_compute_start_us;
+    }
 
     const int64_t t_start_us = ggml_time_us();
 
