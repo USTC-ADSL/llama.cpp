@@ -270,6 +270,10 @@ private:
     bool backend_available_for_route(const std::string & backend_name) const;
     ggml_backend_t find_backend_for_route(const std::string & backend_name) const;
     bool sync_dynamic_cpu_opencl_kv(bool host_to_device);
+    bool rebuild_dynamic_consumer_kv_from_state(
+            const std::string & producer_backend,
+            const std::string & consumer_backend,
+            const char * reason);
     void maybe_debug_dump_powerserve_prefix_before_qnn_switch();
     bool migrate_dynamic_cpu_opencl_kv(const std::string & producer_backend, const std::string & consumer_backend);
     void validate_dynamic_seq0_token_history();

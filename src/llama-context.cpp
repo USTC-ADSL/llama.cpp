@@ -4278,9 +4278,10 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
     return io.n_bytes();
 }
 
-bool llama_context::migrate_dynamic_cpu_opencl_kv(
+bool llama_context::rebuild_dynamic_consumer_kv_from_state(
         const std::string & producer_backend,
-        const std::string & consumer_backend) {
+        const std::string & consumer_backend,
+        const char * reason) {
     if (memory == nullptr) {
         return true;
     }
@@ -4288,10 +4289,12 @@ bool llama_context::migrate_dynamic_cpu_opencl_kv(
     const std::string producer = llama_hetero_canonical_backend(producer_backend);
     const std::string consumer = llama_hetero_canonical_backend(consumer_backend);
 
-    if ((producer != "cpu" && producer != "opencl") ||
-        (consumer != "cpu" && consumer != "opencl") ||
-        producer == consumer) {
-        LLAMA_LOG_ERROR("%s: unsupported CPU/OpenCL KV migration request producer=%s consumer=%s\n",
+    const bool producer_supported =
+        producer == "cpu" || producer == "opencl" || llama_hetero_is_qnn_backend(producer);
+    const bool consumer_supported = consumer == "cpu" || consumer == "opencl";
+
+    if (!producer_supported || !consumer_supported || producer == consumer) {
+        LLAMA_LOG_ERROR("%s: unsupported dynamic KV rebuild request producer=%s consumer=%s\n",
                 __func__,
                 producer.empty() ? "<unset>" : producer.c_str(),
                 consumer.empty() ? "<unset>" : consumer.c_str());
@@ -4325,7 +4328,7 @@ bool llama_context::migrate_dynamic_cpu_opencl_kv(
         migration_contract.implemented = true;
         migration_contract.buffer_available = true;
         migration_contract.zero_copy = false;
-        migration_contract.reason = "cpu-opencl-phase-migration";
+        migration_contract.reason = reason != nullptr ? reason : "dynamic-phase-migration";
 
         llama_memory_params params_mem = {
             /*.type_k =*/ kv_type_k,
@@ -4361,12 +4364,13 @@ bool llama_context::migrate_dynamic_cpu_opencl_kv(
         hetero_dynamic_pre_reserved_plans.clear();
         sched_need_reserve = true;
 
-        LLAMA_LOG_INFO("%s: rebuilt KV-backed memory for CPU/OpenCL phase migration %s -> %s using consumer-owned placement\n",
+        LLAMA_LOG_INFO("%s: rebuilt KV-backed memory for dynamic phase migration %s -> %s using consumer-owned placement (reason=%s)\n",
                 __func__,
                 producer.c_str(),
-                consumer.c_str());
+                consumer.c_str(),
+                migration_contract.reason.c_str());
     } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR("%s: CPU/OpenCL KV migration failed for %s -> %s: %s\n",
+        LLAMA_LOG_ERROR("%s: dynamic KV rebuild failed for %s -> %s: %s\n",
                 __func__,
                 producer.c_str(),
                 consumer.c_str(),
@@ -4375,6 +4379,25 @@ bool llama_context::migrate_dynamic_cpu_opencl_kv(
     }
 
     return true;
+}
+
+bool llama_context::migrate_dynamic_cpu_opencl_kv(
+        const std::string & producer_backend,
+        const std::string & consumer_backend) {
+    const std::string producer = llama_hetero_canonical_backend(producer_backend);
+    const std::string consumer = llama_hetero_canonical_backend(consumer_backend);
+
+    if ((producer != "cpu" && producer != "opencl") ||
+        (consumer != "cpu" && consumer != "opencl") ||
+        producer == consumer) {
+        LLAMA_LOG_ERROR("%s: unsupported CPU/OpenCL KV migration request producer=%s consumer=%s\n",
+                __func__,
+                producer.empty() ? "<unset>" : producer.c_str(),
+                consumer.empty() ? "<unset>" : consumer.c_str());
+        return false;
+    }
+
+    return rebuild_dynamic_consumer_kv_from_state(producer, consumer, "cpu-opencl-phase-migration");
 }
 
 bool llama_context::replay_dynamic_qnn_prefix() {
@@ -4388,6 +4411,10 @@ bool llama_context::replay_dynamic_qnn_prefix() {
     const std::string active_backend_name =
         llama_hetero_canonical_backend(hetero_plan.route.backend_for(llama_hetero_route_stage::ATTN_CORE));
     const bool replaying_into_qnn = hetero_route_requests_qnn(hetero_plan.route);
+    const bool opencl_is_primary_backend =
+        !model.devices.empty() &&
+        model.devices[0] != nullptr &&
+        std::strcmp(ggml_backend_dev_name(model.devices[0]), "GPUOpenCL") == 0;
     ggml_backend_t qnn_backend = replaying_into_qnn ? find_backend_for_route(active_backend_name) : nullptr;
     ggml_backend_qnn_aot_reset_state_t reset_state_fn = nullptr;
     llama_batch replay_batch = {};
@@ -4492,6 +4519,33 @@ bool llama_context::replay_dynamic_qnn_prefix() {
 
     if (n_queued_tokens > 0) {
         synchronize();
+    }
+
+    if (qnn_prefix_replay_rebuild_live_memory &&
+        active_backend_name == "opencl" &&
+        !opencl_is_primary_backend) {
+        const std::string producer_backend =
+            qnn_prefix_replay_restore_plan_valid
+                ? llama_hetero_canonical_backend(
+                      qnn_prefix_replay_restore_plan.route.backend_for(llama_hetero_route_stage::ATTN_CORE))
+                : std::string("qnn-npu");
+        LLAMA_LOG_INFO("%s: rebuilding opencl-owned KV state from serialized context state instead of replaying the prefix through the decoder graph\n",
+                __func__);
+        if (!rebuild_dynamic_consumer_kv_from_state(producer_backend, active_backend_name, "qnn-opencl-phase-migration")) {
+            return cleanup_failure("failed to rebuild opencl-owned KV state after qnn decode");
+        }
+
+        qnn_prefix_replay_pending = false;
+        qnn_prefix_replay_restore_plan_valid = false;
+        qnn_prefix_replay_rebuild_live_memory = false;
+        return true;
+    }
+
+    if (qnn_prefix_replay_rebuild_live_memory &&
+        active_backend_name == "opencl" &&
+        opencl_is_primary_backend) {
+        LLAMA_LOG_INFO("%s: OpenCL is the primary backend for this context, keeping prefix replay on the decoder graph so OpenCL-native model weights stay in the fast path\n",
+                __func__);
     }
 
     if (replaying_into_qnn && !reset_state_fn(qnn_backend)) {
