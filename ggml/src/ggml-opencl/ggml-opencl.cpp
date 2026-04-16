@@ -3304,13 +3304,13 @@ void ggml_backend_opencl_context::release_external_host_views() {
     external_tensor_extras.clear();
 }
 
-static bool ggml_backend_opencl_is_qnn_shared_host_buffer(ggml_backend_buffer_t buffer) {
+static bool ggml_backend_opencl_needs_external_host_alias(ggml_backend_buffer_t buffer) {
     if (buffer == nullptr || !ggml_backend_buffer_is_host(buffer)) {
         return false;
     }
 
     const char * buffer_name = ggml_backend_buffer_name(buffer);
-    return buffer_name != nullptr && std::strcmp(buffer_name, "qnn-npu-host") == 0;
+    return buffer_name == nullptr || std::strcmp(buffer_name, "OpenCL_Host") != 0;
 }
 
 static bool ggml_backend_opencl_can_create_aligned_sub_buffer(const ggml_tensor_extra_cl * extra, size_t alignment) {
@@ -3321,6 +3321,50 @@ static bool ggml_backend_opencl_can_create_aligned_sub_buffer_at_offset(const gg
     return extra != nullptr && extra->data_device != nullptr && alignment != 0 && (offset % alignment) == 0;
 }
 
+static cl_mem ggml_backend_opencl_get_or_create_external_host_buffer_alias(
+        ggml_backend_t backend,
+        ggml_backend_buffer_t buffer) {
+    if (backend == nullptr || buffer == nullptr || !ggml_backend_opencl_needs_external_host_alias(buffer)) {
+        return nullptr;
+    }
+
+    auto * backend_ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
+    if (backend_ctx == nullptr || backend_ctx->context == nullptr) {
+        return nullptr;
+    }
+
+    void * base = ggml_backend_buffer_get_base(buffer);
+    const size_t size = ggml_backend_buffer_get_size(buffer);
+    if (base == nullptr || size == 0) {
+        return nullptr;
+    }
+
+    const size_t alignment = std::max((size_t) backend_ctx->alignment, (size_t) TENSOR_ALIGNMENT);
+    if (((uintptr_t) base) % alignment != 0) {
+        return nullptr;
+    }
+
+    auto it = backend_ctx->external_host_buffer_aliases.find(buffer);
+    if (it != backend_ctx->external_host_buffer_aliases.end()) {
+        return it->second;
+    }
+
+    cl_int err = CL_SUCCESS;
+    cl_mem data_device = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR, size, base, &err);
+    if (err != CL_SUCCESS || data_device == nullptr) {
+        return nullptr;
+    }
+
+    backend_ctx->external_host_buffer_aliases.emplace(buffer, data_device);
+    return data_device;
+}
+
+static cl_mem ggml_backend_opencl_get_syncable_host_buffer_mem(
+        ggml_backend_t backend,
+        ggml_backend_buffer_t buffer);
+
+static void sync_with_other_backends(ggml_backend_opencl_context * backend_ctx);
+
 static ggml_tensor_extra_cl * ggml_backend_opencl_ensure_tensor_extra_from_host_buffer(
         ggml_backend_t backend,
         ggml_tensor * tensor) {
@@ -3328,10 +3372,10 @@ static ggml_tensor_extra_cl * ggml_backend_opencl_ensure_tensor_extra_from_host_
         return nullptr;
     }
 
-    const bool is_qnn_shared_host = ggml_backend_opencl_is_qnn_shared_host_buffer(tensor->buffer);
+    const bool needs_external_host_alias = ggml_backend_opencl_needs_external_host_alias(tensor->buffer);
     if (tensor->extra != nullptr) {
         auto * extra = static_cast<ggml_tensor_extra_cl *>(tensor->extra);
-        if (!is_qnn_shared_host) {
+        if (!needs_external_host_alias) {
             return extra;
         }
 
@@ -3357,12 +3401,7 @@ static ggml_tensor_extra_cl * ggml_backend_opencl_ensure_tensor_extra_from_host_
         return nullptr;
     }
 
-    if (!is_qnn_shared_host) {
-        return nullptr;
-    }
-
-    auto * backend_ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
-    if (backend_ctx == nullptr || backend_ctx->context == nullptr) {
+    if (!needs_external_host_alias) {
         return nullptr;
     }
 
@@ -3372,23 +3411,12 @@ static ggml_tensor_extra_cl * ggml_backend_opencl_ensure_tensor_extra_from_host_
         return nullptr;
     }
 
-    const size_t alignment = std::max((size_t) backend_ctx->alignment, (size_t) TENSOR_ALIGNMENT);
-    if (((uintptr_t) base) % alignment != 0) {
+    cl_mem data_device = ggml_backend_opencl_get_or_create_external_host_buffer_alias(backend, tensor->buffer);
+    if (data_device == nullptr) {
         return nullptr;
     }
 
-    cl_mem data_device = nullptr;
-    auto it = backend_ctx->external_host_buffer_aliases.find(tensor->buffer);
-    if (it != backend_ctx->external_host_buffer_aliases.end()) {
-        data_device = it->second;
-    } else {
-        cl_int err = CL_SUCCESS;
-        data_device = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR, size, base, &err);
-        if (err != CL_SUCCESS || data_device == nullptr) {
-            return nullptr;
-        }
-        backend_ctx->external_host_buffer_aliases.emplace(tensor->buffer, data_device);
-    }
+    auto * backend_ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
 
     auto * extra = new ggml_tensor_extra_cl();
     extra->reset();
@@ -3711,6 +3739,36 @@ static void ggml_backend_opencl_synchronize(ggml_backend_t backend) {
     CL_CHECK(clEnqueueBarrierWithWaitList(backend_ctx->queue, 0, nullptr, &evt));
     CL_CHECK(clWaitForEvents(1, &evt));
     CL_CHECK(clReleaseEvent(evt));
+}
+
+static bool ggml_backend_opencl_sync_external_host_buffer(
+        ggml_backend_t backend,
+        ggml_backend_buffer_t buffer,
+        bool host_to_device) {
+    if (backend == nullptr || buffer == nullptr || !ggml_backend_buffer_is_host(buffer)) {
+        return true;
+    }
+
+    cl_mem data_device = ggml_backend_opencl_get_syncable_host_buffer_mem(backend, buffer);
+    if (data_device == nullptr) {
+        return false;
+    }
+
+    void * base = ggml_backend_buffer_get_base(buffer);
+    const size_t size = ggml_backend_buffer_get_size(buffer);
+    if (base == nullptr || size == 0) {
+        return false;
+    }
+
+    auto * backend_ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
+    sync_with_other_backends(backend_ctx);
+    if (host_to_device) {
+        CL_CHECK(clEnqueueWriteBuffer(backend_ctx->queue, data_device, CL_TRUE, 0, size, base, 0, nullptr, nullptr));
+    } else {
+        CL_CHECK(clEnqueueReadBuffer(backend_ctx->queue, data_device, CL_TRUE, 0, size, base, 0, nullptr, nullptr));
+    }
+
+    return true;
 }
 
 // Synchronizes the 'backend_ctx's device with others so that commands
@@ -4448,6 +4506,26 @@ struct ggml_backend_opencl_buffer_context {
     std::string name;
 };
 
+static cl_mem ggml_backend_opencl_get_syncable_host_buffer_mem(
+        ggml_backend_t backend,
+        ggml_backend_buffer_t buffer) {
+    if (backend == nullptr || buffer == nullptr || !ggml_backend_buffer_is_host(buffer)) {
+        return nullptr;
+    }
+
+    const char * buffer_name = ggml_backend_buffer_name(buffer);
+    if (buffer_name != nullptr && std::strcmp(buffer_name, "OpenCL_Host") == 0) {
+        auto * buffer_ctx = static_cast<ggml_backend_opencl_buffer_context *>(buffer->context);
+        if (buffer_ctx == nullptr || buffer_ctx->buffer.empty()) {
+            return nullptr;
+        }
+
+        return buffer_ctx->buffer[0];
+    }
+
+    return ggml_backend_opencl_get_or_create_external_host_buffer_alias(backend, buffer);
+}
+
 static void ggml_backend_opencl_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
     delete ctx;
@@ -4563,10 +4641,15 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         // Allocate the new extra and create aliases from the original.
         ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
         ggml_tensor_extra_cl_q4_0 * extra = ctx->ggml_opencl_alloc_temp_tensor_extra_q4_0();
+        const bool use_standalone_quant_buffers = ctx->host_accessible && ctx->host_ptr != nullptr;
 
         size_t size_d = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*sizeof(ggml_fp16_t);
         size_t size_q = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*ggml_blck_size(tensor->type)/2;
         GGML_ASSERT(size_d + size_q == ggml_nbytes(tensor) && "Incorrect tensor size");
+
+        if (use_standalone_quant_buffers) {
+            memcpy((char *) tensor->data + offset, data, ggml_nbytes(tensor));
+        }
 
         cl_int err;
         cl_mem data_device = clCreateBuffer(context, CL_MEM_READ_WRITE,
@@ -4591,26 +4674,33 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         // into the general backend code.
         // Does this create misaligned subbuffers (alignment is 1024) in certain
         // cases ?
-        cl_buffer_region region;
+        if (use_standalone_quant_buffers) {
+            extra->d = clCreateBuffer(context, CL_MEM_READ_WRITE, size_d, NULL, &err);
+            CL_CHECK(err);
+            extra->q = clCreateBuffer(context, CL_MEM_READ_WRITE, size_q, NULL, &err);
+            CL_CHECK(err);
+        } else {
+            cl_buffer_region region;
 
-        // The original tensor memory is divided into scales and quants, i.e.,
-        // we first store scales, then quants.
-        // Create subbuffer for scales.
-        region.origin = align_to(extra_orig->offset + tensor->view_offs + offset, backend_ctx->alignment);
-        region.size = size_d;
-        extra->d = clCreateSubBuffer(
-            extra_orig->data_device, CL_MEM_READ_WRITE,
-            CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
-        CL_CHECK(err);
-        auto previous_origin = region.origin;
+            // The original tensor memory is divided into scales and quants, i.e.,
+            // we first store scales, then quants.
+            // Create subbuffer for scales.
+            region.origin = align_to(extra_orig->offset + tensor->view_offs + offset, backend_ctx->alignment);
+            region.size = size_d;
+            extra->d = clCreateSubBuffer(
+                extra_orig->data_device, CL_MEM_READ_WRITE,
+                CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+            CL_CHECK(err);
+            auto previous_origin = region.origin;
 
-        // Create subbuffer for quants.
-        region.origin = align_to(previous_origin + size_d, backend_ctx->alignment);
-        region.size = size_q;
-        extra->q = clCreateSubBuffer(
-            extra_orig->data_device, CL_MEM_READ_WRITE,
-            CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
-        CL_CHECK(err);
+            // Create subbuffer for quants.
+            region.origin = align_to(previous_origin + size_d, backend_ctx->alignment);
+            region.size = size_q;
+            extra->q = clCreateSubBuffer(
+                extra_orig->data_device, CL_MEM_READ_WRITE,
+                CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+            CL_CHECK(err);
+        }
 
         //cl_kernel kernel = backend_ctx->kernel_convert_block_q4_0;
     #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
@@ -4813,11 +4903,16 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         // Allocate the new extra and create aliases from the original.
         ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
         ggml_tensor_extra_cl_q4_1 * extra = ctx->ggml_opencl_alloc_temp_tensor_extra_q4_1();
+        const bool use_standalone_quant_buffers = ctx->host_accessible && ctx->host_ptr != nullptr;
 
         size_t size_d = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*sizeof(ggml_fp16_t);
         size_t size_m = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*sizeof(ggml_fp16_t);
         size_t size_q = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*ggml_blck_size(tensor->type)/2;
         GGML_ASSERT(size_d + size_m + size_q == ggml_nbytes(tensor) && "Incorrect tensor size");
+
+        if (use_standalone_quant_buffers) {
+            memcpy((char *) tensor->data + offset, data, ggml_nbytes(tensor));
+        }
 
         cl_int err;
         cl_mem data_device = clCreateBuffer(context, CL_MEM_READ_WRITE,
@@ -4827,35 +4922,44 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             queue, data_device, CL_TRUE, 0,
             ggml_nbytes(tensor), data, 0, NULL, NULL));
 
-        cl_buffer_region region;
+        if (use_standalone_quant_buffers) {
+            extra->d = clCreateBuffer(context, CL_MEM_READ_WRITE, size_d, NULL, &err);
+            CL_CHECK(err);
+            extra->m = clCreateBuffer(context, CL_MEM_READ_WRITE, size_m, NULL, &err);
+            CL_CHECK(err);
+            extra->q = clCreateBuffer(context, CL_MEM_READ_WRITE, size_q, NULL, &err);
+            CL_CHECK(err);
+        } else {
+            cl_buffer_region region;
 
-        // The original tensor memory is divided into scales and quants, i.e.,
-        // we first store scales, mins, then quants.
-        // Create subbuffer for scales.
-        region.origin = align_to(extra_orig->offset + tensor->view_offs + offset, backend_ctx->alignment);
-        region.size = size_d;
-        extra->d = clCreateSubBuffer(
-            extra_orig->data_device, CL_MEM_READ_WRITE,
-            CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
-        CL_CHECK(err);
-        auto previous_origin = region.origin;
+            // The original tensor memory is divided into scales and quants, i.e.,
+            // we first store scales, mins, then quants.
+            // Create subbuffer for scales.
+            region.origin = align_to(extra_orig->offset + tensor->view_offs + offset, backend_ctx->alignment);
+            region.size = size_d;
+            extra->d = clCreateSubBuffer(
+                extra_orig->data_device, CL_MEM_READ_WRITE,
+                CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+            CL_CHECK(err);
+            auto previous_origin = region.origin;
 
-        // Create subbuffer for mins.
-        region.origin = align_to(previous_origin + size_d, backend_ctx->alignment);
-        region.size = size_m;
-        extra->m = clCreateSubBuffer(
-            extra_orig->data_device, CL_MEM_READ_WRITE,
-            CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
-        CL_CHECK(err);
-        previous_origin = region.origin;
+            // Create subbuffer for mins.
+            region.origin = align_to(previous_origin + size_d, backend_ctx->alignment);
+            region.size = size_m;
+            extra->m = clCreateSubBuffer(
+                extra_orig->data_device, CL_MEM_READ_WRITE,
+                CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+            CL_CHECK(err);
+            previous_origin = region.origin;
 
-        // Create subbuffer for quants.
-        region.origin = align_to(previous_origin + size_m, backend_ctx->alignment);
-        region.size = size_q;
-        extra->q = clCreateSubBuffer(
-            extra_orig->data_device, CL_MEM_READ_WRITE,
-            CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
-        CL_CHECK(err);
+            // Create subbuffer for quants.
+            region.origin = align_to(previous_origin + size_m, backend_ctx->alignment);
+            region.size = size_q;
+            extra->q = clCreateSubBuffer(
+                extra_orig->data_device, CL_MEM_READ_WRITE,
+                CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+            CL_CHECK(err);
+        }
 
     #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
         cl_kernel kernel = backend_ctx->kernel_convert_block_q4_1;
@@ -6030,11 +6134,25 @@ static ggml_backend_dev_t ggml_backend_opencl_reg_device_get(ggml_backend_reg_t 
     GGML_UNUSED(index);
 }
 
+static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+
+    if (name == nullptr) {
+        return nullptr;
+    }
+
+    if (std::strcmp(name, "ggml_backend_opencl_sync_external_host_buffer") == 0) {
+        return reinterpret_cast<void *>(ggml_backend_opencl_sync_external_host_buffer);
+    }
+
+    return nullptr;
+}
+
 static struct ggml_backend_reg_i ggml_backend_opencl_reg_i = {
     /* .get_name         = */ ggml_backend_opencl_reg_get_name,
     /* .device_count     = */ ggml_backend_opencl_reg_device_count,
     /* .device_get       = */ ggml_backend_opencl_reg_device_get,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_opencl_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_opencl_reg(void) {
