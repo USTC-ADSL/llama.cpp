@@ -1281,14 +1281,20 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         llama_hetero_canonical_backend(hetero_plan.route.backend_for(llama_hetero_route_stage::ATTN_CORE));
     const std::string target_attn_backend =
         llama_hetero_canonical_backend(decision.plan.route.backend_for(llama_hetero_route_stage::ATTN_CORE));
+    const bool qnn_aot_enabled = std::getenv("GGML_QNN_AOT_CONFIG") != nullptr;
     const bool switching_into_qnn_decode =
         n_tokens == 1 &&
         !hetero_route_requests_qnn(hetero_plan.route) &&
         hetero_route_requests_qnn(decision.plan.route);
-    const bool should_flush_pending_qnn_kv =
+    const bool switching_out_of_qnn_decode =
         n_tokens == 1 &&
         hetero_route_requests_qnn(hetero_plan.route) &&
         !hetero_route_requests_qnn(decision.plan.route);
+    const bool should_flush_pending_qnn_kv = switching_out_of_qnn_decode;
+    const bool should_rebuild_target_prefix_after_qnn_decode =
+        switching_out_of_qnn_decode &&
+        qnn_aot_enabled &&
+        !target_attn_backend.empty();
     const bool should_migrate_cpu_opencl_kv =
         n_tokens == 1 &&
         ((current_attn_backend == "cpu" && target_attn_backend == "opencl") ||
@@ -1372,6 +1378,7 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         aot_skip_bootstrap_for_next_decode = true;
         qnn_prefix_replay_pending = false;
         qnn_prefix_replay_restore_plan_valid = false;
+        qnn_prefix_replay_rebuild_live_memory = false;
         if (!dynamic_seq0_token_history.empty()) {
             qnn_prefix_replay_restore_plan = previous_plan;
             qnn_prefix_replay_restore_plan_valid = true;
@@ -1379,6 +1386,21 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
             LLAMA_LOG_INFO("%s: queued QNN prefix replay for %zu token(s) after non-QNN -> qnn decode switch\n",
                     __func__,
                     dynamic_seq0_token_history.size());
+        }
+    } else if (applied && should_rebuild_target_prefix_after_qnn_decode) {
+        qnn_prefix_replay_pending = false;
+        qnn_prefix_replay_restore_plan_valid = false;
+        qnn_prefix_replay_rebuild_live_memory = false;
+        if (!dynamic_seq0_token_history.empty()) {
+            qnn_prefix_replay_restore_plan = previous_plan;
+            qnn_prefix_replay_restore_plan_valid = true;
+            qnn_prefix_replay_pending = true;
+            qnn_prefix_replay_rebuild_live_memory = true;
+            LLAMA_LOG_INFO("%s: queued %s prefix replay for %zu token(s) after qnn -> %s decode switch\n",
+                    __func__,
+                    target_attn_backend.c_str(),
+                    dynamic_seq0_token_history.size(),
+                    target_attn_backend.c_str());
         }
     }
 
@@ -4359,12 +4381,14 @@ bool llama_context::replay_dynamic_qnn_prefix() {
     if (dynamic_seq0_token_history.empty()) {
         qnn_prefix_replay_pending = false;
         qnn_prefix_replay_restore_plan_valid = false;
+        qnn_prefix_replay_rebuild_live_memory = false;
         return true;
     }
 
-    const std::string qnn_backend_name =
+    const std::string active_backend_name =
         llama_hetero_canonical_backend(hetero_plan.route.backend_for(llama_hetero_route_stage::ATTN_CORE));
-    ggml_backend_t qnn_backend = find_backend_for_route(qnn_backend_name);
+    const bool replaying_into_qnn = hetero_route_requests_qnn(hetero_plan.route);
+    ggml_backend_t qnn_backend = replaying_into_qnn ? find_backend_for_route(active_backend_name) : nullptr;
     ggml_backend_qnn_aot_reset_state_t reset_state_fn = nullptr;
     llama_batch replay_batch = {};
     llama_memory_ptr saved_memory;
@@ -4408,6 +4432,16 @@ bool llama_context::replay_dynamic_qnn_prefix() {
         reset_replay_graph_state();
     };
 
+    const auto keep_replayed_memory = [&]() {
+        if (!replay_using_scratch_memory) {
+            return;
+        }
+
+        saved_memory.reset();
+        replay_using_scratch_memory = false;
+        reset_replay_graph_state();
+    };
+
     auto cleanup_failure = [&](const char * reason) {
         if (reason != nullptr) {
             LLAMA_LOG_ERROR("%s: %s\n", __func__, reason);
@@ -4418,6 +4452,7 @@ bool llama_context::replay_dynamic_qnn_prefix() {
         }
         dynamic_seq0_token_history.clear();
         qnn_prefix_replay_pending = false;
+        qnn_prefix_replay_rebuild_live_memory = false;
         if (reset_state_fn != nullptr && qnn_backend != nullptr) {
             reset_state_fn(qnn_backend);
         }
@@ -4432,31 +4467,34 @@ bool llama_context::replay_dynamic_qnn_prefix() {
         return false;
     };
 
-    if (qnn_backend == nullptr) {
-        return cleanup_failure("failed to find the active qnn backend for prefix replay");
+    if (replaying_into_qnn) {
+        if (qnn_backend == nullptr) {
+            return cleanup_failure("failed to find the active qnn backend for prefix replay");
+        }
+
+        ggml_backend_dev_t qnn_dev = ggml_backend_get_device(qnn_backend);
+        ggml_backend_reg_t qnn_reg = qnn_dev != nullptr ? ggml_backend_dev_backend_reg(qnn_dev) : nullptr;
+        reset_state_fn =
+            qnn_reg != nullptr
+                ? (ggml_backend_qnn_aot_reset_state_t)
+                      ggml_backend_reg_get_proc_address(qnn_reg, "ggml_backend_qnn_aot_reset_state")
+                : nullptr;
+        if (reset_state_fn == nullptr) {
+            return cleanup_failure("qnn backend does not expose AoT reset_state support");
+        }
     }
 
-    ggml_backend_dev_t qnn_dev = ggml_backend_get_device(qnn_backend);
-    ggml_backend_reg_t qnn_reg = qnn_dev != nullptr ? ggml_backend_dev_backend_reg(qnn_dev) : nullptr;
-    reset_state_fn =
-        qnn_reg != nullptr
-            ? (ggml_backend_qnn_aot_reset_state_t)
-                  ggml_backend_reg_get_proc_address(qnn_reg, "ggml_backend_qnn_aot_reset_state")
-            : nullptr;
-    if (reset_state_fn == nullptr) {
-        return cleanup_failure("qnn backend does not expose AoT reset_state support");
-    }
-
-    LLAMA_LOG_INFO("%s: replaying %zu seq0 prefix token(s) on %s before the current decode token\n",
+    LLAMA_LOG_INFO("%s: replaying %zu seq0 prefix token(s) on %s before the current decode token%s\n",
             __func__,
             dynamic_seq0_token_history.size(),
-            qnn_backend_name.empty() ? "<qnn>" : qnn_backend_name.c_str());
+            active_backend_name.empty() ? "<active-route>" : active_backend_name.c_str(),
+            qnn_prefix_replay_rebuild_live_memory ? " (rebuilding target KV state)" : "");
 
     if (n_queued_tokens > 0) {
         synchronize();
     }
 
-    if (!reset_state_fn(qnn_backend)) {
+    if (replaying_into_qnn && !reset_state_fn(qnn_backend)) {
         return cleanup_failure("failed to reset QNN AoT state before prefix replay");
     }
 
@@ -4480,12 +4518,17 @@ bool llama_context::replay_dynamic_qnn_prefix() {
         replay_using_scratch_memory = true;
         reset_replay_graph_state();
 
-        LLAMA_LOG_INFO("%s: switched to empty scratch memory so QNN prefix replay re-materializes the tracked prefix without reusing the live generic KV state\n",
-                __func__);
+        if (replaying_into_qnn) {
+            LLAMA_LOG_INFO("%s: switched to empty scratch memory so QNN prefix replay re-materializes the tracked prefix without reusing the live generic KV state\n",
+                    __func__);
+        } else {
+            LLAMA_LOG_INFO("%s: switched to empty scratch memory so prefix replay rebuilds the target backend KV state from the tracked seq0 history\n",
+                    __func__);
+        }
 
-        // Replay should rebuild the QNN-native prefix exactly like static QNN.
-        // Temporarily hide the phase-switch env so seeded AoT graphs do not add
-        // the non-QNN -> QNN seed offset a second time on top of the scratch replay.
+        // Replay should rebuild the active route exactly like a static run on
+        // the destination backend. Temporarily hide the phase-switch env so the
+        // replay does not trigger a second dynamic route decision mid-prefix.
         unsetenv("GGML_HETERO_DYNAMIC_PREFILL_ROUTE");
         unsetenv("GGML_HETERO_DYNAMIC_DECODE_ROUTE");
     } catch (const std::exception & err) {
@@ -4519,7 +4562,9 @@ bool llama_context::replay_dynamic_qnn_prefix() {
     }
 
     qnn_prefix_replay_active = true;
-    aot_skip_bootstrap_for_next_decode = true;
+    if (replaying_into_qnn) {
+        aot_skip_bootstrap_for_next_decode = true;
+    }
     sched_reserve();
 
     bool replay_did_optimize = false;
@@ -4576,24 +4621,29 @@ bool llama_context::replay_dynamic_qnn_prefix() {
 
             switch (status) {
                 case GGML_STATUS_ABORTED:
-                    return cleanup_failure("QNN prefix replay was aborted");
+                    return cleanup_failure(replaying_into_qnn ? "QNN prefix replay was aborted" : "prefix replay was aborted");
                 case GGML_STATUS_ALLOC_FAILED:
-                    return cleanup_failure("QNN prefix replay failed during graph allocation");
+                    return cleanup_failure(replaying_into_qnn ? "QNN prefix replay failed during graph allocation" : "prefix replay failed during graph allocation");
                 case GGML_STATUS_FAILED:
-                    return cleanup_failure("QNN prefix replay graph execution failed");
+                    return cleanup_failure(replaying_into_qnn ? "QNN prefix replay graph execution failed" : "prefix replay graph execution failed");
                 case GGML_STATUS_SUCCESS:
-                    return cleanup_failure("QNN prefix replay returned an unexpected success state");
+                    return cleanup_failure(replaying_into_qnn ? "QNN prefix replay returned an unexpected success state" : "prefix replay returned an unexpected success state");
             }
         }
     } while (mctx->next());
 
     ggml_backend_sched_synchronize(sched.get());
     restore_replay_route_env();
-    restore_memory_after_replay();
+    if (qnn_prefix_replay_rebuild_live_memory) {
+        keep_replayed_memory();
+    } else {
+        restore_memory_after_replay();
+    }
 
     llama_batch_free(replay_batch);
     qnn_prefix_replay_pending = false;
     qnn_prefix_replay_restore_plan_valid = false;
+    qnn_prefix_replay_rebuild_live_memory = false;
     qnn_prefix_replay_active = false;
     return true;
 }

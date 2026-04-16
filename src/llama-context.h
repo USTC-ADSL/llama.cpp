@@ -390,6 +390,7 @@ private:
     bool qnn_prefix_replay_restore_plan_valid = false;
     bool qnn_prefix_replay_pending = false;
     bool qnn_prefix_replay_active = false;
+    bool qnn_prefix_replay_rebuild_live_memory = false;
 
     llama_hetero_execution_plan hetero_plan;
     llama_hetero_execution_plan hetero_plan_base;
