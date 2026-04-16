@@ -537,6 +537,8 @@ struct llama_model {
 
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> opencl_cpu_extra_cpu_copies;
+    std::unordered_map<const ggml_tensor *, llama_hetero_route_stage> opencl_cpu_extra_cpu_copy_stages;
 
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;
@@ -578,6 +580,13 @@ struct llama_model {
     const llama_hetero_execution_plan & get_hetero_plan() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
+    void register_opencl_cpu_extra_cpu_copy(
+            ggml_tensor * original,
+            ggml_tensor * cpu_copy,
+            llama_hetero_route_stage stage);
+    ggml_tensor * resolve_weight_for_route(
+            ggml_tensor * weight,
+            const llama_hetero_route_spec & route) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;

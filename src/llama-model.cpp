@@ -29,6 +29,18 @@
 #include <sstream>
 #include <stdexcept>
 
+const ggml_tensor * llama_model_resolve_weight_for_cpu_copy(
+        const ggml_tensor * original,
+        const ggml_tensor * cpu_copy,
+        llama_hetero_route_stage stage,
+        const llama_hetero_route_spec & route) {
+    if (original == nullptr || cpu_copy == nullptr) {
+        return original;
+    }
+
+    return llama_hetero_is_cpu_backend(route.backend_for(stage)) ? cpu_copy : original;
+}
+
 const char * llm_type_name(llm_type type) {
     switch (type) {
         case LLM_TYPE_14M:           return "14M";
@@ -7536,6 +7548,69 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    auto register_dynamic_opencl_cpu_extra_cpu_copy = [&](ggml_tensor * weight, llama_hetero_route_stage stage) {
+        if (weight == nullptr) {
+            return;
+        }
+
+        const ggml_tensor * cpu_copy = ml.get_opencl_cpu_extra_cpu_copy(ggml_get_name(weight));
+        if (cpu_copy == nullptr || cpu_copy == weight) {
+            return;
+        }
+
+        this->register_opencl_cpu_extra_cpu_copy(weight, const_cast<ggml_tensor *>(cpu_copy), stage);
+    };
+
+    register_dynamic_opencl_cpu_extra_cpu_copy(output, llama_hetero_route_stage::OUTPUT);
+
+    for (auto & layer : layers) {
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.wq,        llama_hetero_route_stage::ATTN_PROJ);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.wk,        llama_hetero_route_stage::ATTN_PROJ);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.wv,        llama_hetero_route_stage::ATTN_PROJ);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.wqkv,      llama_hetero_route_stage::ATTN_PROJ);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.wq_a,      llama_hetero_route_stage::ATTN_PROJ);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.wq_b,      llama_hetero_route_stage::ATTN_PROJ);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.wkv_a_mqa, llama_hetero_route_stage::ATTN_PROJ);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.wkv_b,     llama_hetero_route_stage::ATTN_PROJ);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.wk_b,      llama_hetero_route_stage::ATTN_PROJ);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.wv_b,      llama_hetero_route_stage::ATTN_PROJ);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.wq_cross,  llama_hetero_route_stage::ATTN_PROJ);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.wk_cross,  llama_hetero_route_stage::ATTN_PROJ);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.wv_cross,  llama_hetero_route_stage::ATTN_PROJ);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.wq_enc,    llama_hetero_route_stage::ATTN_PROJ);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.wk_enc,    llama_hetero_route_stage::ATTN_PROJ);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.wv_enc,    llama_hetero_route_stage::ATTN_PROJ);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.wqkv_gate, llama_hetero_route_stage::ATTN_PROJ);
+
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.wo,        llama_hetero_route_stage::ATTN_OUT);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.wo_cross,  llama_hetero_route_stage::ATTN_OUT);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.wo_enc,    llama_hetero_route_stage::ATTN_OUT);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.visexp_attn_wo, llama_hetero_route_stage::ATTN_OUT);
+
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.ffn_gate,         llama_hetero_route_stage::FFN);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.ffn_down,         llama_hetero_route_stage::FFN);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.ffn_up,           llama_hetero_route_stage::FFN);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.ffn_gate_enc,     llama_hetero_route_stage::FFN);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.ffn_down_enc,     llama_hetero_route_stage::FFN);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.ffn_up_enc,       llama_hetero_route_stage::FFN);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.ffn_gate_inp,     llama_hetero_route_stage::FFN);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.ffn_gate_exps,    llama_hetero_route_stage::FFN);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.ffn_down_exps,    llama_hetero_route_stage::FFN);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.ffn_up_exps,      llama_hetero_route_stage::FFN);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.ffn_gate_up_exps, llama_hetero_route_stage::FFN);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.ffn_latent_down,  llama_hetero_route_stage::FFN);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.ffn_latent_up,    llama_hetero_route_stage::FFN);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.ffn_gate_shexp,   llama_hetero_route_stage::FFN);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.ffn_down_shexp,   llama_hetero_route_stage::FFN);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.ffn_up_shexp,     llama_hetero_route_stage::FFN);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.ffn_gate_chexps,  llama_hetero_route_stage::FFN);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.ffn_down_chexps,  llama_hetero_route_stage::FFN);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.ffn_up_chexps,    llama_hetero_route_stage::FFN);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.visexp_ffn_gate,  llama_hetero_route_stage::FFN);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.visexp_ffn_down,  llama_hetero_route_stage::FFN);
+        register_dynamic_opencl_cpu_extra_cpu_copy(layer.visexp_ffn_up,    llama_hetero_route_stage::FFN);
+    }
+
     ml.done_getting_tensors();
 
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
@@ -8032,6 +8107,39 @@ const ggml_tensor * llama_model::get_tensor(const char * name) const {
     }
 
     return it->second;
+}
+
+void llama_model::register_opencl_cpu_extra_cpu_copy(
+        ggml_tensor * original,
+        ggml_tensor * cpu_copy,
+        llama_hetero_route_stage stage) {
+    if (original == nullptr || cpu_copy == nullptr || original == cpu_copy) {
+        return;
+    }
+
+    opencl_cpu_extra_cpu_copies[original] = cpu_copy;
+    opencl_cpu_extra_cpu_copy_stages[original] = stage;
+}
+
+ggml_tensor * llama_model::resolve_weight_for_route(
+        ggml_tensor * weight,
+        const llama_hetero_route_spec & route) const {
+    if (weight == nullptr) {
+        return nullptr;
+    }
+
+    auto copy_it = opencl_cpu_extra_cpu_copies.find(weight);
+    if (copy_it == opencl_cpu_extra_cpu_copies.end()) {
+        return weight;
+    }
+
+    auto stage_it = opencl_cpu_extra_cpu_copy_stages.find(weight);
+    if (stage_it == opencl_cpu_extra_cpu_copy_stages.end()) {
+        return weight;
+    }
+
+    return const_cast<ggml_tensor *>(
+            llama_model_resolve_weight_for_cpu_copy(weight, copy_it->second, stage_it->second, route));
 }
 
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {

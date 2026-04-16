@@ -821,6 +821,19 @@ struct ggml_tensor * llama_model_loader::get_tensor_meta(const char * name) cons
     return weight->tensor;
 }
 
+const struct ggml_tensor * llama_model_loader::get_opencl_cpu_extra_cpu_copy(const char * name) const {
+    if (name == nullptr) {
+        return nullptr;
+    }
+
+    auto it = opencl_cpu_extra_cpu_copies_by_name.find(name);
+    if (it == opencl_cpu_extra_cpu_copies_by_name.end()) {
+        return nullptr;
+    }
+
+    return it->second;
+}
+
 struct ggml_tensor * llama_model_loader::require_tensor_meta(const std::string & name) const {
     struct ggml_tensor * tensor = get_tensor_meta(name.c_str());
     if (!tensor) {
@@ -1080,6 +1093,11 @@ bool llama_model_loader_requires_opencl_weight_portability(
         const llama_hetero_route_spec & dynamic_decode_route,
         const llama_hetero_route_spec & dynamic_fallback_route);
 
+bool llama_model_loader_should_enable_opencl_cpu_extra_cpu_copy(
+        const llama_hetero_route_spec & dynamic_prefill_route,
+        const llama_hetero_route_spec & dynamic_decode_route,
+        bool enable_extra_cpu_copy);
+
 bool llama_model_loader_should_preserve_opencl_host_buft_for_mmap(
         bool hetero_phase_route_active,
         bool hetero_portable_cpu_weights_for_opencl_dynamic_stage,
@@ -1115,6 +1133,23 @@ bool llama_model_loader_requires_opencl_weight_portability(
     return route_uses_opencl(dynamic_prefill_route) ||
            route_uses_opencl(dynamic_decode_route) ||
            route_uses_opencl(dynamic_fallback_route);
+}
+
+bool llama_model_loader_should_enable_opencl_cpu_extra_cpu_copy(
+        const llama_hetero_route_spec & dynamic_prefill_route,
+        const llama_hetero_route_spec & dynamic_decode_route,
+        bool enable_extra_cpu_copy) {
+    if (!enable_extra_cpu_copy) {
+        return false;
+    }
+
+    const int dynamic_prefill_backend_kind =
+        llama_hetero_backend_kind(llama_hetero_phase_backend_for_route(dynamic_prefill_route));
+    const int dynamic_decode_backend_kind =
+        llama_hetero_backend_kind(llama_hetero_phase_backend_for_route(dynamic_decode_route));
+
+    return (dynamic_prefill_backend_kind == 1 && dynamic_decode_backend_kind == 2) ||
+           (dynamic_prefill_backend_kind == 2 && dynamic_decode_backend_kind == 1);
 }
 
 bool llama_model_loader_should_preserve_opencl_host_buft_for_mmap(
@@ -1166,6 +1201,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 dynamic_prefill_route,
                 dynamic_decode_route,
                 dynamic_fallback_route);
+    const bool enable_opencl_cpu_extra_cpu_copy =
+        llama_model_loader_should_enable_opencl_cpu_extra_cpu_copy(
+                dynamic_prefill_route,
+                dynamic_decode_route,
+                env_flag_enabled("GGML_HETERO_ENABLE_OPENCL_CPU_EXTRA_CPU_COPY"));
     const bool enable_cpu_opencl_shared_host_weights =
         env_flag_enabled("GGML_HETERO_ENABLE_CPU_OPENCL_SHARED_HOST_WEIGHTS");
     const bool hetero_shared_opencl_host_weights_for_dynamic_cpu_opencl =
@@ -1291,6 +1331,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         LLAMA_LOG_WARN("%s: CPU/OpenCL shared-host weight buffers are disabled by default because the current OpenCL_Host weight path can corrupt decode semantics. Set GGML_HETERO_ENABLE_CPU_OPENCL_SHARED_HOST_WEIGHTS=1 to re-enable it experimentally.\n",
                 __func__);
         logged_dynamic_cpu_opencl_shared_host_weights_disabled = true;
+    }
+
+    static bool logged_opencl_cpu_extra_cpu_copy = false;
+    if (enable_opencl_cpu_extra_cpu_copy && !logged_opencl_cpu_extra_cpu_copy) {
+        LLAMA_LOG_INFO("%s: keeping an extra CPU-friendly duplicate of selected OpenCL decode weights for dynamic CPU/OpenCL switching\n",
+                __func__);
+        logged_opencl_cpu_extra_cpu_copy = true;
     }
 
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
@@ -1702,6 +1749,91 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return buft;
     };
 
+    auto maybe_create_opencl_cpu_extra_cpu_copy = [&](const ggml_tensor * cur, ggml_backend_buffer_type_t primary_buft) {
+        if (!enable_opencl_cpu_extra_cpu_copy || cur == nullptr || primary_buft == nullptr) {
+            return;
+        }
+
+        const char * primary_dev_name = nullptr;
+        if (auto * primary_dev = ggml_backend_buft_get_device(primary_buft)) {
+            primary_dev_name = ggml_backend_dev_name(primary_dev);
+        }
+        if (primary_dev_name == nullptr || std::strcmp(primary_dev_name, "GPUOpenCL") != 0) {
+            return;
+        }
+
+        if (tn.suffix == nullptr || std::strcmp(tn.suffix, "weight") != 0) {
+            return;
+        }
+
+        llm_tensor tn_tensor = tn.tensor;
+        if (tn.tensor == LLM_TENSOR_TOKEN_EMBD && (flags & TENSOR_DUPLICATED)) {
+            tn_tensor = LLM_TENSOR_OUTPUT;
+        }
+
+        bool needs_extra_cpu_copy = false;
+        switch (tn_tensor) {
+            case LLM_TENSOR_OUTPUT:
+            case LLM_TENSOR_ATTN_Q:
+            case LLM_TENSOR_ATTN_K:
+            case LLM_TENSOR_ATTN_V:
+            case LLM_TENSOR_ATTN_QKV:
+            case LLM_TENSOR_ATTN_Q_A:
+            case LLM_TENSOR_ATTN_Q_B:
+            case LLM_TENSOR_ATTN_KV_A_MQA:
+            case LLM_TENSOR_ATTN_KV_B:
+            case LLM_TENSOR_ATTN_K_B:
+            case LLM_TENSOR_ATTN_V_B:
+            case LLM_TENSOR_ATTN_OUT:
+            case LLM_TENSOR_ATTN_GATE:
+            case LLM_TENSOR_FFN_GATE:
+            case LLM_TENSOR_FFN_DOWN:
+            case LLM_TENSOR_FFN_UP:
+            case LLM_TENSOR_FFN_GATE_INP:
+            case LLM_TENSOR_FFN_GATE_EXPS:
+            case LLM_TENSOR_FFN_DOWN_EXPS:
+            case LLM_TENSOR_FFN_UP_EXPS:
+            case LLM_TENSOR_FFN_GATE_UP_EXPS:
+            case LLM_TENSOR_FFN_LATENT_DOWN:
+            case LLM_TENSOR_FFN_LATENT_UP:
+            case LLM_TENSOR_FFN_GATE_SHEXP:
+            case LLM_TENSOR_FFN_DOWN_SHEXP:
+            case LLM_TENSOR_FFN_UP_SHEXP:
+            case LLM_TENSOR_FFN_GATE_CHEXPS:
+            case LLM_TENSOR_FFN_DOWN_CHEXPS:
+            case LLM_TENSOR_FFN_UP_CHEXPS:
+                needs_extra_cpu_copy = true;
+                break;
+            default:
+                break;
+        }
+
+        if (!needs_extra_cpu_copy) {
+            return;
+        }
+
+        const llm_tensor_info info = llm_tensor_info_for(tn_tensor);
+        ggml_op op = info.op;
+        if (tn.suffix != nullptr && std::strcmp(tn.suffix, "bias") == 0) {
+            op = (info.op == GGML_OP_MUL_MAT_ID) ? GGML_OP_ADD_ID : GGML_OP_ADD;
+        }
+
+        ggml_backend_buffer_type_t cpu_copy_buft = select_weight_cpu_buft(hparams, const_cast<ggml_tensor *>(cur), op, buft_list_cpu);
+        if (cpu_copy_buft == nullptr || cpu_copy_buft == primary_buft) {
+            return;
+        }
+
+        ggml_context * cpu_ctx = ctx_for_buft(cpu_copy_buft);
+        ggml_tensor * cpu_copy = ggml_get_tensor(cpu_ctx, ggml_get_name(cur));
+        if (cpu_copy == nullptr) {
+            cpu_copy = ggml_dup_tensor(cpu_ctx, cur);
+            ggml_set_name(cpu_copy, ggml_get_name(cur));
+            size_data += ggml_nbytes(cur);
+        }
+
+        opencl_cpu_extra_cpu_copies_by_name[ggml_get_name(cur)] = cpu_copy;
+    };
+
     if (files.empty()) {
         if (flags & TENSOR_SKIP_IF_VIRTUAL) {
             return nullptr;
@@ -1747,14 +1879,6 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
     ggml_context * ctx = ctx_for_buft(buft);
 
-    // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
-    if (flags & TENSOR_DUPLICATED) {
-        ggml_tensor * t = ggml_get_tensor(ctx, tn.str().c_str());
-        if (t) {
-            return t;
-        }
-    }
-
     LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());
     const struct ggml_tensor * cur = check_tensor_dims(tn.str(), ne, !(flags & TENSOR_NOT_REQUIRED));
 
@@ -1764,6 +1888,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     const bool duplicated = flags & TENSOR_DUPLICATED;
 
+    // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
+    if (duplicated) {
+        ggml_tensor * t = ggml_get_tensor(ctx, tn.str().c_str());
+        if (t) {
+            maybe_create_opencl_cpu_extra_cpu_copy(cur, buft);
+            return t;
+        }
+    }
+
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, cur);
     ggml_set_name(tensor, ggml_get_name(cur));
 
@@ -1772,6 +1905,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     } else {
         n_created++;
     }
+
+    maybe_create_opencl_cpu_extra_cpu_copy(cur, buft);
 
     return tensor;
 }

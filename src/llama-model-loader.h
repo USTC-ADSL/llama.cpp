@@ -90,6 +90,7 @@ struct llama_model_loader {
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
+    std::unordered_map<std::string, ggml_tensor *> opencl_cpu_extra_cpu_copies_by_name;
 
     gguf_context_ptr metadata_ptr;
     struct gguf_context * metadata; // either metadata_ptr.get() or externally set
@@ -176,6 +177,7 @@ struct llama_model_loader {
     const llama_tensor_weight & require_weight(const char * name) const;
 
     struct ggml_tensor * get_tensor_meta(const char * name) const;
+    const struct ggml_tensor * get_opencl_cpu_extra_cpu_copy(const char * name) const;
 
     struct ggml_tensor * require_tensor_meta(const std::string & name) const;
 
