@@ -4,7 +4,10 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache-iswa.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-hetero-route.h"
@@ -19,6 +22,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <stdexcept>
 
@@ -26,6 +30,7 @@ namespace {
 
 using ggml_backend_qnn_aot_has_pending_generic_kv_writeback_t = bool (*)(ggml_backend_t backend);
 using ggml_backend_qnn_aot_flush_pending_generic_kv_writeback_t = bool (*)(ggml_backend_t backend);
+using ggml_backend_qnn_aot_reset_state_t = bool (*)(ggml_backend_t backend);
 
 bool hetero_dynamic_trace_timing_enabled() {
     static int enabled = -1;
@@ -80,6 +85,50 @@ bool hetero_route_requests_qnn(const llama_hetero_route_spec & route) {
     return false;
 }
 
+size_t seq0_prefix_tokens_from_memory(const llama_memory_i * memory) {
+    if (memory == nullptr) {
+        return 0;
+    }
+
+    const llama_pos seq0_max = memory->seq_pos_max(0);
+    return seq0_max < 0 ? 0 : static_cast<size_t>(seq0_max) + 1;
+}
+
+bool batch_extract_appendable_seq0_tokens(
+        const llama_batch & batch,
+        size_t              expected_first_pos,
+        std::vector<llama_token> & out_tokens) {
+    if (batch.token == nullptr || batch.n_tokens <= 0) {
+        return false;
+    }
+
+    out_tokens.clear();
+    out_tokens.reserve(batch.n_tokens);
+
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        const int32_t n_seq_id = batch.n_seq_id != nullptr ? batch.n_seq_id[i] : 1;
+        if (n_seq_id != 1) {
+            return false;
+        }
+
+        const llama_seq_id seq_id = batch.seq_id != nullptr ? batch.seq_id[i][0] : 0;
+        if (seq_id != 0) {
+            return false;
+        }
+
+        if (batch.pos != nullptr) {
+            const llama_pos expected_pos = static_cast<llama_pos>(expected_first_pos + static_cast<size_t>(i));
+            if (batch.pos[i] != expected_pos) {
+                return false;
+            }
+        }
+
+        out_tokens.push_back(batch.token[i]);
+    }
+
+    return true;
+}
+
 } // namespace
 
 //
@@ -92,6 +141,7 @@ llama_context::llama_context(
     model(model),
     kv_type_k(params.type_k),
     kv_type_v(params.type_v),
+    kv_swa_full(params.swa_full),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
@@ -577,10 +627,14 @@ llama_context::llama_context(
 
     // init the memory module
     if (!hparams.vocab_only) {
+        kv_attn_v_trans = !cparams.flash_attn;
+
         llama_memory_params params_mem = {
             /*.type_k   =*/ params.type_k,
             /*.type_v   =*/ params.type_v,
             /*.swa_full =*/ params.swa_full,
+            /*.attn_v_trans =*/ kv_attn_v_trans,
+            /*.attn_v_trans_pinned =*/ true,
             /*.kv_contract =*/ hetero_kv_contract_allocated,
         };
 
@@ -878,6 +932,201 @@ bool llama_context::backend_available_for_route(const std::string & backend_name
     return false;
 }
 
+ggml_backend_t llama_context::find_backend_for_route(const std::string & backend_name) const {
+    const std::string canonical = llama_hetero_canonical_backend(backend_name);
+    if (canonical.empty() || canonical == "cpu") {
+        return backend_cpu;
+    }
+
+    const char * requested_device_name = canonicalize_hetero_backend_device_name(canonical.c_str());
+    if (requested_device_name == nullptr) {
+        return nullptr;
+    }
+
+    for (const auto & backend : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+        if (dev != nullptr && std::strcmp(ggml_backend_dev_name(dev), requested_device_name) == 0) {
+            return backend.get();
+        }
+    }
+
+    return nullptr;
+}
+
+void llama_context::validate_dynamic_seq0_token_history() {
+    if (qnn_prefix_replay_active) {
+        return;
+    }
+
+    const size_t prefix_tokens = seq0_prefix_tokens_from_memory(memory.get());
+    if (prefix_tokens == dynamic_seq0_token_history.size()) {
+        return;
+    }
+
+    if (!dynamic_seq0_token_history.empty() || prefix_tokens != 0) {
+        LLAMA_LOG_WARN("%s: clearing tracked seq0 token history due to state mismatch (tracked=%zu, memory=%zu)\n",
+                __func__,
+                dynamic_seq0_token_history.size(),
+                prefix_tokens);
+    }
+
+    dynamic_seq0_token_history.clear();
+}
+
+void llama_context::record_dynamic_seq0_token_history(const llama_batch & batch_inp, size_t prefix_tokens_before_decode) {
+    if (qnn_prefix_replay_active) {
+        return;
+    }
+
+    std::vector<llama_token> new_tokens;
+    if (!batch_extract_appendable_seq0_tokens(batch_inp, prefix_tokens_before_decode, new_tokens)) {
+        if (!dynamic_seq0_token_history.empty() || prefix_tokens_before_decode != 0) {
+            LLAMA_LOG_WARN("%s: disabling seq0 token-history tracking because the batch is not a contiguous seq0 token append\n",
+                    __func__);
+        }
+        dynamic_seq0_token_history.clear();
+        return;
+    }
+
+    if (dynamic_seq0_token_history.size() != prefix_tokens_before_decode) {
+        if (!dynamic_seq0_token_history.empty()) {
+            LLAMA_LOG_WARN("%s: dropping seq0 token-history tracking because the tracked prefix no longer matches the context state\n",
+                    __func__);
+        }
+        dynamic_seq0_token_history.clear();
+        if (prefix_tokens_before_decode != 0) {
+            return;
+        }
+    }
+
+    dynamic_seq0_token_history.insert(
+        dynamic_seq0_token_history.end(),
+        new_tokens.begin(),
+        new_tokens.end());
+}
+
+bool llama_context::sync_dynamic_cpu_opencl_kv(bool host_to_device) {
+    if (memory == nullptr) {
+        return true;
+    }
+
+    ggml_backend_t opencl_backend = nullptr;
+    for (const auto & backend : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+        if (dev != nullptr && std::strcmp(ggml_backend_dev_name(dev), "GPUOpenCL") == 0) {
+            opencl_backend = backend.get();
+            break;
+        }
+    }
+
+    if (opencl_backend == nullptr) {
+        LLAMA_LOG_ERROR("%s: dynamic CPU/OpenCL KV sync requested, but GPUOpenCL backend is unavailable\n", __func__);
+        return false;
+    }
+
+    std::vector<llama_kv_cache *> kv_caches;
+    auto append_kv_cache = [&](llama_kv_cache * kv_cache) {
+        if (kv_cache != nullptr) {
+            kv_caches.push_back(kv_cache);
+        }
+    };
+
+    if (auto * kv_cache = dynamic_cast<llama_kv_cache *>(memory.get())) {
+        append_kv_cache(kv_cache);
+    } else if (auto * kv_cache_iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get())) {
+        append_kv_cache(kv_cache_iswa->get_base());
+        append_kv_cache(kv_cache_iswa->get_swa());
+    } else if (auto * hybrid_memory = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+        append_kv_cache(hybrid_memory->get_mem_attn());
+    } else if (auto * hybrid_iswa_memory = dynamic_cast<llama_memory_hybrid_iswa *>(memory.get())) {
+        auto * attn_cache = hybrid_iswa_memory->get_mem_attn();
+        append_kv_cache(attn_cache != nullptr ? attn_cache->get_base() : nullptr);
+        append_kv_cache(attn_cache != nullptr ? attn_cache->get_swa() : nullptr);
+    }
+
+    for (llama_kv_cache * kv_cache : kv_caches) {
+        if (!kv_cache->sync_external_opencl_host_aliases(opencl_backend, host_to_device)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void llama_context::maybe_debug_dump_powerserve_prefix_before_qnn_switch() {
+    const char * dump_dir_env = std::getenv("GGML_DEBUG_DUMP_POWERSERVE_SEED_KV_DIR");
+    if (dump_dir_env == nullptr || dump_dir_env[0] == '\0' || memory == nullptr) {
+        return;
+    }
+
+    uint32_t dump_tokens = 0;
+    if (const char * dump_tokens_env = std::getenv("GGML_DEBUG_DUMP_POWERSERVE_SEED_KV_TOKENS");
+        dump_tokens_env != nullptr && dump_tokens_env[0] != '\0') {
+        char * end = nullptr;
+        errno = 0;
+        const unsigned long parsed = std::strtoul(dump_tokens_env, &end, 10);
+        if (errno == 0 && end != dump_tokens_env && *end == '\0' &&
+            parsed <= std::numeric_limits<uint32_t>::max()) {
+            dump_tokens = static_cast<uint32_t>(parsed);
+        } else {
+            LLAMA_LOG_WARN("%s: ignoring invalid GGML_DEBUG_DUMP_POWERSERVE_SEED_KV_TOKENS=%s\n",
+                    __func__, dump_tokens_env);
+        }
+    }
+
+    if (dump_tokens == 0) {
+        const llama_pos seq_max = memory->seq_pos_max(0);
+        if (seq_max < 0) {
+            LLAMA_LOG_WARN("%s: skip prefix dump before qnn switch because seq 0 has no KV state yet\n", __func__);
+            return;
+        }
+        dump_tokens = static_cast<uint32_t>(seq_max + 1);
+    }
+
+    std::vector<std::pair<std::string, llama_kv_cache *>> kv_caches;
+    auto append_kv_cache = [&](const char * label, llama_kv_cache * kv_cache) {
+        if (kv_cache != nullptr) {
+            kv_caches.emplace_back(label != nullptr ? label : "kv", kv_cache);
+        }
+    };
+
+    if (auto * kv_cache = dynamic_cast<llama_kv_cache *>(memory.get())) {
+        append_kv_cache("attn", kv_cache);
+    } else if (auto * kv_cache_iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get())) {
+        append_kv_cache("attn", kv_cache_iswa->get_base());
+        append_kv_cache("swa", kv_cache_iswa->get_swa());
+    } else if (auto * hybrid_memory = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+        append_kv_cache("attn", hybrid_memory->get_mem_attn());
+    } else if (auto * hybrid_iswa_memory = dynamic_cast<llama_memory_hybrid_iswa *>(memory.get())) {
+        auto * attn_cache = hybrid_iswa_memory->get_mem_attn();
+        append_kv_cache("attn", attn_cache != nullptr ? attn_cache->get_base() : nullptr);
+        append_kv_cache("swa", attn_cache != nullptr ? attn_cache->get_swa() : nullptr);
+    }
+
+    if (kv_caches.empty()) {
+        LLAMA_LOG_WARN("%s: skip prefix dump before qnn switch because no llama_kv_cache is available\n", __func__);
+        return;
+    }
+
+    const std::filesystem::path base_dir(dump_dir_env);
+    for (size_t i = 0; i < kv_caches.size(); ++i) {
+        const auto & [label, kv_cache] = kv_caches[i];
+        const std::filesystem::path dump_dir =
+            kv_caches.size() == 1 ? base_dir : (base_dir / label);
+        LLAMA_LOG_INFO("%s: dumping %u token(s) of %s KV state to %s before non-QNN -> qnn switch\n",
+                __func__,
+                dump_tokens,
+                label.c_str(),
+                dump_dir.string().c_str());
+        if (!kv_cache->dump_powerserve_seed_kv(dump_dir.string(), dump_tokens)) {
+            LLAMA_LOG_WARN("%s: failed to dump %s KV state to %s\n",
+                    __func__,
+                    label.c_str(),
+                    dump_dir.string().c_str());
+        }
+    }
+}
+
 bool llama_context::apply_hetero_plan(llama_hetero_execution_plan plan, bool update_base_plan, const char * source) {
     if (!llama_hetero_kv_contract_can_satisfy(hetero_kv_contract_allocated, plan.attn_kv)) {
         LLAMA_LOG_WARN("%s: rejecting hetero plan update from %s: requested attn KV contract layout=%s transfer=%s producer=%s consumer=%s, but the current context was allocated with layout=%s transfer=%s zero_copy=%s. Rebuild the context or add KV migration for this transition.\n",
@@ -1028,6 +1277,10 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
     }
 
     const std::string target_route = llama_hetero_format_route_spec(decision.plan.route);
+    const std::string current_attn_backend =
+        llama_hetero_canonical_backend(hetero_plan.route.backend_for(llama_hetero_route_stage::ATTN_CORE));
+    const std::string target_attn_backend =
+        llama_hetero_canonical_backend(decision.plan.route.backend_for(llama_hetero_route_stage::ATTN_CORE));
     const bool switching_into_qnn_decode =
         n_tokens == 1 &&
         !hetero_route_requests_qnn(hetero_plan.route) &&
@@ -1036,6 +1289,26 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         n_tokens == 1 &&
         hetero_route_requests_qnn(hetero_plan.route) &&
         !hetero_route_requests_qnn(decision.plan.route);
+    const bool should_migrate_cpu_opencl_kv =
+        n_tokens == 1 &&
+        ((current_attn_backend == "cpu" && target_attn_backend == "opencl") ||
+         (current_attn_backend == "opencl" && target_attn_backend == "cpu"));
+    const llama_hetero_execution_plan previous_plan = hetero_plan;
+
+    if (switching_into_qnn_decode) {
+        const size_t prefix_tokens = seq0_prefix_tokens_from_memory(memory.get());
+        if (prefix_tokens > 0 && dynamic_seq0_token_history.size() != prefix_tokens) {
+            LLAMA_LOG_WARN("%s: refusing non-QNN -> qnn decode switch because seq0 token history is unavailable (tracked=%zu, memory=%zu)\n",
+                    __func__,
+                    dynamic_seq0_token_history.size(),
+                    prefix_tokens);
+            return;
+        }
+    }
+
+    if (switching_into_qnn_decode) {
+        maybe_debug_dump_powerserve_prefix_before_qnn_switch();
+    }
 
     if (should_flush_pending_qnn_kv) {
         ggml_backend_t qnn_backend = nullptr;
@@ -1073,12 +1346,40 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         }
     }
 
+    if (should_migrate_cpu_opencl_kv) {
+        LLAMA_LOG_INFO("%s: starting CPU/OpenCL KV migration before decode route switch (%s -> %s)\n",
+                __func__,
+                current_attn_backend.c_str(),
+                target_attn_backend.c_str());
+        const int64_t t_kv_sync_start_us = trace_timing ? ggml_time_us() : 0;
+        const bool migrated = migrate_dynamic_cpu_opencl_kv(current_attn_backend, target_attn_backend);
+        const int64_t t_kv_sync_end_us = trace_timing ? ggml_time_us() : 0;
+        if (trace_timing && hetero_phase_trace.active) {
+            hetero_phase_trace.kv_migration_us += t_kv_sync_end_us - t_kv_sync_start_us;
+        }
+        if (!migrated) {
+            LLAMA_LOG_ERROR("%s: CPU/OpenCL KV migration failed; keeping existing route and skipping backend switch\n",
+                    __func__);
+            return;
+        }
+    }
+
     const int64_t t_apply_start_us = trace_timing ? ggml_time_us() : 0;
     const bool applied = apply_hetero_plan(std::move(decision.plan), /* update_base_plan = */ false, decision.plan_label.c_str());
     const int64_t t_apply_end_us = trace_timing ? ggml_time_us() : 0;
 
     if (applied && switching_into_qnn_decode) {
         aot_skip_bootstrap_for_next_decode = true;
+        qnn_prefix_replay_pending = false;
+        qnn_prefix_replay_restore_plan_valid = false;
+        if (!dynamic_seq0_token_history.empty()) {
+            qnn_prefix_replay_restore_plan = previous_plan;
+            qnn_prefix_replay_restore_plan_valid = true;
+            qnn_prefix_replay_pending = true;
+            LLAMA_LOG_INFO("%s: queued QNN prefix replay for %zu token(s) after non-QNN -> qnn decode switch\n",
+                    __func__,
+                    dynamic_seq0_token_history.size());
+        }
     }
 
     if (trace_timing && hetero_phase_trace.active) {
@@ -2542,6 +2843,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
+    validate_dynamic_seq0_token_history();
+    const size_t seq0_prefix_tokens_before_decode = dynamic_seq0_token_history.size();
 
     const int64_t n_vocab = vocab.n_tokens();
     const int64_t n_embd  = hparams.n_embd_inp();
@@ -2600,7 +2903,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
     }
-    n_queued_tokens += n_tokens_all;
 
     if (hetero_dynamic_trace_timing_enabled()) {
         if (hetero_phase_trace.active) {
@@ -2620,7 +2922,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
     output_swaps.clear();
 
     maybe_apply_dynamic_route(n_tokens_all);
+    if (qnn_prefix_replay_pending) {
+        const bool trace_was_active = hetero_phase_trace.active;
+        const int64_t t_replay_start_us =
+            (hetero_dynamic_trace_timing_enabled() && trace_was_active) ? ggml_time_us() : 0;
+        hetero_phase_trace.active = false;
+        const bool replay_ok = replay_dynamic_qnn_prefix();
+        hetero_phase_trace.active = trace_was_active;
+        if (hetero_dynamic_trace_timing_enabled() && trace_was_active) {
+            hetero_phase_trace.kv_migration_us += ggml_time_us() - t_replay_start_us;
+        }
+        if (!replay_ok) {
+            return -3;
+        }
+    }
     sched_reserve();
+    n_queued_tokens += n_tokens_all;
 
     bool did_optimize = false;
 
@@ -2889,6 +3206,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
+    record_dynamic_seq0_token_history(batch_inp, seq0_prefix_tokens_before_decode);
     return 0;
 }
 
@@ -3926,6 +4244,348 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
     }
 
     return io.n_bytes();
+}
+
+bool llama_context::migrate_dynamic_cpu_opencl_kv(
+        const std::string & producer_backend,
+        const std::string & consumer_backend) {
+    if (memory == nullptr) {
+        return true;
+    }
+
+    const std::string producer = llama_hetero_canonical_backend(producer_backend);
+    const std::string consumer = llama_hetero_canonical_backend(consumer_backend);
+
+    if ((producer != "cpu" && producer != "opencl") ||
+        (consumer != "cpu" && consumer != "opencl") ||
+        producer == consumer) {
+        LLAMA_LOG_ERROR("%s: unsupported CPU/OpenCL KV migration request producer=%s consumer=%s\n",
+                __func__,
+                producer.empty() ? "<unset>" : producer.c_str(),
+                consumer.empty() ? "<unset>" : consumer.c_str());
+        return false;
+    }
+
+    if (producer == "opencl" && !sync_dynamic_cpu_opencl_kv(/* host_to_device = */ false)) {
+        LLAMA_LOG_ERROR("%s: failed to synchronize OpenCL-backed KV buffers before migration to %s\n",
+                __func__,
+                consumer.c_str());
+        return false;
+    }
+
+    try {
+        llama_io_write_dummy io_size;
+        state_write_data(io_size);
+
+        std::vector<uint8_t> state(io_size.n_bytes());
+        llama_io_write_buffer io_write(state.data(), state.size());
+        const size_t n_written = state_write_data(io_write);
+        if (n_written != state.size()) {
+            throw std::runtime_error(format("unexpected state size during CPU/OpenCL migration: %zu != %zu", n_written, state.size()));
+        }
+
+        llama_hetero_kv_contract migration_contract = hetero_plan.attn_kv;
+        migration_contract.producer_backend = producer;
+        migration_contract.consumer_backend = consumer;
+        migration_contract.storage_backend = consumer;
+        migration_contract.transfer = llama_hetero_kv_transfer_mode::NONE;
+        migration_contract.shared_buffer_required = false;
+        migration_contract.implemented = true;
+        migration_contract.buffer_available = true;
+        migration_contract.zero_copy = false;
+        migration_contract.reason = "cpu-opencl-phase-migration";
+
+        llama_memory_params params_mem = {
+            /*.type_k =*/ kv_type_k,
+            /*.type_v =*/ kv_type_v,
+            /*.swa_full =*/ kv_swa_full,
+            /*.attn_v_trans =*/ kv_attn_v_trans,
+            /*.attn_v_trans_pinned =*/ true,
+            /*.kv_contract =*/ migration_contract,
+        };
+
+        llama_memory_ptr migrated_memory(model.create_memory(params_mem, cparams));
+        if (!migrated_memory) {
+            throw std::runtime_error("failed to create migrated memory module");
+        }
+
+        llama_memory_ptr old_memory = std::move(memory);
+        memory = std::move(migrated_memory);
+
+        try {
+            llama_io_read_buffer io_read(state.data(), state.size());
+            const size_t n_read = state_read_data(io_read);
+            if (n_read != state.size()) {
+                throw std::runtime_error(format("unexpected restored state size during CPU/OpenCL migration: %zu != %zu", n_read, state.size()));
+            }
+        } catch (...) {
+            memory = std::move(old_memory);
+            throw;
+        }
+
+        gf_res_prev.reset();
+        gf_res_reserve.reset();
+        aot_saved_sched.reset();
+        hetero_dynamic_pre_reserved_plans.clear();
+        sched_need_reserve = true;
+
+        LLAMA_LOG_INFO("%s: rebuilt KV-backed memory for CPU/OpenCL phase migration %s -> %s using consumer-owned placement\n",
+                __func__,
+                producer.c_str(),
+                consumer.c_str());
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: CPU/OpenCL KV migration failed for %s -> %s: %s\n",
+                __func__,
+                producer.c_str(),
+                consumer.c_str(),
+                err.what());
+        return false;
+    }
+
+    return true;
+}
+
+bool llama_context::replay_dynamic_qnn_prefix() {
+    if (dynamic_seq0_token_history.empty()) {
+        qnn_prefix_replay_pending = false;
+        qnn_prefix_replay_restore_plan_valid = false;
+        return true;
+    }
+
+    const std::string qnn_backend_name =
+        llama_hetero_canonical_backend(hetero_plan.route.backend_for(llama_hetero_route_stage::ATTN_CORE));
+    ggml_backend_t qnn_backend = find_backend_for_route(qnn_backend_name);
+    ggml_backend_qnn_aot_reset_state_t reset_state_fn = nullptr;
+    llama_batch replay_batch = {};
+    llama_memory_ptr saved_memory;
+    bool replay_using_scratch_memory = false;
+    const char * replay_prefill_route_env = std::getenv("GGML_HETERO_DYNAMIC_PREFILL_ROUTE");
+    const char * replay_decode_route_env  = std::getenv("GGML_HETERO_DYNAMIC_DECODE_ROUTE");
+    const bool replay_had_prefill_route_env = replay_prefill_route_env != nullptr;
+    const bool replay_had_decode_route_env  = replay_decode_route_env != nullptr;
+    const std::string replay_saved_prefill_route = replay_had_prefill_route_env ? replay_prefill_route_env : "";
+    const std::string replay_saved_decode_route  = replay_had_decode_route_env  ? replay_decode_route_env  : "";
+
+    const auto reset_replay_graph_state = [&]() {
+        gf_res_prev.reset();
+        gf_res_reserve.reset();
+        aot_saved_sched.reset();
+        hetero_dynamic_pre_reserved_plans.clear();
+        sched_need_reserve = true;
+    };
+
+    const auto restore_replay_route_env = [&]() {
+        if (replay_had_prefill_route_env) {
+            setenv("GGML_HETERO_DYNAMIC_PREFILL_ROUTE", replay_saved_prefill_route.c_str(), 1);
+        } else {
+            unsetenv("GGML_HETERO_DYNAMIC_PREFILL_ROUTE");
+        }
+
+        if (replay_had_decode_route_env) {
+            setenv("GGML_HETERO_DYNAMIC_DECODE_ROUTE", replay_saved_decode_route.c_str(), 1);
+        } else {
+            unsetenv("GGML_HETERO_DYNAMIC_DECODE_ROUTE");
+        }
+    };
+
+    const auto restore_memory_after_replay = [&]() {
+        if (!replay_using_scratch_memory) {
+            return;
+        }
+
+        memory = std::move(saved_memory);
+        replay_using_scratch_memory = false;
+        reset_replay_graph_state();
+    };
+
+    auto cleanup_failure = [&](const char * reason) {
+        if (reason != nullptr) {
+            LLAMA_LOG_ERROR("%s: %s\n", __func__, reason);
+        }
+        if (replay_batch.token != nullptr || replay_batch.embd != nullptr || replay_batch.pos != nullptr ||
+            replay_batch.n_seq_id != nullptr || replay_batch.seq_id != nullptr || replay_batch.logits != nullptr) {
+            llama_batch_free(replay_batch);
+        }
+        dynamic_seq0_token_history.clear();
+        qnn_prefix_replay_pending = false;
+        if (reset_state_fn != nullptr && qnn_backend != nullptr) {
+            reset_state_fn(qnn_backend);
+        }
+        restore_replay_route_env();
+        restore_memory_after_replay();
+        if (qnn_prefix_replay_restore_plan_valid &&
+            !apply_hetero_plan(qnn_prefix_replay_restore_plan, /* update_base_plan = */ false, "qnn-prefix-replay-revert")) {
+            LLAMA_LOG_ERROR("%s: failed to restore the previous route after QNN replay failure\n", __func__);
+        }
+        qnn_prefix_replay_restore_plan_valid = false;
+        qnn_prefix_replay_active = false;
+        return false;
+    };
+
+    if (qnn_backend == nullptr) {
+        return cleanup_failure("failed to find the active qnn backend for prefix replay");
+    }
+
+    ggml_backend_dev_t qnn_dev = ggml_backend_get_device(qnn_backend);
+    ggml_backend_reg_t qnn_reg = qnn_dev != nullptr ? ggml_backend_dev_backend_reg(qnn_dev) : nullptr;
+    reset_state_fn =
+        qnn_reg != nullptr
+            ? (ggml_backend_qnn_aot_reset_state_t)
+                  ggml_backend_reg_get_proc_address(qnn_reg, "ggml_backend_qnn_aot_reset_state")
+            : nullptr;
+    if (reset_state_fn == nullptr) {
+        return cleanup_failure("qnn backend does not expose AoT reset_state support");
+    }
+
+    LLAMA_LOG_INFO("%s: replaying %zu seq0 prefix token(s) on %s before the current decode token\n",
+            __func__,
+            dynamic_seq0_token_history.size(),
+            qnn_backend_name.empty() ? "<qnn>" : qnn_backend_name.c_str());
+
+    if (n_queued_tokens > 0) {
+        synchronize();
+    }
+
+    if (!reset_state_fn(qnn_backend)) {
+        return cleanup_failure("failed to reset QNN AoT state before prefix replay");
+    }
+
+    try {
+        llama_memory_params params_mem = {
+            /*.type_k =*/ kv_type_k,
+            /*.type_v =*/ kv_type_v,
+            /*.swa_full =*/ kv_swa_full,
+            /*.attn_v_trans =*/ kv_attn_v_trans,
+            /*.attn_v_trans_pinned =*/ true,
+            /*.kv_contract =*/ hetero_kv_contract_allocated,
+        };
+
+        llama_memory_ptr scratch_memory(model.create_memory(params_mem, cparams));
+        if (!scratch_memory) {
+            return cleanup_failure("failed to create scratch memory for QNN prefix replay");
+        }
+
+        saved_memory = std::move(memory);
+        memory = std::move(scratch_memory);
+        replay_using_scratch_memory = true;
+        reset_replay_graph_state();
+
+        LLAMA_LOG_INFO("%s: switched to empty scratch memory so QNN prefix replay re-materializes the tracked prefix without reusing the live generic KV state\n",
+                __func__);
+
+        // Replay should rebuild the QNN-native prefix exactly like static QNN.
+        // Temporarily hide the phase-switch env so seeded AoT graphs do not add
+        // the non-QNN -> QNN seed offset a second time on top of the scratch replay.
+        unsetenv("GGML_HETERO_DYNAMIC_PREFILL_ROUTE");
+        unsetenv("GGML_HETERO_DYNAMIC_DECODE_ROUTE");
+    } catch (const std::exception & err) {
+        return cleanup_failure(err.what());
+    }
+
+    replay_batch = llama_batch_init((int32_t) dynamic_seq0_token_history.size(), 0, 1);
+    if (replay_batch.token == nullptr || replay_batch.pos == nullptr ||
+        replay_batch.n_seq_id == nullptr || replay_batch.seq_id == nullptr || replay_batch.logits == nullptr) {
+        return cleanup_failure("failed to allocate replay batch buffers");
+    }
+
+    replay_batch.n_tokens = static_cast<int32_t>(dynamic_seq0_token_history.size());
+    for (int32_t i = 0; i < replay_batch.n_tokens; ++i) {
+        replay_batch.token[i] = dynamic_seq0_token_history[(size_t) i];
+        replay_batch.pos[i] = i;
+        replay_batch.n_seq_id[i] = 1;
+        replay_batch.seq_id[i][0] = 0;
+        replay_batch.logits[i] = 0;
+    }
+
+    llama_batch_allocr replay_balloc(model.hparams.n_pos_per_embd());
+    if (!replay_balloc.init(
+            replay_batch,
+            model.vocab,
+            nullptr,
+            model.hparams.n_embd_inp(),
+            cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max,
+            /* output_all = */ false)) {
+        return cleanup_failure("failed to initialize replay batch");
+    }
+
+    qnn_prefix_replay_active = true;
+    aot_skip_bootstrap_for_next_decode = true;
+    sched_reserve();
+
+    bool replay_did_optimize = false;
+    llama_memory_context_ptr mctx;
+
+    while (true) {
+        mctx = memory->init_batch(replay_balloc, cparams.n_ubatch, /* embd_all = */ false);
+        if (!mctx) {
+            return cleanup_failure("failed to prepare replay memory context");
+        }
+
+        switch (mctx->get_status()) {
+            case LLAMA_MEMORY_STATUS_SUCCESS:
+                break;
+            case LLAMA_MEMORY_STATUS_NO_UPDATE:
+                return cleanup_failure("unexpected replay memory status LLAMA_MEMORY_STATUS_NO_UPDATE");
+            case LLAMA_MEMORY_STATUS_FAILED_PREPARE:
+                if (!replay_did_optimize) {
+                    replay_did_optimize = true;
+                    if (memory_update(true)) {
+                        continue;
+                    }
+                }
+                return cleanup_failure("failed to find a replay memory slot for the tracked prefix");
+            case LLAMA_MEMORY_STATUS_FAILED_COMPUTE:
+                return cleanup_failure("memory computation failed while preparing the replay prefix");
+        }
+
+        break;
+    }
+
+    do {
+        const auto & ubatch = mctx->get_ubatch();
+        n_outputs = 0;
+
+        ggml_status status;
+        const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
+        if (!res) {
+            llama_pos pos_min[LLAMA_MAX_SEQ];
+            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                pos_min[s] = std::numeric_limits<llama_pos>::max();
+            }
+
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                const llama_seq_id seq_id = ubatch.seq_id[i][0];
+                pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
+            }
+
+            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                if (pos_min[s] != std::numeric_limits<llama_pos>::max()) {
+                    memory->seq_rm(s, pos_min[s], -1);
+                }
+            }
+
+            switch (status) {
+                case GGML_STATUS_ABORTED:
+                    return cleanup_failure("QNN prefix replay was aborted");
+                case GGML_STATUS_ALLOC_FAILED:
+                    return cleanup_failure("QNN prefix replay failed during graph allocation");
+                case GGML_STATUS_FAILED:
+                    return cleanup_failure("QNN prefix replay graph execution failed");
+                case GGML_STATUS_SUCCESS:
+                    return cleanup_failure("QNN prefix replay returned an unexpected success state");
+            }
+        }
+    } while (mctx->next());
+
+    ggml_backend_sched_synchronize(sched.get());
+    restore_replay_route_env();
+    restore_memory_after_replay();
+
+    llama_batch_free(replay_batch);
+    qnn_prefix_replay_pending = false;
+    qnn_prefix_replay_restore_plan_valid = false;
+    qnn_prefix_replay_active = false;
+    return true;
 }
 
 //

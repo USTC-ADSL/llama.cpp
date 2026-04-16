@@ -997,6 +997,60 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     return updated;
 }
 
+bool llama_kv_cache::sync_external_opencl_host_aliases(ggml_backend_t opencl_backend, bool host_to_device) const {
+    using ggml_backend_opencl_sync_external_host_buffer_t =
+        bool (*)(ggml_backend_t backend, ggml_backend_buffer_t buffer, bool host_to_device);
+
+    if (opencl_backend == nullptr) {
+        return false;
+    }
+
+    ggml_backend_dev_t opencl_dev = ggml_backend_get_device(opencl_backend);
+    ggml_backend_reg_t opencl_reg = opencl_dev != nullptr ? ggml_backend_dev_backend_reg(opencl_dev) : nullptr;
+    auto * sync_buffer_fn =
+        opencl_reg != nullptr
+            ? (ggml_backend_opencl_sync_external_host_buffer_t)
+                  ggml_backend_reg_get_proc_address(opencl_reg, "ggml_backend_opencl_sync_external_host_buffer")
+            : nullptr;
+    if (sync_buffer_fn == nullptr) {
+        LLAMA_LOG_ERROR("%s: OpenCL backend does not expose external host-buffer sync support\n", __func__);
+        return false;
+    }
+
+    size_t synced_buffers = 0;
+    size_t synced_bytes = 0;
+
+    for (const auto & [ctx, buf] : ctxs_bufs) {
+        GGML_UNUSED(ctx);
+
+        if (buf == nullptr || !ggml_backend_buffer_is_host(buf.get())) {
+            continue;
+        }
+        const char * buffer_name = ggml_backend_buffer_name(buf.get());
+
+        if (!sync_buffer_fn(opencl_backend, buf.get(), host_to_device)) {
+            LLAMA_LOG_ERROR("%s: failed to synchronize KV buffer %s for CPU/OpenCL phase switch (%s)\n",
+                    __func__,
+                    buffer_name != nullptr ? buffer_name : "<unnamed>",
+                    host_to_device ? "host->device" : "device->host");
+            return false;
+        }
+
+        synced_buffers++;
+        synced_bytes += ggml_backend_buffer_get_size(buf.get());
+    }
+
+    if (synced_buffers > 0) {
+        LLAMA_LOG_INFO("%s: synchronized %zu KV buffer(s) for CPU/OpenCL phase switch (%s), total %.2f MiB\n",
+                __func__,
+                synced_buffers,
+                host_to_device ? "host->device" : "device->host",
+                synced_bytes / 1024.0 / 1024.0);
+    }
+
+    return true;
+}
+
 llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {
 
     if (debug > 0) {

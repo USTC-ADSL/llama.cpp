@@ -205,6 +205,7 @@ public:
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     bool dump_powerserve_seed_kv(const std::string & dir, uint32_t n_tokens) const;
+    bool sync_external_opencl_host_aliases(ggml_backend_t opencl_backend, bool host_to_device) const;
 
 private:
     const llama_model & model;

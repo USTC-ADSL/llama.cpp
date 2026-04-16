@@ -268,6 +268,13 @@ private:
     bool ensure_hetero_backends_for_route(const llama_hetero_route_spec & route, const char * label_prefix);
     bool ensure_dynamic_route_backends_ready(const llama_dynamic_route_runtime_config & config);
     bool backend_available_for_route(const std::string & backend_name) const;
+    ggml_backend_t find_backend_for_route(const std::string & backend_name) const;
+    bool sync_dynamic_cpu_opencl_kv(bool host_to_device);
+    void maybe_debug_dump_powerserve_prefix_before_qnn_switch();
+    bool migrate_dynamic_cpu_opencl_kv(const std::string & producer_backend, const std::string & consumer_backend);
+    void validate_dynamic_seq0_token_history();
+    void record_dynamic_seq0_token_history(const llama_batch & batch_inp, size_t prefix_tokens_before_decode);
+    bool replay_dynamic_qnn_prefix();
     void maybe_apply_dynamic_route(uint32_t n_tokens);
 
     //
@@ -279,6 +286,8 @@ private:
     llama_cparams cparams;
     ggml_type kv_type_k = GGML_TYPE_F16;
     ggml_type kv_type_v = GGML_TYPE_F16;
+    bool kv_swa_full = false;
+    bool kv_attn_v_trans = true;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
@@ -376,6 +385,11 @@ private:
     bool aot_bootstrap_cpu_sched_active = false;
     bool aot_active_route_requests_qnn = false;
     bool aot_skip_bootstrap_for_next_decode = false;
+    std::vector<llama_token> dynamic_seq0_token_history;
+    llama_hetero_execution_plan qnn_prefix_replay_restore_plan;
+    bool qnn_prefix_replay_restore_plan_valid = false;
+    bool qnn_prefix_replay_pending = false;
+    bool qnn_prefix_replay_active = false;
 
     llama_hetero_execution_plan hetero_plan;
     llama_hetero_execution_plan hetero_plan_base;

@@ -1,4 +1,5 @@
 #include "aot.hpp"
+#include "aot-pos-utils.hpp"
 
 #include "ggml-impl.h"
 #include "logger.hpp"
@@ -650,12 +651,29 @@ float read_kq_mask_value(const ggml_tensor * mask,
         return mask_value;
     }
 
-    const auto * row = static_cast<const char *>(mask->data) + token * mask->nb[1];
     switch (mask->type) {
-        case GGML_TYPE_F32:
-            return reinterpret_cast<const float *>(row)[kv_index];
-        case GGML_TYPE_F16:
-            return ggml_fp16_to_fp32(reinterpret_cast<const ggml_fp16_t *>(row)[kv_index]);
+        case GGML_TYPE_F32: {
+            float value = mask_value;
+            const size_t offset = token * mask->nb[1] + kv_index * sizeof(float);
+            if (tensor_has_host_accessible_data(mask)) {
+                const auto * row = static_cast<const char *>(mask->data) + token * mask->nb[1];
+                value = reinterpret_cast<const float *>(row)[kv_index];
+            } else {
+                backend_tensor_get_view_aware(mask, &value, offset, sizeof(value));
+            }
+            return value;
+        }
+        case GGML_TYPE_F16: {
+            ggml_fp16_t value = ggml_fp32_to_fp16(mask_value);
+            const size_t offset = token * mask->nb[1] + kv_index * sizeof(ggml_fp16_t);
+            if (tensor_has_host_accessible_data(mask)) {
+                const auto * row = static_cast<const char *>(mask->data) + token * mask->nb[1];
+                value = reinterpret_cast<const ggml_fp16_t *>(row)[kv_index];
+            } else {
+                backend_tensor_get_view_aware(mask, &value, offset, sizeof(value));
+            }
+            return ggml_fp16_to_fp32(value);
+        }
         default:
             return mask_value;
     }
@@ -1133,6 +1151,18 @@ bool aot_generic_kv_writeback_needed_for_phase_switch() {
     return true;
 }
 
+bool aot_phase_switch_into_seeded_qnn_from_non_qnn_prefill() {
+    const aot_phase_route_spec decode_route =
+        parse_phase_route_spec(std::getenv("GGML_HETERO_DYNAMIC_DECODE_ROUTE"));
+    if (!decode_route.has_any_route() || !route_requests_qnn(decode_route)) {
+        return false;
+    }
+
+    const aot_phase_route_spec prefill_route =
+        parse_phase_route_spec(std::getenv("GGML_HETERO_DYNAMIC_PREFILL_ROUTE"));
+    return prefill_route.has_any_route() && route_attention_uses_non_qnn_backend(prefill_route);
+}
+
 bool aot_write_generic_kv_enabled() {
     return env_flag_enabled("GGML_QNN_AOT_WRITE_GENERIC_KV");
 }
@@ -1257,6 +1287,148 @@ bool copy_i64_tensor_slice(const ggml_tensor * tensor,
     } else {
         backend_tensor_get_view_aware(tensor, out.data(), offset * sizeof(int64_t), bytes);
     }
+    return true;
+}
+
+bool read_f32_token_block_from_cache(const ggml_tensor * cache,
+                                     const ggml_tensor * idxs,
+                                     size_t              token_offset,
+                                     size_t              n_tokens,
+                                     bool                allow_slot_row_reads,
+                                     const std::vector<int64_t> * fallback_slots,
+                                     std::vector<float> & out) {
+    if (cache == nullptr || n_tokens == 0 || (cache->type != GGML_TYPE_F32 && cache->type != GGML_TYPE_F16)) {
+        return false;
+    }
+
+    const size_t token_values = static_cast<size_t>(cache->ne[0]);
+    if (token_values == 0) {
+        return false;
+    }
+
+    std::vector<int64_t> slot_slice;
+    if (fallback_slots != nullptr && fallback_slots->size() == n_tokens) {
+        slot_slice = *fallback_slots;
+    } else if (idxs != nullptr) {
+        copy_i64_tensor_slice(idxs, token_offset, n_tokens, slot_slice);
+    }
+
+    if (idxs == nullptr) {
+        if (ggml_n_dims(cache) < 2 || cache->ne[2] != 1 || cache->ne[3] != 1) {
+            return false;
+        }
+
+        if (slot_slice.empty()) {
+            slot_slice.resize(n_tokens);
+            for (size_t i = 0; i < n_tokens; ++i) {
+                slot_slice[i] = static_cast<int64_t>(token_offset + i);
+            }
+        }
+
+        out.resize(token_values * n_tokens);
+        return copy_token_rows_from_cache(cache,
+                                          slot_slice,
+                                          out.data(),
+                                          out.size() * sizeof(float),
+                                          QNN_DATATYPE_FLOAT_32);
+    }
+
+    std::vector<int64_t> idx_slice;
+    if (allow_slot_row_reads &&
+        ggml_n_dims(cache) >= 2 &&
+        cache->ne[2] == 1 &&
+        cache->ne[3] == 1 &&
+        !slot_slice.empty()) {
+        bool row_indices = true;
+        for (const int64_t idx : slot_slice) {
+            if (idx < 0 || idx >= cache->ne[1]) {
+                row_indices = false;
+                break;
+            }
+        }
+
+        if (row_indices) {
+            out.resize(token_values * n_tokens);
+            return copy_token_rows_from_cache(cache,
+                                              slot_slice,
+                                              out.data(),
+                                              out.size() * sizeof(float),
+                                              QNN_DATATYPE_FLOAT_32);
+        }
+    }
+
+    const size_t value_count = token_values * n_tokens;
+    const bool have_dense_value_indices =
+        copy_i64_tensor_slice(idxs, token_offset * token_values, value_count, idx_slice) &&
+        ggml_is_contiguous(cache);
+
+    if (!have_dense_value_indices) {
+        if (!ggml_is_contiguous(cache) || slot_slice.empty()) {
+            return false;
+        }
+
+        const size_t kv_size = static_cast<size_t>(cache->ne[1]);
+        idx_slice.resize(value_count);
+        for (size_t token = 0; token < n_tokens; ++token) {
+            const int64_t slot = slot_slice[token];
+            if (slot < 0) {
+                return false;
+            }
+            const size_t stream = static_cast<size_t>(slot) / kv_size;
+            const size_t local_slot = static_cast<size_t>(slot) % kv_size;
+            const size_t stream_offset = stream * kv_size * token_values;
+            for (size_t i = 0; i < token_values; ++i) {
+                idx_slice[token * token_values + i] = static_cast<int64_t>(stream_offset + i * kv_size + local_slot);
+            }
+        }
+    }
+
+    const size_t cache_values = ggml_nelements(cache);
+    if (cache_values == 0) {
+        return false;
+    }
+
+    out.resize(value_count);
+
+    if (cache->type == GGML_TYPE_F32) {
+        std::vector<float> cache_host;
+        const float * cache_base = nullptr;
+        if (tensor_has_host_accessible_data(cache)) {
+            cache_base = static_cast<const float *>(cache->data);
+        } else {
+            cache_host.resize(cache_values);
+            backend_tensor_get_view_aware(cache, cache_host.data(), 0, ggml_nbytes(cache));
+            cache_base = cache_host.data();
+        }
+
+        for (size_t i = 0; i < value_count; ++i) {
+            const int64_t idx = idx_slice[i];
+            if (idx < 0 || static_cast<size_t>(idx) >= cache_values) {
+                return false;
+            }
+            out[i] = cache_base[idx];
+        }
+        return true;
+    }
+
+    std::vector<ggml_fp16_t> cache_host;
+    const ggml_fp16_t * cache_base = nullptr;
+    if (tensor_has_host_accessible_data(cache)) {
+        cache_base = static_cast<const ggml_fp16_t *>(cache->data);
+    } else {
+        cache_host.resize(cache_values);
+        backend_tensor_get_view_aware(cache, cache_host.data(), 0, ggml_nbytes(cache));
+        cache_base = cache_host.data();
+    }
+
+    for (size_t i = 0; i < value_count; ++i) {
+        const int64_t idx = idx_slice[i];
+        if (idx < 0 || static_cast<size_t>(idx) >= cache_values) {
+            return false;
+        }
+        out[i] = ggml_fp16_to_fp32(cache_base[idx]);
+    }
+
     return true;
 }
 
@@ -3839,6 +4011,26 @@ void qnn_aot_runtime::save_kv(qnn_aot_graph & graph, size_t n_tokens) {
             const size_t key_cache_stride   = graph_config.cache_size * key_element_size;
             const size_t value_row_bytes    = head_dim * value_element_size;
 
+            if (aot_trace_bind_enabled() &&
+                layer == graph_config.start_layer_id &&
+                head == 0 &&
+                n_tokens > 0) {
+                QNN_LOG_INFO(
+                    "[aot] save_kv sample: graph=%s base=%zu tokens=%zu layer=%zu k0=[%.5f %.5f %.5f %.5f] v0=[%.5f %.5f %.5f %.5f]\n",
+                    graph_config.graph_name.c_str(),
+                    _kv_position,
+                    n_tokens,
+                    layer,
+                    read_fp_value(key_out + 0 * key_element_size, key_element_size),
+                    head_dim > 1 ? read_fp_value(key_out + 1 * key_element_size, key_element_size) : 0.0f,
+                    head_dim > 2 ? read_fp_value(key_out + 2 * key_element_size, key_element_size) : 0.0f,
+                    head_dim > 3 ? read_fp_value(key_out + 3 * key_element_size, key_element_size) : 0.0f,
+                    read_fp_value(value_out + 0 * value_element_size, value_element_size),
+                    head_dim > 1 ? read_fp_value(value_out + 1 * value_element_size, value_element_size) : 0.0f,
+                    head_dim > 2 ? read_fp_value(value_out + 2 * value_element_size, value_element_size) : 0.0f,
+                    head_dim > 3 ? read_fp_value(value_out + 3 * value_element_size, value_element_size) : 0.0f);
+            }
+
             for (size_t token = 0; token < n_tokens; ++token) {
                 // Bug 5 fix: guard against writing past the end of the KV cache.
                 const size_t cache_slot = _kv_position + token;
@@ -3862,22 +4054,54 @@ void qnn_aot_runtime::save_kv(qnn_aot_graph & graph, size_t n_tokens) {
 
 bool qnn_aot_runtime::import_generic_kv_prefix_to_graph(qnn_aot_graph & graph,
                                                         const aot_match_result & match,
+                                                        size_t source_token_offset,
+                                                        size_t dest_token_offset,
                                                         size_t n_tokens) {
     if (n_tokens == 0) {
         return true;
     }
 
     const auto & graph_config = graph.config();
-    if (graph_config.cache_size == 0 || n_tokens > graph_config.cache_size) {
-        QNN_LOG_WARN("[aot] import_generic_kv_prefix_to_graph invalid token count=%zu cache_size=%zu graph=%s\n",
-                     n_tokens, graph_config.cache_size, graph_config.graph_name.c_str());
+    if (graph_config.cache_size == 0 || dest_token_offset > graph_config.cache_size ||
+        n_tokens > graph_config.cache_size - dest_token_offset) {
+        QNN_LOG_WARN("[aot] import_generic_kv_prefix_to_graph invalid range src_offset=%zu dst_offset=%zu tokens=%zu cache_size=%zu graph=%s\n",
+                     source_token_offset, dest_token_offset, n_tokens, graph_config.cache_size, graph_config.graph_name.c_str());
         return false;
     }
 
-    std::vector<int64_t> slots(n_tokens);
+    std::vector<int64_t> source_slots(n_tokens);
     for (size_t i = 0; i < n_tokens; ++i) {
-        slots[i] = static_cast<int64_t>(i);
+        source_slots[i] = static_cast<int64_t>(source_token_offset + i);
     }
+
+    auto convert_and_store = [](char * dst,
+                                size_t elem_size,
+                                Qnn_DataType_t dtype,
+                                const float * src,
+                                size_t n_values,
+                                size_t dst_stride) -> bool {
+        switch (dtype) {
+            case QNN_DATATYPE_FLOAT_16:
+            case QNN_DATATYPE_UNDEFINED: {
+                auto * dst_bytes = dst;
+                for (size_t i = 0; i < n_values; ++i) {
+                    *reinterpret_cast<ggml_fp16_t *>(dst_bytes) = ggml_fp32_to_fp16(src[i]);
+                    dst_bytes += dst_stride;
+                }
+                return true;
+            }
+            case QNN_DATATYPE_FLOAT_32: {
+                auto * dst_bytes = dst;
+                for (size_t i = 0; i < n_values; ++i) {
+                    *reinterpret_cast<float *>(dst_bytes) = src[i];
+                    dst_bytes += dst_stride;
+                }
+                return true;
+            }
+            default:
+                return false;
+        }
+    };
 
     for (size_t layer = graph_config.start_layer_id; layer < graph_config.end_layer_id; ++layer) {
         auto cache_k_it = match.cache_k_layers.find(layer);
@@ -3908,6 +4132,10 @@ bool qnn_aot_runtime::import_generic_kv_prefix_to_graph(qnn_aot_graph & graph,
 
         const size_t key_head_values = generic_k_values / _config.model.n_kv_heads;
         const size_t value_head_values = generic_v_values / _config.model.n_kv_heads;
+        const bool value_cache_uses_dense_indices =
+            match.v_idxs != nullptr &&
+            match.n_tokens > 0 &&
+            static_cast<size_t>(match.v_idxs->ne[0]) > match.n_tokens;
 
         for (size_t head = 0; head < _config.model.n_kv_heads; ++head) {
             const auto key_cache_name   = std::string("layer_") + std::to_string(layer) + "_key_t_cache_" + std::to_string(head);
@@ -3939,42 +4167,81 @@ bool qnn_aot_runtime::import_generic_kv_prefix_to_graph(qnn_aot_graph & graph,
 
             const size_t key_cache_stride = graph_config.cache_size * key_elem_size;
             const size_t value_row_bytes = value_head_values * value_elem_size;
-            std::vector<uint8_t> key_rows(n_tokens * generic_k_values * key_elem_size);
-            std::vector<uint8_t> value_rows(n_tokens * generic_v_values * value_elem_size);
+            std::vector<float> key_rows;
+            std::vector<float> value_rows;
 
-            if (!copy_token_rows_from_cache(generic_k,
-                                            slots,
-                                            key_rows.data(),
-                                            key_rows.size(),
-                                            key_dtype) ||
-                !copy_token_rows_from_cache(generic_v,
-                                            slots,
-                                            value_rows.data(),
-                                            value_rows.size(),
-                                            value_dtype)) {
+            if (!read_f32_token_block_from_cache(generic_k,
+                                                 match.k_idxs,
+                                                 source_token_offset,
+                                                 n_tokens,
+                                                 true,
+                                                 &source_slots,
+                                                 key_rows) ||
+                !read_f32_token_block_from_cache(generic_v,
+                                                 match.v_idxs,
+                                                 source_token_offset,
+                                                 n_tokens,
+                                                 !value_cache_uses_dense_indices,
+                                                 &source_slots,
+                                                 value_rows)) {
                 QNN_LOG_WARN("[aot] import_generic_kv_prefix_to_graph failed to read generic cache rows at layer=%zu head=%zu graph=%s\n",
                              layer, head, graph_config.graph_name.c_str());
                 return false;
             }
 
+            if (aot_trace_bind_enabled() &&
+                layer == graph_config.start_layer_id &&
+                head == 0 &&
+                !key_rows.empty() &&
+                !value_rows.empty()) {
+                QNN_LOG_INFO(
+                    "[aot] import generic KV sample: graph=%s offset=%zu tokens=%zu layer=%zu dense_v=%d k_idxs=%lld v_idxs=%lld slot0=%lld k0=[%.5f %.5f %.5f %.5f] v0=[%.5f %.5f %.5f %.5f]\n",
+                    graph_config.graph_name.c_str(),
+                    source_token_offset,
+                    n_tokens,
+                    layer,
+                    value_cache_uses_dense_indices ? 1 : 0,
+                    match.k_idxs ? (long long) match.k_idxs->ne[0] : -1LL,
+                    match.v_idxs ? (long long) match.v_idxs->ne[0] : -1LL,
+                    source_slots.empty() ? -1LL : (long long) source_slots[0],
+                    key_rows.size() > 0 ? key_rows[0] : 0.0f,
+                    key_rows.size() > 1 ? key_rows[1] : 0.0f,
+                    key_rows.size() > 2 ? key_rows[2] : 0.0f,
+                    key_rows.size() > 3 ? key_rows[3] : 0.0f,
+                    value_rows.size() > 0 ? value_rows[0] : 0.0f,
+                    value_rows.size() > 1 ? value_rows[1] : 0.0f,
+                    value_rows.size() > 2 ? value_rows[2] : 0.0f,
+                    value_rows.size() > 3 ? value_rows[3] : 0.0f);
+            }
+
             for (size_t token = 0; token < n_tokens; ++token) {
-                const char * key_row = reinterpret_cast<const char *>(key_rows.data()) + token * generic_k_values * key_elem_size;
-                const char * value_row = reinterpret_cast<const char *>(value_rows.data()) + token * generic_v_values * value_elem_size;
-                copy_contiguous_to_strided(key_cache + token * key_elem_size,
-                                           key_cache_stride,
-                                           key_row + head * key_head_values * key_elem_size,
-                                           key_head_values,
-                                           key_elem_size);
-                std::memcpy(value_cache + token * value_row_bytes,
-                            value_row + head * value_head_values * value_elem_size,
-                            value_row_bytes);
+                const float * key_row = key_rows.data() + token * generic_k_values + head * key_head_values;
+                const float * value_row = value_rows.data() + token * generic_v_values + head * value_head_values;
+                if (!convert_and_store(key_cache + (dest_token_offset + token) * key_elem_size,
+                                       key_elem_size,
+                                       key_dtype,
+                                       key_row,
+                                       key_head_values,
+                                       key_cache_stride) ||
+                    !convert_and_store(value_cache + (dest_token_offset + token) * value_row_bytes,
+                                       value_elem_size,
+                                       value_dtype,
+                                       value_row,
+                                       value_head_values,
+                                       value_elem_size)) {
+                    QNN_LOG_WARN("[aot] import_generic_kv_prefix_to_graph failed to convert rows at layer=%zu head=%zu graph=%s\n",
+                                 layer, head, graph_config.graph_name.c_str());
+                    return false;
+                }
             }
         }
     }
 
     if (aot_trace_bind_enabled()) {
-        QNN_LOG_INFO("[aot] imported generic KV prefix into private QNN cache: graph=%s tokens=%zu layers=[%zu,%zu)\n",
+        QNN_LOG_INFO("[aot] imported generic KV prefix into private QNN cache: graph=%s src_offset=%zu dst_offset=%zu tokens=%zu layers=[%zu,%zu)\n",
                      graph_config.graph_name.c_str(),
+                     source_token_offset,
+                     dest_token_offset,
                      n_tokens,
                      graph_config.start_layer_id,
                      graph_config.end_layer_id);
@@ -4466,28 +4733,7 @@ void qnn_aot_runtime::zero_transformer_state() {
 }
 
 size_t qnn_aot_runtime::infer_start_pos(const std::vector<ggml_tensor *> & inputs, size_t n_tokens) const {
-    size_t inferred = _kv_position;
-    for (auto * tensor : inputs) {
-        if (!tensor || tensor->type != GGML_TYPE_I32 || ggml_n_dims(tensor) != 1 || tensor->data == nullptr) {
-            continue;
-        }
-        if (static_cast<size_t>(tensor->ne[0]) < n_tokens || n_tokens == 0) {
-            continue;
-        }
-
-        const auto * values = static_cast<const int32_t *>(tensor->data);
-        bool contiguous = true;
-        for (size_t i = 1; i < n_tokens; ++i) {
-            if (values[i] != values[0] + static_cast<int32_t>(i)) {
-                contiguous = false;
-                break;
-            }
-        }
-        if (contiguous && values[0] >= 0) {
-            inferred = std::max(inferred, static_cast<size_t>(values[0]));
-        }
-    }
-    return inferred;
+    return qnn_aot_infer_start_pos_from_inputs(inputs, n_tokens, _kv_position);
 }
 
 bool qnn_aot_runtime::is_transformer_output_candidate(const ggml_tensor * tensor) const {
@@ -4550,12 +4796,41 @@ bool qnn_aot_runtime::execute_attention(ggml_cgraph * cgraph, const aot_match_re
         return false;
     }
 
-    if ((match.inferred_pos == 0 && _kv_position != 0) ||
-        (_kv_position + match.n_tokens > graph->config().cache_size && match.inferred_pos == 0)) {
+    const bool apply_seed_prefix_offset =
+        _seed_kv_loaded &&
+        _seed_kv_size > 0 &&
+        _kv_position == _seed_kv_size &&
+        aot_phase_switch_into_seeded_qnn_from_non_qnn_prefill();
+    const size_t effective_inferred_pos =
+        apply_seed_prefix_offset ? match.inferred_pos + _seed_kv_size : match.inferred_pos;
+
+    if (aot_trace_bind_enabled()) {
+        QNN_LOG_INFO("[aot] attention prefix state: graph=%s kv_position=%zu seed_kv_size=%zu inferred_pos=%zu effective_pos=%zu n_tokens=%zu\n",
+                     graph->config().graph_name.c_str(),
+                     _kv_position,
+                     _seed_kv_size,
+                     match.inferred_pos,
+                     effective_inferred_pos,
+                     match.n_tokens);
+    }
+
+    if ((effective_inferred_pos == 0 && _kv_position != 0) ||
+        (_kv_position + match.n_tokens > graph->config().cache_size && effective_inferred_pos == 0)) {
         reset_state();
     }
 
-    size_t generic_prefix_tokens = match.inferred_pos;
+    size_t generic_prefix_tokens = effective_inferred_pos;
+    if (_kv_position == 0 && generic_prefix_tokens == 0) {
+        size_t inferred_from_k_idxs = 0;
+        if (qnn_aot_try_infer_contiguous_start_pos(match.k_idxs, match.n_tokens, inferred_from_k_idxs)) {
+            generic_prefix_tokens = inferred_from_k_idxs;
+            if (aot_trace_bind_enabled()) {
+                QNN_LOG_INFO("[aot] inferred generic KV prefix from k_idxs: graph=%s inferred_pos=%zu\n",
+                             graph->config().graph_name.c_str(),
+                             generic_prefix_tokens);
+            }
+        }
+    }
     if (_kv_position == 0 && generic_prefix_tokens == 0 && match.kq_mask != nullptr && match.n_tokens == 1) {
         std::vector<int64_t> inferred_slots;
         if (infer_current_token_slots_from_kq_mask(match.kq_mask,
@@ -4567,16 +4842,45 @@ bool qnn_aot_runtime::execute_attention(ggml_cgraph * cgraph, const aot_match_re
             generic_prefix_tokens = static_cast<size_t>(inferred_slots[0]);
         }
     }
+    if (_kv_position == 0 && generic_prefix_tokens == 0 && aot_trace_bind_enabled()) {
+        std::vector<int64_t> k_idx_sample;
+        const bool has_k_idx_sample = copy_i64_tensor_slice(match.k_idxs, 0, std::min<size_t>(match.n_tokens, 4), k_idx_sample);
+        std::vector<int64_t> inferred_slots;
+        const bool mask_inferred = match.kq_mask != nullptr &&
+                                   infer_current_token_slots_from_kq_mask(match.kq_mask,
+                                                                          match.n_tokens,
+                                                                          _config.model.attention_mask_value,
+                                                                          inferred_slots);
+        QNN_LOG_INFO("[aot] generic KV prefix unresolved: graph=%s k_idxs=%s kq_mask=%s k_idx_sample=%s mask_slot0=%lld\n",
+                     graph->config().graph_name.c_str(),
+                     match.k_idxs ? ggml_type_name(match.k_idxs->type) : "<null>",
+                     match.kq_mask ? ggml_type_name(match.kq_mask->type) : "<null>",
+                     has_k_idx_sample && !k_idx_sample.empty() ? std::to_string(k_idx_sample[0]).c_str() : "<none>",
+                     mask_inferred && !inferred_slots.empty() ? (long long) inferred_slots[0] : -1LL);
+    }
 
-    if (_kv_position == 0 && generic_prefix_tokens > 0) {
-        if (!import_generic_kv_prefix_to_graph(*graph, match, generic_prefix_tokens)) {
+    if (generic_prefix_tokens > _kv_position) {
+        const size_t import_tokens = generic_prefix_tokens - _kv_position;
+        const size_t import_source_offset =
+            apply_seed_prefix_offset && _kv_position >= _seed_kv_size
+                ? (_kv_position - _seed_kv_size)
+                : _kv_position;
+        if (apply_seed_prefix_offset && import_source_offset + import_tokens > match.inferred_pos) {
+            QNN_LOG_WARN("[aot] attention import source range invalid: src_offset=%zu tokens=%zu raw_inferred_pos=%zu graph=%s\n",
+                         import_source_offset,
+                         import_tokens,
+                         match.inferred_pos,
+                         graph->config().graph_name.c_str());
+            return false;
+        }
+        if (!import_generic_kv_prefix_to_graph(*graph, match, import_source_offset, _kv_position, import_tokens)) {
             QNN_LOG_WARN("[aot] attention failed to import generic KV prefix for graph=%s inferred_pos=%zu\n",
                          graph->config().graph_name.c_str(),
                          generic_prefix_tokens);
             return false;
         }
-        _kv_position = generic_prefix_tokens;
     }
+    _kv_position = std::max(_kv_position, generic_prefix_tokens);
 
     if (match.embd->type != GGML_TYPE_F32 || match.out->type != GGML_TYPE_F32) {
         QNN_LOG_WARN("[aot] attention IO expects F32 tensors, got %s -> %s\n",
@@ -4709,12 +5013,41 @@ bool qnn_aot_runtime::execute_transformer(ggml_cgraph * cgraph, const aot_match_
         }
     }
 
-    if ((match.inferred_pos == 0 && _kv_position != 0) ||
-        (_kv_position + match.n_tokens > graphs.front()->config().cache_size && match.inferred_pos == 0)) {
+    const bool apply_seed_prefix_offset =
+        _seed_kv_loaded &&
+        _seed_kv_size > 0 &&
+        _kv_position == _seed_kv_size &&
+        aot_phase_switch_into_seeded_qnn_from_non_qnn_prefill();
+    const size_t effective_inferred_pos =
+        apply_seed_prefix_offset ? match.inferred_pos + _seed_kv_size : match.inferred_pos;
+
+    if (aot_trace_bind_enabled()) {
+        QNN_LOG_INFO("[aot] transformer prefix state: graph=%s kv_position=%zu seed_kv_size=%zu inferred_pos=%zu effective_pos=%zu n_tokens=%zu\n",
+                     graphs.front()->config().graph_name.c_str(),
+                     _kv_position,
+                     _seed_kv_size,
+                     match.inferred_pos,
+                     effective_inferred_pos,
+                     match.n_tokens);
+    }
+
+    if ((effective_inferred_pos == 0 && _kv_position != 0) ||
+        (_kv_position + match.n_tokens > graphs.front()->config().cache_size && effective_inferred_pos == 0)) {
         reset_state();
     }
 
-    size_t generic_prefix_tokens = match.inferred_pos;
+    size_t generic_prefix_tokens = effective_inferred_pos;
+    if (_kv_position == 0 && generic_prefix_tokens == 0) {
+        size_t inferred_from_k_idxs = 0;
+        if (qnn_aot_try_infer_contiguous_start_pos(match.k_idxs, match.n_tokens, inferred_from_k_idxs)) {
+            generic_prefix_tokens = inferred_from_k_idxs;
+            if (aot_trace_bind_enabled()) {
+                QNN_LOG_INFO("[aot] inferred generic KV prefix from k_idxs: graph=%s inferred_pos=%zu\n",
+                             graphs.front()->config().graph_name.c_str(),
+                             generic_prefix_tokens);
+            }
+        }
+    }
     if (_kv_position == 0 && generic_prefix_tokens == 0 && match.kq_mask != nullptr && match.n_tokens == 1) {
         std::vector<int64_t> inferred_slots;
         if (infer_current_token_slots_from_kq_mask(match.kq_mask,
@@ -4726,18 +5059,47 @@ bool qnn_aot_runtime::execute_transformer(ggml_cgraph * cgraph, const aot_match_
             generic_prefix_tokens = static_cast<size_t>(inferred_slots[0]);
         }
     }
+    if (_kv_position == 0 && generic_prefix_tokens == 0 && aot_trace_bind_enabled()) {
+        std::vector<int64_t> k_idx_sample;
+        const bool has_k_idx_sample = copy_i64_tensor_slice(match.k_idxs, 0, std::min<size_t>(match.n_tokens, 4), k_idx_sample);
+        std::vector<int64_t> inferred_slots;
+        const bool mask_inferred = match.kq_mask != nullptr &&
+                                   infer_current_token_slots_from_kq_mask(match.kq_mask,
+                                                                          match.n_tokens,
+                                                                          _config.model.attention_mask_value,
+                                                                          inferred_slots);
+        QNN_LOG_INFO("[aot] generic KV prefix unresolved: graph=%s k_idxs=%s kq_mask=%s k_idx_sample=%s mask_slot0=%lld\n",
+                     graphs.front()->config().graph_name.c_str(),
+                     match.k_idxs ? ggml_type_name(match.k_idxs->type) : "<null>",
+                     match.kq_mask ? ggml_type_name(match.kq_mask->type) : "<null>",
+                     has_k_idx_sample && !k_idx_sample.empty() ? std::to_string(k_idx_sample[0]).c_str() : "<none>",
+                     mask_inferred && !inferred_slots.empty() ? (long long) inferred_slots[0] : -1LL);
+    }
 
-    if (_kv_position == 0 && generic_prefix_tokens > 0) {
+    if (generic_prefix_tokens > _kv_position) {
+        const size_t import_tokens = generic_prefix_tokens - _kv_position;
+        const size_t import_source_offset =
+            apply_seed_prefix_offset && _kv_position >= _seed_kv_size
+                ? (_kv_position - _seed_kv_size)
+                : _kv_position;
+        if (apply_seed_prefix_offset && import_source_offset + import_tokens > match.inferred_pos) {
+            QNN_LOG_WARN("[aot] transformer import source range invalid: src_offset=%zu tokens=%zu raw_inferred_pos=%zu graph=%s\n",
+                         import_source_offset,
+                         import_tokens,
+                         match.inferred_pos,
+                         graphs.front()->config().graph_name.c_str());
+            return false;
+        }
         for (auto * graph : graphs) {
-            if (!import_generic_kv_prefix_to_graph(*graph, match, generic_prefix_tokens)) {
+            if (!import_generic_kv_prefix_to_graph(*graph, match, import_source_offset, _kv_position, import_tokens)) {
                 QNN_LOG_WARN("[aot] transformer failed to import generic KV prefix for graph=%s inferred_pos=%zu\n",
                              graph->config().graph_name.c_str(),
                              generic_prefix_tokens);
                 return false;
             }
         }
-        _kv_position = generic_prefix_tokens;
     }
+    _kv_position = std::max(_kv_position, generic_prefix_tokens);
 
     if (match.embd->type != GGML_TYPE_F32 || match.out->type != GGML_TYPE_F32) {
         QNN_LOG_WARN("[aot] transformer IO expects F32 tensors, got %s -> %s\n", ggml_type_name(match.embd->type),
