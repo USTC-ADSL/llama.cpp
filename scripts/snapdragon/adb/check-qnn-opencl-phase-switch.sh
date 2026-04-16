@@ -30,6 +30,7 @@ run_case() {
     local prefill_route="$2"
     local decode_route="$3"
     local decode_backend_label="$4"
+    local primary_device="$5"
 
     local stdout_log
     local stderr_log
@@ -52,7 +53,7 @@ export GGML_HETERO_DYNAMIC_DECODE_ROUTE=${decode_route} &&
 export GGML_HETERO_DYNAMIC_TRACE_TIMING=1 &&
 taskset 80 ./llama-completion --simple-io -no-cnv -st --temp 0 \
   -m ${remote_model} \
-  -ngl 99 -dev GPUOpenCL -t 1 -c 2048 -b 2048 -ub 512 \
+  -ngl 99 -dev ${primary_device} -t 1 -c 2048 -b 2048 -ub 512 \
   -p '${prompt}' \
   -n 24 -s 123 --no-warmup" \
       >"${stdout_log}" 2>"${stderr_log}"
@@ -91,5 +92,6 @@ taskset 80 ./llama-completion --simple-io -no-cnv -st --temp 0 \
     printf '%s\n' "${response}"
 }
 
-run_case "opencl->qnn" "opencl" "qnn-npu" "qnn-npu"
-run_case "qnn->opencl" "qnn-npu" "opencl" "opencl"
+run_case "opencl-main opencl->qnn" "opencl" "qnn-npu" "qnn-npu" "GPUOpenCL"
+run_case "opencl-main qnn->opencl" "qnn-npu" "opencl" "opencl" "GPUOpenCL"
+run_case "qnn-main qnn->opencl" "qnn-npu" "opencl" "opencl" "qnn-npu"

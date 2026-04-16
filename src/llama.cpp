@@ -51,6 +51,13 @@ struct llama_device_memory_data {
     llama_memory_breakdown_data mb;
 };
 
+static bool llama_skip_default_device_selection(ggml_backend_dev_t dev) {
+    const char * name = ggml_backend_dev_name(dev);
+    // Keep qnn-gpu opt-in only. Auto-selecting it alongside GPUOpenCL pollutes
+    // CPU/OpenCL runs with an extra backend that can hijack op offload.
+    return name != nullptr && std::strcmp(name, "qnn-gpu") == 0;
+}
+
 static std::vector<llama_device_memory_data> llama_get_device_memory_data(
         const char * path_model, const llama_model_params * mparams, const llama_context_params * cparams,
         std::vector<ggml_backend_dev_t> & devs, uint32_t & hp_ngl, uint32_t & hp_n_ctx_train, uint32_t & hp_n_expert,
@@ -932,6 +939,13 @@ static struct llama_model * llama_model_load_from_file_impl(
 
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (llama_skip_default_device_selection(dev)) {
+                LLAMA_LOG_DEBUG("%s: skipping device %s (%s) from default device auto-selection\n",
+                        __func__,
+                        ggml_backend_dev_name(dev),
+                        ggml_backend_dev_description(dev));
+                continue;
+            }
             switch (ggml_backend_dev_type(dev)) {
                 case GGML_BACKEND_DEVICE_TYPE_CPU:
                 case GGML_BACKEND_DEVICE_TYPE_ACCEL:

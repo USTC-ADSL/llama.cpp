@@ -185,7 +185,12 @@ static llama_rope_scaling_type llama_rope_scaling_type_from_string(const std::st
 static buft_list_t make_cpu_buft_list(const std::vector<ggml_backend_dev_t> & devices, bool use_extra_bufts, bool no_host) {
     buft_list_t buft_list;
     const bool allow_qnn_accel_buft = std::any_of(devices.begin(), devices.end(), [](ggml_backend_dev_t dev) {
-        return dev != nullptr && llama_hetero_is_qnn_backend(ggml_backend_dev_name(dev));
+        if (dev == nullptr) {
+            return false;
+        }
+
+        const std::string normalized = llama_hetero_canonical_backend(ggml_backend_dev_name(dev));
+        return normalized == "qnn-npu" || normalized == "qnn-cpu";
     });
 
     // add ACCEL buffer types
