@@ -198,6 +198,9 @@ llama_build_and_test(test-chat-template.cpp)
 llama_build_and_test(test-json-partial.cpp)
 llama_build_and_test(test-log.cpp)
 llama_build_and_test(test-memory-attn-v-trans.cpp)
+llama_build_and_test(test-model-loader-opencl-portability.cpp)
+llama_build_and_test(test-opencl-extra-metadata.cpp)
+llama_build_and_test(test-opencl-external-host-alias.cpp)
 llama_build_and_test(test-qnn-aot-pos-utils.cpp)
 llama_build_and_test(
     test-peg-parser.cpp
