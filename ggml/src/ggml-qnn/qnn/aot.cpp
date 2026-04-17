@@ -1,6 +1,8 @@
 #include "aot.hpp"
 #include "aot-pos-utils.hpp"
 
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "logger.hpp"
 
@@ -902,6 +904,32 @@ bool env_flag_enabled(const char * name) {
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
+const char * aot_debug_dump_dir() {
+    const char * value = std::getenv("GGML_QNN_AOT_DEBUG_DUMP_DIR");
+    return value != nullptr && value[0] != '\0' ? value : nullptr;
+}
+
+void aot_debug_dump_f32_blob(const char * filename, const float * data, size_t count) {
+    const char * dir = aot_debug_dump_dir();
+    if (dir == nullptr || filename == nullptr || filename[0] == '\0' || data == nullptr || count == 0) {
+        return;
+    }
+
+    std::error_code ec;
+    const std::filesystem::path dump_dir(dir);
+    std::filesystem::create_directories(dump_dir, ec);
+    if (ec) {
+        return;
+    }
+
+    std::ofstream out(dump_dir / filename, std::ios::binary);
+    if (!out) {
+        return;
+    }
+
+    out.write(reinterpret_cast<const char *>(data), static_cast<std::streamsize>(count * sizeof(float)));
+}
+
 std::string trim_copy(std::string_view value) {
     size_t begin = 0;
     size_t end = value.size();
@@ -1173,6 +1201,14 @@ bool aot_trace_match_enabled() {
 
 bool aot_trace_bind_enabled() {
     return env_flag_enabled("GGML_QNN_AOT_TRACE_BIND");
+}
+
+bool aot_trace_attn_bias_compare_enabled() {
+    return env_flag_enabled("GGML_QNN_AOT_TRACE_ATTN_BIAS_COMPARE");
+}
+
+bool aot_seed_kv_enabled() {
+    return !env_flag_enabled("GGML_QNN_AOT_DISABLE_SEED_KV");
 }
 
 bool graph_type_is_transformer(const std::string & graph_type) {
@@ -1927,6 +1963,36 @@ bool qnn_aot_graph::retrieve_graph_metadata() {
         return true;
     };
 
+    auto log_tensors = [this](const char * kind, const std::vector<Qnn_Tensor_t> & tensors) {
+        if (!aot_trace_bind_enabled()) {
+            return;
+        }
+
+        for (const auto & tensor : tensors) {
+            const char * name = QNN_TENSOR_GET_NAME(tensor);
+            const uint32_t rank = QNN_TENSOR_GET_RANK(tensor);
+            const uint32_t * dims = QNN_TENSOR_GET_DIMENSIONS(tensor);
+            std::string dims_str;
+            dims_str.push_back('[');
+            for (uint32_t i = 0; i < rank; ++i) {
+                if (i > 0) {
+                    dims_str += ',';
+                }
+                dims_str += std::to_string(dims != nullptr ? dims[i] : 0);
+            }
+            dims_str.push_back(']');
+            std::fprintf(stderr,
+                         "[aot] graph tensor graph=%s kind=%s name=%s dtype=%s rank=%u dims=%s bytes=%zu\n",
+                         _config.graph_name.c_str(),
+                         kind,
+                         name != nullptr ? name : "<unnamed>",
+                         qnn::qnn_datatype_to_string(QNN_TENSOR_GET_DATA_TYPE(tensor)),
+                         rank,
+                         dims_str.c_str(),
+                         tensor_nbytes(tensor));
+        }
+    };
+
     bool found = false;
     switch (binary_info->version) {
         case QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_1: {
@@ -1970,6 +2036,10 @@ bool qnn_aot_graph::retrieve_graph_metadata() {
     }
     if (!found) {
         QNN_LOG_WARN("[aot] graph info not found for %s\n", _config.graph_name.c_str());
+    }
+    if (found) {
+        log_tensors("input", _inputs);
+        log_tensors("output", _outputs);
     }
     return found;
 }
@@ -2315,6 +2385,11 @@ qnn_aot_runtime::~qnn_aot_runtime() {
     _ffn_graphs.clear();
     _lm_head_graphs.clear();
     _contexts.clear();
+
+    if (_cpu_backend != nullptr) {
+        ggml_backend_free(_cpu_backend);
+        _cpu_backend = nullptr;
+    }
 }
 
 bool qnn_aot_runtime::initialize(const std::string & config_path, const std::string & model_dir) {
@@ -3378,10 +3453,41 @@ qnn_aot_runtime::aot_match_result qnn_aot_runtime::match_transformer_graph(ggml_
                      leaf_names.c_str());
     }
 
+    const size_t expected_transformer_tokens =
+        result.embd != nullptr ? static_cast<size_t>(result.embd->ne[1]) : 0;
+    const auto transformer_output_matches_tokens = [&](const ggml_tensor * tensor) {
+        if (expected_transformer_tokens == 0) {
+            return is_transformer_output_candidate(tensor);
+        }
+
+        return qnn::qnn_aot_is_f32_token_matrix(tensor, _config.model.embed_dim, expected_transformer_tokens);
+    };
+    const bool trace_match = aot_trace_match_enabled();
+    auto log_transformer_candidate = [&](const char * source, const ggml_tensor * tensor, int node_index) {
+        if (!trace_match || tensor == nullptr) {
+            return;
+        }
+        const char * tensor_name = ggml_get_name(tensor);
+        std::fprintf(stderr,
+                     "[aot-match] transformer candidate source=%s node=%d name=%s type=%s bytes=%zu ne=[%lld,%lld,%lld,%lld] nb1=%zu matches=%d\n",
+                     source,
+                     node_index,
+                     tensor_name != nullptr ? tensor_name : "<unnamed>",
+                     ggml_type_name(tensor->type),
+                     ggml_nbytes(tensor),
+                     (long long) tensor->ne[0],
+                     (long long) tensor->ne[1],
+                     (long long) tensor->ne[2],
+                     (long long) tensor->ne[3],
+                     tensor->nb[1],
+                     transformer_output_matches_tokens(tensor) ? 1 : 0);
+    };
+
     if (seen_result_norm && norm_node != nullptr) {
         for (size_t i = 0; i < GGML_MAX_SRC && norm_node->src[i]; ++i) {
             auto * src = norm_node->src[i];
-            if (src != nullptr && (src->flags & GGML_TENSOR_FLAG_PARAM) == 0) {
+            log_transformer_candidate("result_norm.src", src, -1);
+            if (transformer_output_matches_tokens(src)) {
                 result.out = src;
                 break;
             }
@@ -3391,7 +3497,10 @@ qnn_aot_runtime::aot_match_result qnn_aot_runtime::match_transformer_graph(ggml_
     if (result.out == nullptr && !io.outputs.empty()) {
         for (auto * output : io.outputs) {
             const char * name = ggml_get_name(output);
-            if (is_transformer_stage_name(name) && has_prefix(name, "l_out-")) {
+            log_transformer_candidate("graph.output", output, -1);
+            if (is_transformer_stage_name(name) &&
+                has_prefix(name, "l_out-") &&
+                transformer_output_matches_tokens(output)) {
                 result.out = output;
             }
         }
@@ -3400,7 +3509,10 @@ qnn_aot_runtime::aot_match_result qnn_aot_runtime::match_transformer_graph(ggml_
     if (result.out == nullptr) {
         for (int i = cgraph->n_nodes - 1; i >= 0; --i) {
             auto * node = cgraph->nodes[i];
-            if (is_transformer_output_candidate(node)) {
+            if (trace_match && is_transformer_output_candidate(node)) {
+                log_transformer_candidate("graph.node", node, i);
+            }
+            if (is_transformer_output_candidate(node) && transformer_output_matches_tokens(node)) {
                 result.out = node;
                 break;
             }
@@ -3409,6 +3521,16 @@ qnn_aot_runtime::aot_match_result qnn_aot_runtime::match_transformer_graph(ggml_
 
     if (!result.embd || !result.out) {
         return result;
+    }
+
+    if (trace_match) {
+        const char * embd_name = ggml_get_name(result.embd);
+        const char * out_name = ggml_get_name(result.out);
+        std::fprintf(stderr,
+                     "[aot-match] transformer selected embd=%s out=%s tokens=%zu\n",
+                     embd_name != nullptr ? embd_name : "<unnamed>",
+                     out_name != nullptr ? out_name : "<unnamed>",
+                     expected_transformer_tokens);
     }
 
     result.n_tokens       = static_cast<size_t>(result.embd->ne[1]);
@@ -3929,6 +4051,18 @@ void qnn_aot_runtime::fill_rope_embeds(qnn_aot_graph & graph, size_t start_pos, 
         return;
     }
 
+    if (aot_trace_bind_enabled()) {
+        QNN_LOG_INFO("[aot] rope buffers graph=%s cos_dtype=%s cos_bytes=%zu sin_dtype=%s sin_bytes=%zu start_pos=%zu n_tokens=%zu row_elems=%zu\n",
+                     graph.config().graph_name.c_str(),
+                     qnn::qnn_datatype_to_string(graph.tensor_data_type("rope_embed_cos")),
+                     graph.buffer_size("rope_embed_cos"),
+                     qnn::qnn_datatype_to_string(graph.tensor_data_type("rope_embed_sin")),
+                     graph.buffer_size("rope_embed_sin"),
+                     start_pos,
+                     n_tokens,
+                     _config.model.head_dim / 2);
+    }
+
     // Bug 4 fix: guard against underflow when _rope_embeds is empty (size()-1 wraps to SIZE_MAX).
     if (_rope_embeds.empty()) {
         QNN_LOG_WARN("[aot] fill_rope_embeds: _rope_embeds is empty, skipping\n");
@@ -3985,6 +4119,101 @@ void qnn_aot_runtime::fill_attention_bias(qnn_aot_graph & graph, size_t n_tokens
         }
         fill_bias(static_cast<__fp16 *>(attn_bias_raw), (__fp16) mask_valuef, (__fp16) 0.0f);
     }
+}
+
+static void maybe_trace_attention_bias_compare(const ggml_tensor * mask,
+                                               qnn_aot_graph &      graph,
+                                               float                mask_value,
+                                               size_t               n_tokens,
+                                               size_t               kv_position) {
+    if (!aot_trace_attn_bias_compare_enabled() || mask == nullptr) {
+        return;
+    }
+
+    void * current_bias = graph.buffer_data("attn_bias");
+    if (current_bias == nullptr) {
+        return;
+    }
+
+    const auto dtype = graph.tensor_data_type("attn_bias");
+    std::vector<uint8_t> ref_bytes(graph.buffer_size("attn_bias"));
+    if (!fill_attention_bias_from_kq_mask(mask,
+                                          ref_bytes.data(),
+                                          graph.batch_size(),
+                                          graph.config().context_size,
+                                          mask_value,
+                                          dtype)) {
+        QNN_LOG_WARN("[aot] attn_bias compare could not build reference from kq_mask for graph=%s\n",
+                     graph.config().graph_name.c_str());
+        return;
+    }
+
+    double max_abs = 0.0;
+    double sum_abs = 0.0;
+    size_t count = 0;
+
+    if (dtype == QNN_DATATYPE_FLOAT_32) {
+        const auto * cur = static_cast<const float *>(current_bias);
+        const auto * ref = reinterpret_cast<const float *>(ref_bytes.data());
+        const size_t n = graph.buffer_size("attn_bias") / sizeof(float);
+        for (size_t i = 0; i < n; ++i) {
+            const double diff = std::abs(static_cast<double>(cur[i]) - static_cast<double>(ref[i]));
+            max_abs = std::max(max_abs, diff);
+            sum_abs += diff;
+        }
+        count = n;
+    } else if (dtype == QNN_DATATYPE_FLOAT_16 || dtype == QNN_DATATYPE_UNDEFINED) {
+        const auto * cur = static_cast<const ggml_fp16_t *>(current_bias);
+        const auto * ref = reinterpret_cast<const ggml_fp16_t *>(ref_bytes.data());
+        const size_t n = graph.buffer_size("attn_bias") / sizeof(ggml_fp16_t);
+        for (size_t i = 0; i < n; ++i) {
+            const double diff = std::abs(
+                    static_cast<double>(ggml_fp16_to_fp32(cur[i])) -
+                    static_cast<double>(ggml_fp16_to_fp32(ref[i])));
+            max_abs = std::max(max_abs, diff);
+            sum_abs += diff;
+        }
+        count = n;
+    } else {
+        QNN_LOG_WARN("[aot] attn_bias compare skips unsupported dtype %s for graph=%s\n",
+                     qnn::qnn_datatype_to_string(dtype),
+                     graph.config().graph_name.c_str());
+        return;
+    }
+
+    const double mean_abs = count > 0 ? sum_abs / static_cast<double>(count) : 0.0;
+    QNN_LOG_INFO("[aot] attn_bias compare graph=%s tokens=%zu kv_position=%zu mask_dims=[%lld,%lld,%lld,%lld] max_abs=%.6f mean_abs=%.6f\n",
+                 graph.config().graph_name.c_str(),
+                 n_tokens,
+                 kv_position,
+                 (long long) mask->ne[0],
+                 (long long) mask->ne[1],
+                 (long long) mask->ne[2],
+                 (long long) mask->ne[3],
+                 max_abs,
+                 mean_abs);
+}
+
+static bool materialize_attention_bias_for_graph(const ggml_tensor * mask,
+                                                 qnn_aot_graph &      graph,
+                                                 float                mask_value,
+                                                 size_t               n_tokens,
+                                                 size_t               kv_position) {
+    if (mask != nullptr) {
+        void * attn_bias_raw = graph.buffer_data("attn_bias");
+        if (attn_bias_raw != nullptr &&
+            fill_attention_bias_from_kq_mask(mask,
+                                             attn_bias_raw,
+                                             graph.batch_size(),
+                                             graph.config().context_size,
+                                             mask_value,
+                                             graph.tensor_data_type("attn_bias"))) {
+            maybe_trace_attention_bias_compare(mask, graph, mask_value, n_tokens, kv_position);
+            return true;
+        }
+    }
+
+    return false;
 }
 
 void qnn_aot_runtime::save_kv(qnn_aot_graph & graph, size_t n_tokens) {
@@ -4334,6 +4563,24 @@ bool qnn_aot_runtime::collect_generic_kv_from_graph(qnn_aot_graph & graph,
         v_idx_slice = k_idx_slice;
     }
 
+    if (!aot_seed_kv_enabled()) {
+        const bool normalized_k =
+            qnn_aot_try_remove_seed_kv_offset_from_indices(k_idx_slice, _kv_position, _seed_kv_size);
+        bool normalized_v = false;
+        if (v_indices_per_token == 1) {
+            normalized_v =
+                qnn_aot_try_remove_seed_kv_offset_from_indices(v_idx_slice, _kv_position, _seed_kv_size);
+        }
+
+        if (aot_trace_bind_enabled() && (normalized_k || normalized_v)) {
+            QNN_LOG_INFO("[aot] normalized generic KV indices after disabling seed KV: kv_position=%zu seed_kv_size=%zu k=%d v=%d\n",
+                         _kv_position,
+                         _seed_kv_size,
+                         normalized_k ? 1 : 0,
+                         normalized_v ? 1 : 0);
+        }
+    }
+
     const auto & graph_config = graph.config();
     for (size_t layer = graph_config.start_layer_id; layer < graph_config.end_layer_id; ++layer) {
         auto cache_k_it = match.cache_k_layers.find(layer);
@@ -4565,6 +4812,13 @@ std::string qnn_aot_runtime::format_kv_path(const qnn_aot_graph_config & config,
 bool qnn_aot_runtime::load_seed_kv() {
     _seed_kv_loaded = false;
 
+    if (!aot_seed_kv_enabled()) {
+        if (aot_trace_bind_enabled()) {
+            QNN_LOG_INFO("[aot] seed KV loading disabled by GGML_QNN_AOT_DISABLE_SEED_KV\n");
+        }
+        return false;
+    }
+
     if (_seed_kv_size == 0) {
         return true;
     }
@@ -4733,7 +4987,11 @@ void qnn_aot_runtime::zero_transformer_state() {
 }
 
 size_t qnn_aot_runtime::infer_start_pos(const std::vector<ggml_tensor *> & inputs, size_t n_tokens) const {
-    return qnn_aot_infer_start_pos_from_inputs(inputs, n_tokens, _kv_position);
+    const size_t inferred = qnn_aot_infer_start_pos_from_inputs(inputs, n_tokens, _kv_position);
+    if (!aot_seed_kv_enabled()) {
+        return qnn_aot_normalize_start_pos_without_seed_kv(inferred, _kv_position, _seed_kv_size);
+    }
+    return inferred;
 }
 
 bool qnn_aot_runtime::is_transformer_output_candidate(const ggml_tensor * tensor) const {
@@ -4919,7 +5177,18 @@ bool qnn_aot_runtime::execute_attention(ggml_cgraph * cgraph, const aot_match_re
         copy_ggml_rows_to_contiguous(match.embd, offset, step, embed_dim, x_buffer);
 
         fill_rope_embeds(*graph, _kv_position, step);
-        fill_attention_bias(*graph, step);
+        if (!materialize_attention_bias_for_graph(match.kq_mask,
+                                                  *graph,
+                                                  _config.model.attention_mask_value,
+                                                  step,
+                                                  _kv_position)) {
+            fill_attention_bias(*graph, step);
+            maybe_trace_attention_bias_compare(match.kq_mask,
+                                               *graph,
+                                               _config.model.attention_mask_value,
+                                               step,
+                                               _kv_position);
+        }
 
         if (!graph->execute()) {
             return false;
@@ -4938,10 +5207,10 @@ bool qnn_aot_runtime::execute_attention(ggml_cgraph * cgraph, const aot_match_re
     return true;
 }
 
-bool qnn_aot_runtime::execute_transformer(ggml_cgraph * cgraph, const aot_match_result & match) {
+bool qnn_aot_runtime::execute_transformer(ggml_cgraph * cgraph, const aot_match_result & match, ggml_tensor * last_row_out) {
     GGML_UNUSED(cgraph);
     const auto * graph_bucket = select_transformer_graphs(match.n_tokens);
-    if (graph_bucket == nullptr || !match.embd || !match.out) {
+    if (graph_bucket == nullptr || !match.embd || (match.out == nullptr && last_row_out == nullptr)) {
         return false;
     }
 
@@ -5101,16 +5370,22 @@ bool qnn_aot_runtime::execute_transformer(ggml_cgraph * cgraph, const aot_match_
     }
     _kv_position = std::max(_kv_position, generic_prefix_tokens);
 
-    if (match.embd->type != GGML_TYPE_F32 || match.out->type != GGML_TYPE_F32) {
+    if (match.embd->type != GGML_TYPE_F32 ||
+        (match.out != nullptr && match.out->type != GGML_TYPE_F32) ||
+        (last_row_out != nullptr && last_row_out->type != GGML_TYPE_F32)) {
         QNN_LOG_WARN("[aot] transformer IO expects F32 tensors, got %s -> %s\n", ggml_type_name(match.embd->type),
-                     ggml_type_name(match.out->type));
+                     match.out != nullptr ? ggml_type_name(match.out->type) : (last_row_out != nullptr ? ggml_type_name(last_row_out->type) : "<null>"));
         return false;
     }
 
     const size_t embed_dim = _config.model.embed_dim;
-    if (static_cast<size_t>(match.embd->ne[0]) != embed_dim || static_cast<size_t>(match.out->ne[0]) != embed_dim) {
+    const ggml_tensor * output_tensor = last_row_out != nullptr ? last_row_out : match.out;
+    if (static_cast<size_t>(match.embd->ne[0]) != embed_dim ||
+        output_tensor == nullptr ||
+        static_cast<size_t>(output_tensor->ne[0]) != embed_dim) {
         QNN_LOG_WARN("[aot] transformer IO dim mismatch, expected %zu, got %lld -> %lld\n", embed_dim,
-                     (long long) match.embd->ne[0], (long long) match.out->ne[0]);
+                     (long long) match.embd->ne[0],
+                     output_tensor != nullptr ? (long long) output_tensor->ne[0] : -1LL);
         return false;
     }
 
@@ -5136,7 +5411,7 @@ bool qnn_aot_runtime::execute_transformer(ggml_cgraph * cgraph, const aot_match_
 
         if (aot_trace_match_enabled()) {
             const char * embd_name = ggml_get_name(match.embd);
-            const char * out_name = ggml_get_name(match.out);
+            const char * out_name = ggml_get_name(output_tensor);
             QNN_LOG_INFO("[aot] transformer io graph=%s layers=[%zu,%zu) tokens=%zu batch=%zu x={dtype=%s bytes=%zu} out={dtype=%s bytes=%zu} ggml_x={name=%s type=%s bytes=%zu nb1=%zu contig=%d} ggml_out={name=%s type=%s bytes=%zu nb1=%zu contig=%d}\n",
                          graph->config().graph_name.c_str(),
                          graph->config().start_layer_id,
@@ -5153,10 +5428,10 @@ bool qnn_aot_runtime::execute_transformer(ggml_cgraph * cgraph, const aot_match_
                          match.embd->nb[1],
                          ggml_is_contiguous(match.embd) ? 1 : 0,
                          out_name != nullptr ? out_name : "<unnamed>",
-                         ggml_type_name(match.out->type),
-                         ggml_nbytes(match.out),
-                         match.out->nb[1],
-                         ggml_is_contiguous(match.out) ? 1 : 0);
+                         ggml_type_name(output_tensor->type),
+                         ggml_nbytes(output_tensor),
+                         output_tensor->nb[1],
+                         ggml_is_contiguous(output_tensor) ? 1 : 0);
         }
     }
 
@@ -5193,7 +5468,22 @@ bool qnn_aot_runtime::execute_transformer(ggml_cgraph * cgraph, const aot_match_
             }
 
             fill_rope_embeds(*graph, _kv_position, step);
-            fill_attention_bias(*graph, step);
+            const bool can_materialize_direct_bias =
+                qnn::qnn_aot_mask_has_full_context_width(match.kq_mask, graph->config().context_size);
+            if (can_materialize_direct_bias &&
+                materialize_attention_bias_for_graph(match.kq_mask,
+                                                    *graph,
+                                                    _config.model.attention_mask_value,
+                                                    step,
+                                                    _kv_position)) {
+                maybe_trace_attention_bias_compare(match.kq_mask,
+                                                   *graph,
+                                                   _config.model.attention_mask_value,
+                                                   step,
+                                                   _kv_position);
+            } else {
+                fill_attention_bias(*graph, step);
+            }
 
             if (!graph->execute()) {
                 return false;
@@ -5208,7 +5498,16 @@ bool qnn_aot_runtime::execute_transformer(ggml_cgraph * cgraph, const aot_match_
         }
 
         GGML_ASSERT(stage_input != nullptr);
-        copy_contiguous_rows_to_ggml(match.out, offset, step, embed_dim, stage_input);
+        if (last_row_out != nullptr) {
+            if (offset + step == match.n_tokens) {
+                aot_debug_dump_f32_blob("transformer_last_row.f32",
+                                        stage_input + (step - 1) * embed_dim,
+                                        embed_dim);
+                copy_contiguous_rows_to_ggml(last_row_out, 0, 1, embed_dim, stage_input + (step - 1) * embed_dim);
+            }
+        } else {
+            copy_contiguous_rows_to_ggml(match.out, offset, step, embed_dim, stage_input);
+        }
 
         _kv_position += step;
         offset += step;
@@ -6070,13 +6369,51 @@ bool qnn_aot_runtime::execute_lm_head(ggml_cgraph * cgraph, const aot_match_resu
         }
 
         copy_ggml_rows_to_contiguous(match.embd, offset, step, embed_dim, x_buffer);
+        if (offset + step == match.n_tokens) {
+            aot_debug_dump_f32_blob("lm_head_input.f32", x_buffer + (step - 1) * embed_dim, embed_dim);
+        }
 
         if (!graph->execute()) {
             return false;
         }
+        if (offset + step == match.n_tokens) {
+            aot_debug_dump_f32_blob("lm_head_logits.f32", out_buffer + (step - 1) * vocab_size, vocab_size);
+        }
 
         copy_contiguous_rows_to_ggml(match.out, offset, step, vocab_size, out_buffer);
         offset += step;
+    }
+
+    return true;
+}
+
+ggml_backend_t qnn_aot_runtime::ensure_cpu_backend() {
+    if (_cpu_backend == nullptr) {
+        _cpu_backend = ggml_backend_cpu_init();
+    }
+
+    return _cpu_backend;
+}
+
+bool qnn_aot_runtime::execute_tail_replay_fragment(ggml_cgraph * cgraph, size_t begin, size_t end) {
+    if (cgraph == nullptr || begin >= end || end > static_cast<size_t>(cgraph->n_nodes)) {
+        return false;
+    }
+
+    ggml_backend_t cpu_backend = ensure_cpu_backend();
+    if (cpu_backend == nullptr) {
+        QNN_LOG_WARN("[aot] failed to initialize CPU backend for output-tail replay\n");
+        return false;
+    }
+
+    ggml_cgraph view = ggml_graph_view(cgraph, static_cast<int>(begin), static_cast<int>(end));
+    const ggml_status status = ggml_backend_graph_compute(cpu_backend, &view);
+    if (status != GGML_STATUS_SUCCESS) {
+        QNN_LOG_WARN("[aot] output-tail replay failed: nodes=[%zu,%zu) status=%d\n",
+                     begin,
+                     end,
+                     static_cast<int>(status));
+        return false;
     }
 
     return true;
@@ -6323,6 +6660,10 @@ bool qnn_aot_runtime::maybe_execute(ggml_cgraph * cgraph) {
     struct combined_match_result {
         aot_match_result transformer;
         aot_match_result lm_head;
+        size_t           tail_replay_begin = 0;
+        size_t           tail_replay_end = 0;
+        bool             materialize_last_row = false;
+        bool             saw_combined_graph = false;
         bool is_combined = false;
     };
 
@@ -6360,6 +6701,7 @@ bool qnn_aot_runtime::maybe_execute(ggml_cgraph * cgraph) {
         if (!seen_transformer || !seen_result_output) {
             return combined;
         }
+        combined.saw_combined_graph = true;
 
         const auto io = get_io_tensors_from_graph(graph);
         std::vector<ggml_tensor *> idx_inputs;
@@ -6453,10 +6795,41 @@ bool qnn_aot_runtime::maybe_execute(ggml_cgraph * cgraph) {
                          leaf_names.c_str());
         }
 
+        const size_t expected_transformer_tokens =
+            combined.transformer.embd != nullptr ? static_cast<size_t>(combined.transformer.embd->ne[1]) : 0;
+        const auto transformer_output_matches_tokens = [&](const ggml_tensor * tensor) {
+            if (expected_transformer_tokens == 0) {
+                return is_transformer_output_candidate(tensor);
+            }
+
+            return qnn::qnn_aot_is_f32_token_matrix(tensor, _config.model.embed_dim, expected_transformer_tokens);
+        };
+        const bool trace_match = aot_trace_match_enabled();
+        auto log_transformer_candidate = [&](const char * source, const ggml_tensor * tensor, int node_index) {
+            if (!trace_match || tensor == nullptr) {
+                return;
+            }
+            const char * tensor_name = ggml_get_name(tensor);
+            std::fprintf(stderr,
+                         "[aot-match] combined transformer candidate source=%s node=%d name=%s type=%s bytes=%zu ne=[%lld,%lld,%lld,%lld] nb1=%zu matches=%d\n",
+                         source,
+                         node_index,
+                         tensor_name != nullptr ? tensor_name : "<unnamed>",
+                         ggml_type_name(tensor->type),
+                         ggml_nbytes(tensor),
+                         (long long) tensor->ne[0],
+                         (long long) tensor->ne[1],
+                         (long long) tensor->ne[2],
+                         (long long) tensor->ne[3],
+                         tensor->nb[1],
+                         transformer_output_matches_tokens(tensor) ? 1 : 0);
+        };
+
         if (seen_result_norm && norm_node != nullptr) {
             for (size_t i = 0; i < GGML_MAX_SRC && norm_node->src[i]; ++i) {
                 auto * src = norm_node->src[i];
-                if (src != nullptr && (src->flags & GGML_TENSOR_FLAG_PARAM) == 0) {
+                log_transformer_candidate("result_norm.src", src, -1);
+                if (transformer_output_matches_tokens(src)) {
                     combined.transformer.out = src;
                     break;
                 }
@@ -6466,10 +6839,36 @@ bool qnn_aot_runtime::maybe_execute(ggml_cgraph * cgraph) {
         if (combined.transformer.out == nullptr && !io.outputs.empty()) {
             for (auto * output : io.outputs) {
                 const char * name = ggml_get_name(output);
-                if (is_transformer_stage_name(name) && has_prefix(name, "l_out-")) {
+                log_transformer_candidate("graph.output", output, -1);
+                if (is_transformer_stage_name(name) &&
+                    has_prefix(name, "l_out-") &&
+                    transformer_output_matches_tokens(output)) {
                     combined.transformer.out = output;
                 }
             }
+        }
+
+        if (combined.transformer.out == nullptr) {
+            for (int i = graph->n_nodes - 1; i >= 0; --i) {
+                auto * node = graph->nodes[i];
+                if (trace_match && is_transformer_output_candidate(node)) {
+                    log_transformer_candidate("graph.node", node, i);
+                }
+                if (is_transformer_output_candidate(node) && transformer_output_matches_tokens(node)) {
+                    combined.transformer.out = node;
+                    break;
+                }
+            }
+        }
+
+        if (trace_match && combined.transformer.embd != nullptr && combined.transformer.out != nullptr) {
+            const char * embd_name = ggml_get_name(combined.transformer.embd);
+            const char * out_name = ggml_get_name(combined.transformer.out);
+            std::fprintf(stderr,
+                         "[aot-match] combined transformer selected embd=%s out=%s tokens=%zu\n",
+                         embd_name != nullptr ? embd_name : "<unnamed>",
+                         out_name != nullptr ? out_name : "<unnamed>",
+                         expected_transformer_tokens);
         }
 
         auto is_activation_input = [this](const ggml_tensor * tensor) {
@@ -6532,6 +6931,13 @@ bool qnn_aot_runtime::maybe_execute(ggml_cgraph * cgraph) {
             return combined;
         }
 
+        const size_t transformer_rows = ggml_n_dims(combined.transformer.out) >= 2
+            ? static_cast<size_t>(combined.transformer.out->ne[1]) : 1;
+        const size_t lm_head_rows = ggml_n_dims(combined.lm_head.embd) >= 2
+            ? static_cast<size_t>(combined.lm_head.embd->ne[1]) : 1;
+
+        combined.materialize_last_row = transformer_rows > 1 && lm_head_rows == 1;
+
         combined.transformer.n_tokens       = static_cast<size_t>(combined.transformer.embd->ne[1]);
         combined.transformer.inferred_pos   = infer_start_pos(io.inputs, combined.transformer.n_tokens);
         combined.transformer.is_transformer = combined.transformer.n_tokens > 0;
@@ -6543,15 +6949,27 @@ bool qnn_aot_runtime::maybe_execute(ggml_cgraph * cgraph) {
         return combined;
     };
 
-    const auto combined_match = match_combined_graph(cgraph);
+    auto combined_match = match_combined_graph(cgraph);
 
     if (combined_match.is_combined) {
         const auto & transformer_match = combined_match.transformer;
         const auto & lm_head_match     = combined_match.lm_head;
-        if (!execute_transformer(cgraph, transformer_match)) {
+        ggml_tensor * transformer_last_row_out =
+            combined_match.materialize_last_row ? lm_head_match.embd : nullptr;
+        if (combined_match.materialize_last_row && aot_trace_match_enabled()) {
+            std::fprintf(stderr,
+                         "[aot-match] combined materialize last row into %s\n",
+                         ggml_get_name(lm_head_match.embd) != nullptr ? ggml_get_name(lm_head_match.embd) : "<unnamed>");
+        }
+        if (!execute_transformer(cgraph, transformer_match, transformer_last_row_out)) {
             return false;
         }
+
         return execute_lm_head(cgraph, lm_head_match);
+    }
+
+    if (combined_match.saw_combined_graph) {
+        return false;
     }
 
     const auto attn_proj_match   = match_attn_proj_graph(cgraph);
@@ -6667,6 +7085,9 @@ void qnn_aot_runtime::reset_state() {
     _pending_generic_kv_writeback.clear();
     if (_seed_kv_size > 0 && load_seed_kv()) {
         _kv_position = _seed_kv_size;
+    } else if (_seed_kv_size > 0 && !aot_seed_kv_enabled() && aot_trace_bind_enabled()) {
+        QNN_LOG_INFO("[aot] reset_state starting from empty KV because seed KV is disabled (artifact seed_kv_size=%zu)\n",
+                     _seed_kv_size);
     }
 }
 
