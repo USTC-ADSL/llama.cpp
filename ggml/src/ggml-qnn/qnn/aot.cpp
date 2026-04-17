@@ -6968,6 +6968,22 @@ bool qnn_aot_runtime::maybe_execute(ggml_cgraph * cgraph) {
         return execute_lm_head(cgraph, lm_head_match);
     }
 
+    if (combined_match.saw_combined_graph &&
+        combined_match.transformer.is_transformer &&
+        !combined_match.lm_head.is_lm_head &&
+        combined_match.lm_head.out != nullptr &&
+        ggml_nbytes(combined_match.lm_head.out) == 0) {
+        if (aot_trace_match_enabled()) {
+            const char * out_name = ggml_get_name(combined_match.lm_head.out);
+            std::fprintf(stderr,
+                         "[aot-match] combined transformer-only fallback out=%s bytes=%zu tokens=%zu\n",
+                         out_name != nullptr ? out_name : "<unnamed>",
+                         ggml_nbytes(combined_match.lm_head.out),
+                         combined_match.transformer.n_tokens);
+        }
+        return execute_transformer(cgraph, combined_match.transformer);
+    }
+
     if (combined_match.saw_combined_graph) {
         return false;
     }
