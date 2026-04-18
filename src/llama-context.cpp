@@ -38,6 +38,67 @@ bool llama_context_should_disable_cpu_qnn_host_fallback(
         bool routes_use_opencl,
         bool routes_use_cpu);
 
+llama_hetero_kv_contract llama_dynamic_phase_migration_kv_contract(
+        const std::string & producer_backend,
+        const std::string & consumer_backend,
+        const char * reason);
+
+bool llama_context_should_attempt_qnn_phase_kv_migration(
+        const std::string & current_attn_backend,
+        const std::string & target_attn_backend,
+        uint32_t            n_tokens,
+        bool                generic_kv_enabled);
+
+llama_hetero_kv_contract llama_dynamic_phase_migration_kv_contract(
+        const std::string & producer_backend,
+        const std::string & consumer_backend,
+        const char * reason) {
+    const std::string producer = llama_hetero_canonical_backend(producer_backend);
+    const std::string consumer = llama_hetero_canonical_backend(consumer_backend);
+
+    llama_hetero_kv_contract contract;
+    contract.producer_backend = producer;
+    contract.consumer_backend = consumer;
+    contract.implemented = true;
+    contract.reason = reason != nullptr ? reason : "dynamic-phase-migration";
+
+    if (llama_hetero_is_qnn_backend(producer) &&
+        (consumer == "cpu" || consumer == "opencl")) {
+        contract.layout = llama_hetero_kv_layout_kind::STAGE_SHARED;
+        contract.transfer = llama_hetero_kv_transfer_mode::QNN_RPCMEM;
+        contract.storage_backend = "qnn-npu-host";
+        contract.shared_buffer_required = true;
+        contract.buffer_available = false;
+        contract.zero_copy = false;
+        return contract;
+    }
+
+    contract.storage_backend = consumer;
+    contract.transfer = llama_hetero_kv_transfer_mode::NONE;
+    contract.shared_buffer_required = false;
+    contract.buffer_available = true;
+    contract.zero_copy = false;
+    return contract;
+}
+
+bool llama_context_should_attempt_qnn_phase_kv_migration(
+        const std::string & current_attn_backend,
+        const std::string & target_attn_backend,
+        uint32_t            n_tokens,
+        bool                generic_kv_enabled) {
+    if (!generic_kv_enabled || n_tokens != 1) {
+        return false;
+    }
+
+    const std::string current = llama_hetero_canonical_backend(current_attn_backend);
+    const std::string target  = llama_hetero_canonical_backend(target_attn_backend);
+    if (!llama_hetero_is_qnn_backend(current)) {
+        return false;
+    }
+
+    return target == "cpu" || target == "opencl";
+}
+
 namespace {
 
 using ggml_backend_qnn_aot_has_pending_generic_kv_writeback_t = bool (*)(ggml_backend_t backend);
@@ -95,23 +156,6 @@ bool hetero_route_requests_qnn(const llama_hetero_route_spec & route) {
     }
 
     return false;
-}
-
-llama_hetero_kv_contract llama_dynamic_phase_migration_kv_contract(
-        const std::string & producer_backend,
-        const std::string & consumer_backend,
-        const char * reason) {
-    llama_hetero_kv_contract contract;
-    contract.producer_backend = producer_backend;
-    contract.consumer_backend = consumer_backend;
-    contract.storage_backend = consumer_backend;
-    contract.transfer = llama_hetero_kv_transfer_mode::NONE;
-    contract.shared_buffer_required = false;
-    contract.implemented = true;
-    contract.buffer_available = true;
-    contract.zero_copy = false;
-    contract.reason = reason != nullptr ? reason : "dynamic-phase-migration";
-    return contract;
 }
 
 size_t seq0_prefix_tokens_from_memory(const llama_memory_i * memory) {
@@ -1377,16 +1421,24 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         n_tokens == 1 &&
         hetero_route_requests_qnn(hetero_plan.route) &&
         !hetero_route_requests_qnn(decision.plan.route);
+    const char * generic_qnn_kv_env = std::getenv("GGML_QNN_AOT_WRITE_GENERIC_KV");
+    const bool generic_qnn_kv_enabled =
+        generic_qnn_kv_env != nullptr &&
+        generic_qnn_kv_env[0] != '\0' &&
+        std::strcmp(generic_qnn_kv_env, "0") != 0;
+    const bool should_attempt_qnn_kv_migration =
+        llama_context_should_attempt_qnn_phase_kv_migration(
+                current_attn_backend,
+                target_attn_backend,
+                n_tokens,
+                generic_qnn_kv_enabled);
     const bool should_flush_pending_qnn_kv = switching_out_of_qnn_decode;
-    const bool should_rebuild_target_prefix_after_qnn_decode =
-        switching_out_of_qnn_decode &&
-        qnn_aot_enabled &&
-        !target_attn_backend.empty();
     const bool should_migrate_cpu_opencl_kv =
         n_tokens == 1 &&
         ((current_attn_backend == "cpu" && target_attn_backend == "opencl") ||
          (current_attn_backend == "opencl" && target_attn_backend == "cpu"));
     const llama_hetero_execution_plan previous_plan = hetero_plan;
+    bool migrated_qnn_kv = false;
 
     if (switching_into_qnn_decode) {
         const size_t prefix_tokens = seq0_prefix_tokens_from_memory(memory.get());
@@ -1457,6 +1509,28 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         }
     }
 
+    if (should_attempt_qnn_kv_migration) {
+        LLAMA_LOG_INFO("%s: starting QNN KV migration before decode route switch (%s -> %s)\n",
+                __func__,
+                current_attn_backend.c_str(),
+                target_attn_backend.c_str());
+        const int64_t t_kv_sync_start_us = trace_timing ? ggml_time_us() : 0;
+        migrated_qnn_kv = rebuild_dynamic_consumer_kv_from_state(
+                current_attn_backend,
+                target_attn_backend,
+                "qnn-phase-state-migration");
+        const int64_t t_kv_sync_end_us = trace_timing ? ggml_time_us() : 0;
+        if (trace_timing && hetero_phase_trace.active) {
+            hetero_phase_trace.kv_migration_us += t_kv_sync_end_us - t_kv_sync_start_us;
+        }
+        if (!migrated_qnn_kv) {
+            LLAMA_LOG_WARN("%s: direct QNN KV migration failed; falling back to prefix replay for %s -> %s\n",
+                    __func__,
+                    current_attn_backend.c_str(),
+                    target_attn_backend.c_str());
+        }
+    }
+
     const int64_t t_apply_start_us = trace_timing ? ggml_time_us() : 0;
     const bool applied = apply_hetero_plan(std::move(decision.plan), /* update_base_plan = */ false, decision.plan_label.c_str());
     const int64_t t_apply_end_us = trace_timing ? ggml_time_us() : 0;
@@ -1474,7 +1548,11 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                     __func__,
                     dynamic_seq0_token_history.size());
         }
-    } else if (applied && should_rebuild_target_prefix_after_qnn_decode) {
+    } else if (applied &&
+               switching_out_of_qnn_decode &&
+               qnn_aot_enabled &&
+               !target_attn_backend.empty() &&
+               !migrated_qnn_kv) {
         qnn_prefix_replay_pending = false;
         qnn_prefix_replay_restore_plan_valid = false;
         qnn_prefix_replay_rebuild_live_memory = false;

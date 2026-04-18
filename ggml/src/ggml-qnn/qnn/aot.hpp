@@ -13,6 +13,7 @@
 
 #include "buffer.hpp"
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "qnn-lib.hpp"
 #include "utils.hpp"
 
@@ -220,9 +221,11 @@ class qnn_aot_runtime {
     bool execute_attention(ggml_cgraph * cgraph, const aot_match_result & match);
     bool execute_attn_proj(ggml_cgraph * cgraph, const aot_match_result & match);
     bool execute_attn_core(ggml_cgraph * cgraph, const aot_match_result & match);
-    bool execute_transformer(ggml_cgraph * cgraph, const aot_match_result & match);
+    bool execute_transformer(ggml_cgraph * cgraph, const aot_match_result & match, ggml_tensor * last_row_out = nullptr);
     bool execute_ffn(ggml_cgraph * cgraph, const aot_match_result & match);
     bool execute_lm_head(ggml_cgraph * cgraph, const aot_match_result & match);
+    bool execute_tail_replay_fragment(ggml_cgraph * cgraph, size_t begin, size_t end);
+    ggml_backend_t ensure_cpu_backend();
     qnn_aot_graph * select_attention_graph(size_t start_layer_id, size_t end_layer_id, size_t n_tokens) const;
     qnn_aot_graph * select_attn_proj_graph(size_t n_tokens, size_t layer_id);
     qnn_aot_graph * select_attn_core_graph(size_t n_tokens, size_t layer_id);
@@ -263,6 +266,7 @@ class qnn_aot_runtime {
 
     qnn_instance_ptr   _instance;
     backend_index_type _device;
+    ggml_backend_t     _cpu_backend = nullptr;
 
     bool        _enabled        = false;
     bool        _seed_kv_loaded = false;

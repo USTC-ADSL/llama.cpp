@@ -1,4 +1,5 @@
 #include "aot.hpp"
+#include "aot-kv-utils.hpp"
 #include "aot-pos-utils.hpp"
 
 #include "ggml-backend.h"
@@ -1157,21 +1158,17 @@ bool aot_generic_kv_writeback_needed_for_phase_switch() {
         return false;
     }
 
-    // Phase-only QNN -> CPU/OpenCL routes can keep legacy KV on the future
-    // decode consumer placement, so generic KV writeback is unnecessary there.
-    // Keep an opt-in override for OpenCL in case a driver stack still needs the
-    // older generic-KV phase-switch path.
+    // Phase-only QNN -> CPU/OpenCL routes need generic KV materialization when
+    // the runtime wants to migrate the prefill KV state into a non-QNN decode
+    // consumer without replaying the whole prefix. Keep static homogeneous QNN
+    // runs on the old fast path; only explicit mixed phase routes reach here.
     if (prefill_route.has_any_route() &&
         route_is_phase_homogeneous(prefill_route) &&
         route_is_phase_homogeneous(decode_route)) {
         const std::string prefill_backend = route_phase_backend(prefill_route);
         const std::string decode_backend = route_phase_backend(decode_route);
-        const bool decode_uses_non_qnn_consumer_owned_legacy =
-            decode_backend == "cpu" ||
-            (decode_backend == "opencl" &&
-             !env_flag_enabled("GGML_QNN_AOT_FORCE_QNN_OPENCL_GENERIC_KV"));
         if (is_qnn_route_backend(prefill_backend) &&
-            decode_uses_non_qnn_consumer_owned_legacy) {
+            is_qnn_route_backend(decode_backend)) {
             return false;
         }
     }
@@ -4680,6 +4677,21 @@ bool qnn_aot_runtime::collect_generic_kv_from_graph(qnn_aot_graph & graph,
             return false;
         }
 
+        if (!qnn_aot_restore_unscaled_key_rows_for_generic_kv(payload.key_rows,
+                                                              payload.n_tokens,
+                                                              payload.key_token_values,
+                                                              _config.model.n_kv_heads,
+                                                              _config.model.head_dim)) {
+            QNN_LOG_WARN("[aot] failed to restore unscaled generic K rows for layer=%zu: tokens=%zu token_values=%zu n_kv_heads=%zu head_dim=%zu total_values=%zu\n",
+                         layer,
+                         payload.n_tokens,
+                         payload.key_token_values,
+                         _config.model.n_kv_heads,
+                         _config.model.head_dim,
+                         payload.key_rows.size());
+            return false;
+        }
+
         payloads.emplace_back(std::move(payload));
     }
 
@@ -4690,7 +4702,12 @@ bool qnn_aot_runtime::stage_generic_kv_from_graph(qnn_aot_graph & graph,
                                                   const aot_match_result & match,
                                                   size_t token_offset,
                                                   size_t n_tokens) {
-    if (token_offset == 0 && !_pending_generic_kv_writeback.empty()) {
+    const auto & graph_config = graph.config();
+    if (qnn::qnn_aot_should_reset_staged_generic_kv_writeback(
+            token_offset,
+            graph_config.start_layer_id,
+            _pending_generic_kv_writeback.size()) &&
+        !_pending_generic_kv_writeback.empty()) {
         _pending_generic_kv_writeback.clear();
     }
 
@@ -4699,7 +4716,6 @@ bool qnn_aot_runtime::stage_generic_kv_from_graph(qnn_aot_graph & graph,
     }
 
     if (aot_trace_bind_enabled()) {
-        const auto & graph_config = graph.config();
         QNN_LOG_INFO("[aot] staged full-graph generic KV for deferred migration: layers=[%zu,%zu) offset=%zu tokens=%zu pending_layers=%zu\n",
                      graph_config.start_layer_id,
                      graph_config.end_layer_id,

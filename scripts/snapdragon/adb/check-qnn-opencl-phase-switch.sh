@@ -47,6 +47,7 @@ export GGML_HEXAGON_EXPERIMENTAL=1 &&
 export GGML_QNN_AOT_CONFIG=${remote_qnn_dir}/config.json &&
 export GGML_QNN_AOT_MODEL_DIR=${remote_qnn_dir} &&
 export GGML_QNN_AOT_WRITE_GENERIC_KV=1 &&
+export GGML_QNN_AOT_DISABLE_SEED_KV=1 &&
 export GGML_HETERO_DYNAMIC_MODE=phase &&
 export GGML_HETERO_DYNAMIC_PREFILL_ROUTE=${prefill_route} &&
 export GGML_HETERO_DYNAMIC_DECODE_ROUTE=${decode_route} &&
