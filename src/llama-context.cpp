@@ -49,6 +49,19 @@ bool llama_context_should_attempt_qnn_phase_kv_migration(
         uint32_t            n_tokens,
         bool                generic_kv_enabled);
 
+llama_hetero_kv_contract llama_dynamic_phase_shared_qnn_kv_contract(
+        const std::string & prefill_attn_backend,
+        const std::string & decode_attn_backend,
+        bool                qnn_host_buffer_available,
+        bool                opencl_can_alias_qnn_host);
+
+bool llama_context_should_use_qnn_shared_phase_kv(
+        const std::string & current_attn_backend,
+        const std::string & target_attn_backend,
+        uint32_t            n_tokens,
+        bool                generic_kv_enabled,
+        const llama_hetero_kv_contract & allocated_kv_contract);
+
 llama_hetero_kv_contract llama_dynamic_phase_migration_kv_contract(
         const std::string & producer_backend,
         const std::string & consumer_backend,
@@ -97,6 +110,71 @@ bool llama_context_should_attempt_qnn_phase_kv_migration(
     }
 
     return target == "cpu" || target == "opencl";
+}
+
+llama_hetero_kv_contract llama_dynamic_phase_shared_qnn_kv_contract(
+        const std::string & prefill_attn_backend,
+        const std::string & decode_attn_backend,
+        bool                qnn_host_buffer_available,
+        bool                opencl_can_alias_qnn_host) {
+    const std::string prefill = llama_hetero_canonical_backend(prefill_attn_backend);
+    const std::string decode  = llama_hetero_canonical_backend(decode_attn_backend);
+
+    llama_hetero_kv_contract contract;
+
+    if (!llama_hetero_is_qnn_backend(prefill) || decode != "opencl") {
+        contract.reason = "dynamic-phase-shared-qnn-kv-not-applicable";
+        return contract;
+    }
+
+    if (!qnn_host_buffer_available || !opencl_can_alias_qnn_host) {
+        contract.reason = !qnn_host_buffer_available
+            ? "qnn-host-buffer-unavailable"
+            : "opencl-cannot-alias-qnn-host";
+        return contract;
+    }
+
+    contract.producer_backend = prefill;
+    contract.consumer_backend = decode;
+    contract.storage_backend = "qnn-npu-host";
+    contract.layout = llama_hetero_kv_layout_kind::STAGE_SHARED;
+    contract.transfer = llama_hetero_kv_transfer_mode::QNN_RPCMEM;
+    contract.shared_buffer_required = true;
+    contract.implemented = true;
+    contract.buffer_available = true;
+    contract.zero_copy = true;
+    contract.reason = "dynamic-qnn-prefill-opencl-decode-shared-kv";
+    return contract;
+}
+
+bool llama_context_should_use_qnn_shared_phase_kv(
+        const std::string & current_attn_backend,
+        const std::string & target_attn_backend,
+        uint32_t            n_tokens,
+        bool                generic_kv_enabled,
+        const llama_hetero_kv_contract & allocated_kv_contract) {
+    if (!llama_context_should_attempt_qnn_phase_kv_migration(
+                current_attn_backend,
+                target_attn_backend,
+                n_tokens,
+                generic_kv_enabled)) {
+        return false;
+    }
+
+    if (llama_hetero_canonical_backend(target_attn_backend) != "opencl") {
+        return false;
+    }
+
+    return allocated_kv_contract.stage_boundary_active() &&
+           llama_hetero_is_qnn_backend(allocated_kv_contract.producer_backend) &&
+           llama_hetero_canonical_backend(allocated_kv_contract.consumer_backend) == "opencl" &&
+           allocated_kv_contract.storage_backend == "qnn-npu-host" &&
+           allocated_kv_contract.layout == llama_hetero_kv_layout_kind::STAGE_SHARED &&
+           allocated_kv_contract.transfer == llama_hetero_kv_transfer_mode::QNN_RPCMEM &&
+           allocated_kv_contract.shared_buffer_required &&
+           allocated_kv_contract.implemented &&
+           allocated_kv_contract.buffer_available &&
+           allocated_kv_contract.zero_copy;
 }
 
 namespace {
@@ -577,9 +655,10 @@ llama_context::llama_context(
             return opencl_dev != nullptr && ggml_backend_dev_supports_buft(opencl_dev, buft);
         };
 
+        const bool opencl_can_alias_qnn_host = opencl_supports_buft(qnn_shared_host_buft);
+
         if (hetero_qnn_shared_host_requested) {
             if (enable_cpu_opencl_shared_host) {
-                const bool opencl_can_alias_qnn_host = opencl_supports_buft(qnn_shared_host_buft);
                 if (qnn_host_buffer_available && opencl_can_alias_qnn_host) {
                     shared_host_buft = qnn_shared_host_buft;
                     hetero_qnn_shared_host_compute = true;
@@ -653,6 +732,45 @@ llama_context::llama_context(
         maybe_promote_allocated_kv(dynamic_route_config.prefill);
         maybe_promote_allocated_kv(dynamic_route_config.decode);
         maybe_promote_allocated_kv(dynamic_route_config.fallback);
+
+        const auto maybe_promote_dynamic_phase_shared_qnn_kv = [&]() {
+            if (!dynamic_route_config.prefill.configured || !dynamic_route_config.decode.configured) {
+                return;
+            }
+
+            if (!llama_hetero_route_is_phase_homogeneous(dynamic_route_config.prefill.plan.route) ||
+                !llama_hetero_route_is_phase_homogeneous(dynamic_route_config.decode.plan.route)) {
+                return;
+            }
+
+            llama_hetero_kv_contract upgraded = llama_dynamic_phase_shared_qnn_kv_contract(
+                    llama_hetero_phase_backend_for_route(dynamic_route_config.prefill.plan.route),
+                    llama_hetero_phase_backend_for_route(dynamic_route_config.decode.plan.route),
+                    qnn_host_buffer_available,
+                    opencl_can_alias_qnn_host);
+            if (!upgraded.stage_boundary_active() ||
+                llama_hetero_kv_contract_can_satisfy(hetero_kv_contract_allocated, upgraded)) {
+                return;
+            }
+
+            if (llama_hetero_kv_contract_can_satisfy(upgraded, hetero_kv_contract_allocated)) {
+                LLAMA_LOG_INFO("%s: promoting allocated attn KV contract for dynamic qnn-prefill/opencl-decode to layout=%s transfer=%s\n",
+                        __func__,
+                        llama_hetero_kv_layout_name(upgraded.layout),
+                        llama_hetero_kv_transfer_mode_name(upgraded.transfer));
+                hetero_kv_contract_allocated = std::move(upgraded);
+                return;
+            }
+
+            LLAMA_LOG_WARN("%s: dynamic qnn-prefill/opencl-decode shared KV requires layout=%s transfer=%s, which is incompatible with the current allocated contract layout=%s transfer=%s. The direct shared-KV fast path will stay disabled until the context is rebuilt with a compatible contract.\n",
+                    __func__,
+                    llama_hetero_kv_layout_name(upgraded.layout),
+                    llama_hetero_kv_transfer_mode_name(upgraded.transfer),
+                    llama_hetero_kv_layout_name(hetero_kv_contract_allocated.layout),
+                    llama_hetero_kv_transfer_mode_name(hetero_kv_contract_allocated.transfer));
+        };
+
+        maybe_promote_dynamic_phase_shared_qnn_kv();
 
         const bool first_device_is_opencl =
             !model.devices.empty() &&
@@ -1432,6 +1550,13 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                 target_attn_backend,
                 n_tokens,
                 generic_qnn_kv_enabled);
+    const bool should_use_qnn_shared_phase_kv =
+        llama_context_should_use_qnn_shared_phase_kv(
+                current_attn_backend,
+                target_attn_backend,
+                n_tokens,
+                generic_qnn_kv_enabled,
+                hetero_kv_contract_allocated);
     const bool should_flush_pending_qnn_kv = switching_out_of_qnn_decode;
     const bool should_migrate_cpu_opencl_kv =
         n_tokens == 1 &&
@@ -1509,7 +1634,29 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         }
     }
 
-    if (should_attempt_qnn_kv_migration) {
+    if (should_use_qnn_shared_phase_kv) {
+        LLAMA_LOG_INFO("%s: reusing shared QNN KV directly for decode route switch (%s -> %s)\n",
+                __func__,
+                current_attn_backend.c_str(),
+                target_attn_backend.c_str());
+        const int64_t t_kv_sync_start_us = trace_timing ? ggml_time_us() : 0;
+        migrated_qnn_kv =
+            target_attn_backend == "opencl"
+                ? sync_dynamic_cpu_opencl_kv(/* host_to_device = */ true)
+                : true;
+        const int64_t t_kv_sync_end_us = trace_timing ? ggml_time_us() : 0;
+        if (trace_timing && hetero_phase_trace.active) {
+            hetero_phase_trace.kv_migration_us += t_kv_sync_end_us - t_kv_sync_start_us;
+        }
+        if (!migrated_qnn_kv) {
+            LLAMA_LOG_WARN("%s: direct shared QNN KV handoff failed; falling back to state rebuild for %s -> %s\n",
+                    __func__,
+                    current_attn_backend.c_str(),
+                    target_attn_backend.c_str());
+        }
+    }
+
+    if (should_attempt_qnn_kv_migration && !migrated_qnn_kv) {
         LLAMA_LOG_INFO("%s: starting QNN KV migration before decode route switch (%s -> %s)\n",
                 __func__,
                 current_attn_backend.c_str(),
