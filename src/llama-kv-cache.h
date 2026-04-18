@@ -7,6 +7,7 @@
 #include "llama-memory.h"
 
 #include <string>
+#include <cstdint>
 #include <unordered_map>
 #include <vector>
 
@@ -14,6 +15,26 @@ struct llama_cparams;
 struct llama_hparams;
 struct llama_model;
 struct llama_context;
+
+struct llama_opencl_external_host_sync_timing {
+    int64_t alias_us = 0;
+    int64_t backend_sync_us = 0;
+    int64_t transfer_us = 0;
+
+    void clear() {
+        *this = {};
+    }
+
+    void accumulate(const llama_opencl_external_host_sync_timing & other) {
+        alias_us += other.alias_us;
+        backend_sync_us += other.backend_sync_us;
+        transfer_us += other.transfer_us;
+    }
+
+    int64_t accounted_us() const {
+        return alias_us + backend_sync_us + transfer_us;
+    }
+};
 
 //
 // llama_kv_cache
@@ -205,7 +226,10 @@ public:
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     bool dump_powerserve_seed_kv(const std::string & dir, uint32_t n_tokens) const;
-    bool sync_external_opencl_host_aliases(ggml_backend_t opencl_backend, bool host_to_device) const;
+    bool sync_external_opencl_host_aliases(
+            ggml_backend_t opencl_backend,
+            bool host_to_device,
+            llama_opencl_external_host_sync_timing * timing = nullptr) const;
 
 private:
     const llama_model & model;

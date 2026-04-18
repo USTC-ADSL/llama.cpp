@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -997,9 +998,19 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     return updated;
 }
 
-bool llama_kv_cache::sync_external_opencl_host_aliases(ggml_backend_t opencl_backend, bool host_to_device) const {
+bool llama_kv_cache::sync_external_opencl_host_aliases(
+        ggml_backend_t opencl_backend,
+        bool host_to_device,
+        llama_opencl_external_host_sync_timing * timing) const {
     using ggml_backend_opencl_sync_external_host_buffer_t =
         bool (*)(ggml_backend_t backend, ggml_backend_buffer_t buffer, bool host_to_device);
+    using ggml_backend_opencl_sync_external_host_buffer_timed_t =
+        bool (*)(ggml_backend_t backend,
+                 ggml_backend_buffer_t buffer,
+                 bool host_to_device,
+                 int64_t * alias_us,
+                 int64_t * backend_sync_us,
+                 int64_t * transfer_us);
 
     if (opencl_backend == nullptr) {
         return false;
@@ -1012,9 +1023,19 @@ bool llama_kv_cache::sync_external_opencl_host_aliases(ggml_backend_t opencl_bac
             ? (ggml_backend_opencl_sync_external_host_buffer_t)
                   ggml_backend_reg_get_proc_address(opencl_reg, "ggml_backend_opencl_sync_external_host_buffer")
             : nullptr;
-    if (sync_buffer_fn == nullptr) {
+    auto * sync_buffer_timed_fn =
+        opencl_reg != nullptr
+            ? (ggml_backend_opencl_sync_external_host_buffer_timed_t)
+                  ggml_backend_reg_get_proc_address(opencl_reg, "ggml_backend_opencl_sync_external_host_buffer_timed")
+            : nullptr;
+    if (sync_buffer_fn == nullptr && sync_buffer_timed_fn == nullptr) {
         LLAMA_LOG_ERROR("%s: OpenCL backend does not expose external host-buffer sync support\n", __func__);
         return false;
+    }
+
+    llama_opencl_external_host_sync_timing total_timing;
+    if (timing != nullptr) {
+        timing->clear();
     }
 
     size_t synced_buffers = 0;
@@ -1028,7 +1049,17 @@ bool llama_kv_cache::sync_external_opencl_host_aliases(ggml_backend_t opencl_bac
         }
         const char * buffer_name = ggml_backend_buffer_name(buf.get());
 
-        if (!sync_buffer_fn(opencl_backend, buf.get(), host_to_device)) {
+        llama_opencl_external_host_sync_timing buffer_timing;
+        const bool ok = sync_buffer_timed_fn != nullptr
+            ? sync_buffer_timed_fn(
+                    opencl_backend,
+                    buf.get(),
+                    host_to_device,
+                    &buffer_timing.alias_us,
+                    &buffer_timing.backend_sync_us,
+                    &buffer_timing.transfer_us)
+            : sync_buffer_fn(opencl_backend, buf.get(), host_to_device);
+        if (!ok) {
             LLAMA_LOG_ERROR("%s: failed to synchronize KV buffer %s for CPU/OpenCL phase switch (%s)\n",
                     __func__,
                     buffer_name != nullptr ? buffer_name : "<unnamed>",
@@ -1038,6 +1069,7 @@ bool llama_kv_cache::sync_external_opencl_host_aliases(ggml_backend_t opencl_bac
 
         synced_buffers++;
         synced_bytes += ggml_backend_buffer_get_size(buf.get());
+        total_timing.accumulate(buffer_timing);
     }
 
     if (synced_buffers > 0) {
@@ -1046,6 +1078,17 @@ bool llama_kv_cache::sync_external_opencl_host_aliases(ggml_backend_t opencl_bac
                 synced_buffers,
                 host_to_device ? "host->device" : "device->host",
                 synced_bytes / 1024.0 / 1024.0);
+        if (sync_buffer_timed_fn != nullptr) {
+            LLAMA_LOG_INFO("%s: timing alias_us=%" PRId64 " backend_sync_us=%" PRId64 " transfer_us=%" PRId64 "\n",
+                    __func__,
+                    total_timing.alias_us,
+                    total_timing.backend_sync_us,
+                    total_timing.transfer_us);
+        }
+    }
+
+    if (timing != nullptr) {
+        timing->accumulate(total_timing);
     }
 
     return true;

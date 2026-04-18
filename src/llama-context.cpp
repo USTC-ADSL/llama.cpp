@@ -62,6 +62,26 @@ bool llama_context_should_use_qnn_shared_phase_kv(
         bool                generic_kv_enabled,
         const llama_hetero_kv_contract & allocated_kv_contract);
 
+bool llama_context_should_try_qnn_opencl_direct_host_ptr_visibility(
+        const std::string & current_attn_backend,
+        const std::string & target_attn_backend,
+        uint32_t            n_tokens,
+        bool                generic_kv_enabled,
+        const llama_hetero_kv_contract & allocated_kv_contract,
+        bool                experimental_enabled);
+
+bool llama_context_should_use_dynamic_decode_tg_only_sched_reserve(
+        bool     dynamic_route_enabled,
+        uint32_t n_tokens,
+        bool     experimental_enabled);
+
+bool llama_context_should_prewarm_dynamic_qnn_opencl_kv_aliases(
+        const std::string & prefill_attn_backend,
+        const std::string & decode_attn_backend,
+        bool                generic_kv_enabled,
+        const llama_hetero_kv_contract & allocated_kv_contract,
+        bool                experimental_enabled);
+
 llama_hetero_kv_contract llama_dynamic_phase_migration_kv_contract(
         const std::string & producer_backend,
         const std::string & consumer_backend,
@@ -177,6 +197,44 @@ bool llama_context_should_use_qnn_shared_phase_kv(
            allocated_kv_contract.zero_copy;
 }
 
+bool llama_context_should_try_qnn_opencl_direct_host_ptr_visibility(
+        const std::string & current_attn_backend,
+        const std::string & target_attn_backend,
+        uint32_t            n_tokens,
+        bool                generic_kv_enabled,
+        const llama_hetero_kv_contract & allocated_kv_contract,
+        bool                experimental_enabled) {
+    return experimental_enabled &&
+           llama_context_should_use_qnn_shared_phase_kv(
+                   current_attn_backend,
+                   target_attn_backend,
+                   n_tokens,
+                   generic_kv_enabled,
+                   allocated_kv_contract);
+}
+
+bool llama_context_should_use_dynamic_decode_tg_only_sched_reserve(
+        bool     dynamic_route_enabled,
+        uint32_t n_tokens,
+        bool     experimental_enabled) {
+    return experimental_enabled && dynamic_route_enabled && n_tokens == 1;
+}
+
+bool llama_context_should_prewarm_dynamic_qnn_opencl_kv_aliases(
+        const std::string & prefill_attn_backend,
+        const std::string & decode_attn_backend,
+        bool                generic_kv_enabled,
+        const llama_hetero_kv_contract & allocated_kv_contract,
+        bool                experimental_enabled) {
+    return llama_context_should_try_qnn_opencl_direct_host_ptr_visibility(
+            prefill_attn_backend,
+            decode_attn_backend,
+            1,
+            generic_kv_enabled,
+            allocated_kv_contract,
+            experimental_enabled);
+}
+
 namespace {
 
 using ggml_backend_qnn_aot_has_pending_generic_kv_writeback_t = bool (*)(ggml_backend_t backend);
@@ -191,6 +249,11 @@ bool hetero_dynamic_trace_timing_enabled() {
     }
 
     return enabled != 0;
+}
+
+bool env_flag_enabled(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
 const char * hetero_phase_name(uint32_t n_tokens) {
@@ -1049,6 +1112,7 @@ llama_context::llama_context(
         }
 
         sched_reserve();
+        maybe_prewarm_dynamic_qnn_opencl_kv_aliases();
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
@@ -1202,6 +1266,50 @@ ggml_backend_t llama_context::find_backend_for_route(const std::string & backend
     return nullptr;
 }
 
+void llama_context::maybe_prewarm_dynamic_qnn_opencl_kv_aliases() {
+    if (memory == nullptr || !dynamic_route_config.enabled()) {
+        return;
+    }
+
+    const std::string prefill_attn_backend =
+        llama_hetero_canonical_backend(
+                dynamic_route_config.prefill.plan.route.backend_for(llama_hetero_route_stage::ATTN_CORE));
+    const std::string decode_attn_backend =
+        llama_hetero_canonical_backend(
+                dynamic_route_config.decode.plan.route.backend_for(llama_hetero_route_stage::ATTN_CORE));
+    const bool generic_qnn_kv_enabled = env_flag_enabled("GGML_QNN_AOT_WRITE_GENERIC_KV");
+    const bool experimental_enabled = env_flag_enabled("GGML_OPENCL_EXPERIMENTAL_QNN_DIRECT_HOST_PTR");
+
+    if (!llama_context_should_prewarm_dynamic_qnn_opencl_kv_aliases(
+                prefill_attn_backend,
+                decode_attn_backend,
+                generic_qnn_kv_enabled,
+                hetero_kv_contract_allocated,
+                experimental_enabled)) {
+        return;
+    }
+
+    ggml_backend_t opencl_backend = find_backend_for_route("opencl");
+    if (opencl_backend == nullptr) {
+        LLAMA_LOG_WARN("%s: skipping eager qnn->opencl KV alias prewarm because the OpenCL backend is unavailable\n",
+                __func__);
+        return;
+    }
+
+    llama_opencl_external_host_sync_timing timing;
+    if (!sync_dynamic_cpu_opencl_kv(/* host_to_device = */ true, &timing)) {
+        LLAMA_LOG_WARN("%s: eager qnn->opencl KV alias prewarm failed; falling back to on-demand alias creation during the first decode switch\n",
+                __func__);
+        return;
+    }
+
+    LLAMA_LOG_INFO("%s: prewarmed experimental qnn->opencl KV alias path alias_us=%" PRId64 " backend_sync_us=%" PRId64 " transfer_us=%" PRId64 "\n",
+            __func__,
+            timing.alias_us,
+            timing.backend_sync_us,
+            timing.transfer_us);
+}
+
 void llama_context::validate_dynamic_seq0_token_history() {
     if (qnn_prefix_replay_active) {
         return;
@@ -1254,7 +1362,9 @@ void llama_context::record_dynamic_seq0_token_history(const llama_batch & batch_
         new_tokens.end());
 }
 
-bool llama_context::sync_dynamic_cpu_opencl_kv(bool host_to_device) {
+bool llama_context::sync_dynamic_cpu_opencl_kv(
+        bool host_to_device,
+        llama_opencl_external_host_sync_timing * timing) {
     if (memory == nullptr) {
         return true;
     }
@@ -1293,9 +1403,17 @@ bool llama_context::sync_dynamic_cpu_opencl_kv(bool host_to_device) {
         append_kv_cache(attn_cache != nullptr ? attn_cache->get_swa() : nullptr);
     }
 
+    if (timing != nullptr) {
+        timing->clear();
+    }
+
     for (llama_kv_cache * kv_cache : kv_caches) {
-        if (!kv_cache->sync_external_opencl_host_aliases(opencl_backend, host_to_device)) {
+        llama_opencl_external_host_sync_timing cache_timing;
+        if (!kv_cache->sync_external_opencl_host_aliases(opencl_backend, host_to_device, &cache_timing)) {
             return false;
+        }
+        if (timing != nullptr) {
+            timing->accumulate(cache_timing);
         }
     }
 
@@ -1557,6 +1675,19 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                 n_tokens,
                 generic_qnn_kv_enabled,
                 hetero_kv_contract_allocated);
+    const char * direct_qnn_opencl_host_ptr_env = std::getenv("GGML_OPENCL_EXPERIMENTAL_QNN_DIRECT_HOST_PTR");
+    const bool direct_qnn_opencl_host_ptr_enabled =
+        direct_qnn_opencl_host_ptr_env != nullptr &&
+        direct_qnn_opencl_host_ptr_env[0] != '\0' &&
+        std::strcmp(direct_qnn_opencl_host_ptr_env, "0") != 0;
+    const bool should_try_qnn_opencl_direct_host_ptr_visibility =
+        llama_context_should_try_qnn_opencl_direct_host_ptr_visibility(
+                current_attn_backend,
+                target_attn_backend,
+                n_tokens,
+                generic_qnn_kv_enabled,
+                hetero_kv_contract_allocated,
+                direct_qnn_opencl_host_ptr_enabled);
     const bool should_flush_pending_qnn_kv = switching_out_of_qnn_decode;
     const bool should_migrate_cpu_opencl_kv =
         n_tokens == 1 &&
@@ -1635,18 +1766,25 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
     }
 
     if (should_use_qnn_shared_phase_kv) {
-        LLAMA_LOG_INFO("%s: reusing shared QNN KV directly for decode route switch (%s -> %s)\n",
+        LLAMA_LOG_INFO("%s: reusing shared QNN KV directly for decode route switch (%s -> %s)%s\n",
                 __func__,
                 current_attn_backend.c_str(),
-                target_attn_backend.c_str());
+                target_attn_backend.c_str(),
+                should_try_qnn_opencl_direct_host_ptr_visibility
+                    ? " with experimental OpenCL direct-host-ptr visibility"
+                    : "");
         const int64_t t_kv_sync_start_us = trace_timing ? ggml_time_us() : 0;
+        llama_opencl_external_host_sync_timing opencl_sync_timing;
         migrated_qnn_kv =
             target_attn_backend == "opencl"
-                ? sync_dynamic_cpu_opencl_kv(/* host_to_device = */ true)
+                ? sync_dynamic_cpu_opencl_kv(/* host_to_device = */ true, &opencl_sync_timing)
                 : true;
         const int64_t t_kv_sync_end_us = trace_timing ? ggml_time_us() : 0;
         if (trace_timing && hetero_phase_trace.active) {
             hetero_phase_trace.kv_migration_us += t_kv_sync_end_us - t_kv_sync_start_us;
+            hetero_phase_trace.kv_alias_us += opencl_sync_timing.alias_us;
+            hetero_phase_trace.kv_backend_sync_us += opencl_sync_timing.backend_sync_us;
+            hetero_phase_trace.kv_transfer_us += opencl_sync_timing.transfer_us;
         }
         if (!migrated_qnn_kv) {
             LLAMA_LOG_WARN("%s: direct shared QNN KV handoff failed; falling back to state rebuild for %s -> %s\n",
@@ -1763,6 +1901,9 @@ llama_context::~llama_context() {
 }
 
 void llama_context::sched_reserve() {
+    const uint32_t reserve_request_tokens = sched_reserve_request_tokens;
+    sched_reserve_request_tokens = 0;
+
     if (!sched_need_reserve) {
         return;
     }
@@ -1787,10 +1928,12 @@ void llama_context::sched_reserve() {
     }
 
     const int64_t t_start_us = ggml_time_us();
+    llama_sched_reserve_timing reserve_timing;
 
     const uint32_t n_seqs = cparams.n_seq_max;
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
+    const int64_t t_sched_new_start_us = ggml_time_us();
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
@@ -1799,8 +1942,10 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    reserve_timing.sched_new_us += ggml_time_us() - t_sched_new_start_us;
 
     llama_memory_context_ptr mctx;
+    const int64_t t_memory_init_start_us = ggml_time_us();
     if (memory) {
         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
         mctx = memory->init_full();
@@ -1808,12 +1953,14 @@ void llama_context::sched_reserve() {
             throw std::runtime_error("failed to initialize memory module");
         }
     }
+    reserve_timing.memory_init_us += ggml_time_us() - t_memory_init_start_us;
 
     // avoid reserving graphs with zero outputs - assume one output per sequence
     const int n_outputs = n_seqs;
 
     LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
 
+    const int64_t t_feature_probe_start_us = ggml_time_us();
     // resolve automatic Flash Attention use
     if (cparams.auto_fa) {
         auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true);
@@ -1936,6 +2083,7 @@ void llama_context::sched_reserve() {
 
         cparams.auto_fgdn = false;
     }
+    reserve_timing.feature_probe_us += ggml_time_us() - t_feature_probe_start_us;
 
     // reserve worst-case graph
     int n_splits_pp = -1;
@@ -1944,34 +2092,43 @@ void llama_context::sched_reserve() {
     int n_splits_tg = -1;
     int n_nodes_tg  = -1;
 
+    const bool use_decode_tg_only_reserve =
+        llama_context_should_use_dynamic_decode_tg_only_sched_reserve(
+                dynamic_route_config.enabled(),
+                reserve_request_tokens,
+                env_flag_enabled("GGML_HETERO_DYNAMIC_DECODE_TG_ONLY_RESERVE"));
+
     const auto reserve_plan_buffers = [&](const llama_hetero_execution_plan & plan,
-                                          bool capture_stats) {
+                                          bool capture_stats,
+                                          bool decode_tg_only) {
         const auto saved_plan = hetero_plan;
         const bool saved_qnn_active = aot_active_route_requests_qnn;
         hetero_plan = plan;
         aot_active_route_requests_qnn = hetero_route_requests_qnn(hetero_plan.route);
 
-        // reserve pp (prompt processing) graph first so that buffers are only allocated once
-        {
-            auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(),
-                    model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
-            if (!gf) {
-                if (cparams.pipeline_parallel) {
-                    LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
-                    cparams.pipeline_parallel = false;
-                    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
-                    gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get());
-                }
+        if (!decode_tg_only) {
+            // reserve pp (prompt processing) graph first so that buffers are only allocated once
+            {
+                auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(),
+                        model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
                 if (!gf) {
-                    hetero_plan = saved_plan;
-                    aot_active_route_requests_qnn = saved_qnn_active;
-                    throw std::runtime_error("failed to allocate compute pp buffers");
+                    if (cparams.pipeline_parallel) {
+                        LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
+                        cparams.pipeline_parallel = false;
+                        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                        gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get());
+                    }
+                    if (!gf) {
+                        hetero_plan = saved_plan;
+                        aot_active_route_requests_qnn = saved_qnn_active;
+                        throw std::runtime_error("failed to allocate compute pp buffers");
+                    }
                 }
-            }
 
-            if (capture_stats) {
-                n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
-                n_nodes_pp  = ggml_graph_n_nodes(gf);
+                if (capture_stats) {
+                    n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
+                    n_nodes_pp  = ggml_graph_n_nodes(gf);
+                }
             }
         }
 
@@ -1990,27 +2147,33 @@ void llama_context::sched_reserve() {
             }
         }
 
-        // reserve again with pp graph to avoid ggml-alloc reallocations during inference
-        {
-            auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(), model.hparams.no_alloc);
-            if (!gf) {
-                hetero_plan = saved_plan;
-                aot_active_route_requests_qnn = saved_qnn_active;
-                throw std::runtime_error("failed to allocate compute pp buffers");
+        if (decode_tg_only) {
+            if (capture_stats) {
+                n_splits_pp = n_splits_tg;
+                n_nodes_pp  = n_nodes_tg;
             }
-            (void) gf;
+        } else {
+            // reserve again with pp graph to avoid ggml-alloc reallocations during inference
+            {
+                auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(), model.hparams.no_alloc);
+                if (!gf) {
+                    hetero_plan = saved_plan;
+                    aot_active_route_requests_qnn = saved_qnn_active;
+                    throw std::runtime_error("failed to allocate compute pp buffers");
+                }
+                (void) gf;
+            }
         }
 
         hetero_plan = saved_plan;
         aot_active_route_requests_qnn = saved_qnn_active;
     };
 
-    reserve_plan_buffers(hetero_plan, /* capture_stats = */ true);
-
-    const auto env_flag_enabled = [](const char * name) {
-        const char * value = std::getenv(name);
-        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
-    };
+    const int64_t t_plan_reserve_start_us = ggml_time_us();
+    if (use_decode_tg_only_reserve) {
+        LLAMA_LOG_INFO("%s: using experimental decode tg-only reserve for current dynamic phase switch\n", __func__);
+    }
+    reserve_plan_buffers(hetero_plan, /* capture_stats = */ true, /* decode_tg_only = */ use_decode_tg_only_reserve);
 
     if (dynamic_route_config.enabled() && env_flag_enabled("GGML_HETERO_DYNAMIC_PRERESERVE")) {
         const bool include_fallback = env_flag_enabled("GGML_HETERO_DYNAMIC_PRERESERVE_FALLBACK");
@@ -2062,7 +2225,7 @@ void llama_context::sched_reserve() {
             if (llama_hetero_execution_plan_equals(plan, hetero_plan)) {
                 continue;
             }
-            reserve_plan_buffers(plan, /* capture_stats = */ false);
+            reserve_plan_buffers(plan, /* capture_stats = */ false, /* decode_tg_only = */ false);
             append_reserved_plan(plan);
         }
 
@@ -2071,7 +2234,9 @@ void llama_context::sched_reserve() {
                 hetero_dynamic_pre_reserved_plans.size(),
                 include_fallback ? " (including fallback)" : "");
     }
+    reserve_timing.plan_reserve_us += ggml_time_us() - t_plan_reserve_start_us;
 
+    const int64_t t_finalize_start_us = ggml_time_us();
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         ggml_backend_t             backend = backend_ptrs[i];
         ggml_backend_buffer_type_t buft    = backend_buft[i];
@@ -2096,12 +2261,18 @@ void llama_context::sched_reserve() {
     } else {
         LLAMA_LOG_INFO("%s: graph splits = %d (with bs=%d), %d (with bs=1)\n", __func__, n_splits_pp, n_tokens, n_splits_tg);
     }
+    reserve_timing.finalize_us += ggml_time_us() - t_finalize_start_us;
 
     const int64_t t_end_us = ggml_time_us();
     const int64_t reserve_us = t_end_us - t_start_us;
 
     if (hetero_dynamic_trace_timing_enabled() && hetero_phase_trace.active) {
         hetero_phase_trace.reserve_us += reserve_us;
+        hetero_phase_trace.reserve_sched_new_us += reserve_timing.sched_new_us;
+        hetero_phase_trace.reserve_memory_init_us += reserve_timing.memory_init_us;
+        hetero_phase_trace.reserve_feature_probe_us += reserve_timing.feature_probe_us;
+        hetero_phase_trace.reserve_plan_reserve_us += reserve_timing.plan_reserve_us;
+        hetero_phase_trace.reserve_finalize_us += reserve_timing.finalize_us;
     }
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
@@ -2120,6 +2291,20 @@ void llama_context::synchronize() {
         hetero_phase_trace.active &&
         hetero_phase_trace.batch_start_us > 0) {
         const int64_t total_us = ggml_time_us() - hetero_phase_trace.batch_start_us;
+        const int64_t reserve_accounted_us =
+            hetero_phase_trace.reserve_sched_new_us +
+            hetero_phase_trace.reserve_memory_init_us +
+            hetero_phase_trace.reserve_feature_probe_us +
+            hetero_phase_trace.reserve_plan_reserve_us +
+            hetero_phase_trace.reserve_finalize_us;
+        const int64_t reserve_unattributed_us =
+            std::max<int64_t>(int64_t(0), hetero_phase_trace.reserve_us - reserve_accounted_us);
+        const int64_t kv_accounted_us =
+            hetero_phase_trace.kv_alias_us +
+            hetero_phase_trace.kv_backend_sync_us +
+            hetero_phase_trace.kv_transfer_us;
+        const int64_t kv_unattributed_us =
+            std::max<int64_t>(int64_t(0), hetero_phase_trace.kv_migration_us - kv_accounted_us);
         LLAMA_LOG_INFO("%s: timing phase=%s n_tokens=%u total_wall_us=%" PRId64 " decide_us=%" PRId64 " apply_us=%" PRId64 " reserve_us=%" PRId64 " memory_update_us=%" PRId64 " kv_migration_us=%" PRId64 " process_ubatch_us=%" PRId64 " bootstrap_sync_us=%" PRId64 " bootstrap_sched_rebuild_us=%" PRId64 " ubatches=%d graph_runs_reused=%d graph_runs_rebuilt=%d route_applied=%s route_noop=%s bootstrap_ran=%s label=%s reason=%s target=%s\n",
                 __func__,
                 hetero_phase_name(hetero_phase_trace.n_tokens),
@@ -2142,6 +2327,20 @@ void llama_context::synchronize() {
                 hetero_phase_trace.route_label.empty() ? "<none>" : hetero_phase_trace.route_label.c_str(),
                 hetero_phase_trace.route_reason.empty() ? "<none>" : hetero_phase_trace.route_reason.c_str(),
                 hetero_phase_trace.target_route.empty() ? "<default>" : hetero_phase_trace.target_route.c_str());
+        LLAMA_LOG_INFO("%s: timing reserve_breakdown sched_new_us=%" PRId64 " memory_init_us=%" PRId64 " feature_probe_us=%" PRId64 " plan_reserve_us=%" PRId64 " finalize_us=%" PRId64 " unattributed_us=%" PRId64 "\n",
+                __func__,
+                hetero_phase_trace.reserve_sched_new_us,
+                hetero_phase_trace.reserve_memory_init_us,
+                hetero_phase_trace.reserve_feature_probe_us,
+                hetero_phase_trace.reserve_plan_reserve_us,
+                hetero_phase_trace.reserve_finalize_us,
+                reserve_unattributed_us);
+        LLAMA_LOG_INFO("%s: timing kv_breakdown alias_us=%" PRId64 " backend_sync_us=%" PRId64 " transfer_us=%" PRId64 " unattributed_us=%" PRId64 "\n",
+                __func__,
+                hetero_phase_trace.kv_alias_us,
+                hetero_phase_trace.kv_backend_sync_us,
+                hetero_phase_trace.kv_transfer_us,
+                kv_unattributed_us);
         hetero_phase_trace.reset();
     }
 
@@ -2915,6 +3114,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
     // TODO: this clear of the buffer can easily be forgotten - need something better
     embd_seq.clear();
 
+    sched_reserve_request_tokens = n_tokens;
     sched_reserve();
 
     n_queued_tokens += n_tokens;
@@ -3265,6 +3465,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     embd_seq.clear();
     output_swaps.clear();
 
+    sched_reserve_request_tokens = n_tokens_all;
     maybe_apply_dynamic_route(n_tokens_all);
     if (qnn_prefix_replay_pending) {
         const bool trace_was_active = hetero_phase_trace.active;
@@ -4935,6 +5136,7 @@ bool llama_context::replay_dynamic_qnn_prefix() {
     if (replaying_into_qnn) {
         aot_skip_bootstrap_for_next_decode = true;
     }
+    sched_reserve_request_tokens = static_cast<uint32_t>(replay_batch.n_tokens);
     sched_reserve();
 
     bool replay_did_optimize = false;

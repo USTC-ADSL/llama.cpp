@@ -20,6 +20,7 @@ class llama_batch_allocr;
 
 class llama_io_read_i;
 class llama_io_write_i;
+struct llama_opencl_external_host_sync_timing;
 
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
@@ -33,6 +34,30 @@ struct llama_memory_breakdown_data {
 
     size_t total() const {
         return model + context + compute;
+    }
+};
+
+struct llama_sched_reserve_timing {
+    int64_t sched_new_us = 0;
+    int64_t memory_init_us = 0;
+    int64_t feature_probe_us = 0;
+    int64_t plan_reserve_us = 0;
+    int64_t finalize_us = 0;
+
+    void clear() {
+        *this = {};
+    }
+
+    void accumulate(const llama_sched_reserve_timing & other) {
+        sched_new_us += other.sched_new_us;
+        memory_init_us += other.memory_init_us;
+        feature_probe_us += other.feature_probe_us;
+        plan_reserve_us += other.plan_reserve_us;
+        finalize_us += other.finalize_us;
+    }
+
+    int64_t accounted_us() const {
+        return sched_new_us + memory_init_us + feature_probe_us + plan_reserve_us + finalize_us;
     }
 };
 
@@ -269,7 +294,10 @@ private:
     bool ensure_dynamic_route_backends_ready(const llama_dynamic_route_runtime_config & config);
     bool backend_available_for_route(const std::string & backend_name) const;
     ggml_backend_t find_backend_for_route(const std::string & backend_name) const;
-    bool sync_dynamic_cpu_opencl_kv(bool host_to_device);
+    void maybe_prewarm_dynamic_qnn_opencl_kv_aliases();
+    bool sync_dynamic_cpu_opencl_kv(
+            bool host_to_device,
+            llama_opencl_external_host_sync_timing * timing = nullptr);
     bool rebuild_dynamic_consumer_kv_from_state(
             const std::string & producer_backend,
             const std::string & consumer_backend,
@@ -348,6 +376,7 @@ private:
     ggml_backend_sched_ptr aot_saved_sched;
 
     bool sched_need_reserve = true;
+    uint32_t sched_reserve_request_tokens = 0;
     std::vector<llama_hetero_execution_plan> hetero_dynamic_pre_reserved_plans;
 
     ggml_backend_t backend_cpu = nullptr;
@@ -414,8 +443,16 @@ private:
         int64_t route_decide_us = 0;
         int64_t route_apply_us = 0;
         int64_t reserve_us = 0;
+        int64_t reserve_sched_new_us = 0;
+        int64_t reserve_memory_init_us = 0;
+        int64_t reserve_feature_probe_us = 0;
+        int64_t reserve_plan_reserve_us = 0;
+        int64_t reserve_finalize_us = 0;
         int64_t memory_update_us = 0;
         int64_t kv_migration_us = 0;
+        int64_t kv_alias_us = 0;
+        int64_t kv_backend_sync_us = 0;
+        int64_t kv_transfer_us = 0;
         int64_t process_ubatch_us = 0;
         int64_t bootstrap_sync_us = 0;
         int64_t bootstrap_sched_rebuild_us = 0;
