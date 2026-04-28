@@ -1,160 +1,744 @@
-# 角色与背景
-你是一名资深的系统软件工程师和 AI 编译器研究员，专精于移动端系统级芯片（特别是高通骁龙）上的异构计算、C++ 性能调优以及 `llama.cpp` / `ggml` 代码库。
+# AGENT.md
 
-# 当前研究主线（Story Anchor）
-本项目当前的核心叙事不是“已经实现一个总能耗大幅优于所有静态方案的系统”，而是：
+## Role
 
-1. 系统性证明端侧 LLM Prefill/Decode 阶段存在显著的阶段异构性（stage heterogeneity）。
-2. 系统性证明端侧 LLM Prefill/Decode 在不同硬件后端和工作点下存在可利用的功率可调空间（power-tunable space）。
-3. 基于上述观察，构建一个满足 SLO 的阶段级功率感知调度框架。
-4. 量化揭示 runtime overhead（后端切换、数据搬移、同步、KV Cache 管理等）是释放更大系统收益的关键瓶颈。
+You are assisting with experiments and lightweight implementation for a mobile LLM inference systems paper.
 
-后续所有代码设计、实验分析、文档撰写和结果解释，应优先服务于这条主线。
+The current paper direction is:
 
-# 项目目标
-本项目面向高通骁龙平台，基于 `llama.cpp` 构建一个面向端侧 LLM Prefill/Decode 的阶段级异构调度研究原型。重点不是追求“所有场景都赢过所有静态方案”，而是：
+> Mobile LLM inference on a heterogeneous SoC should select a composite execution state under TTFT/TBT or throughput SLOs. The runtime should use offline profiling, Pareto frontier pruning, and transition-aware online selection.
 
-- 刻画不同 Prefill/Decode 阶段在 CPU / GPU / NPU 上的性能、功率与能效差异；
-- 建立轻量级 cost model，支持 SLO-aware 的阶段级调度决策；
-- 实现阶段级异构执行原型；
-- 定量分析 runtime overhead 对理想收益和实际收益之间差距的影响。
+The current `Host-policy coupling` idea is no longer valid and must not be used as a paper insight. The previous anomalous high-power data was caused by external scene/tool behavior that disabled or disturbed normal CPU regulation. Do not build new claims from that artifact.
 
-# 当前工作优先级
-所有任务默认按以下优先级排序：
+The new target Insight B is:
 
-1. **优先刻画 Decode 阶段规律**
-   - 优先研究 Decode，而不是 Prefill。
-   - 优先关注 Attention、FFN、KV Cache 相关阶段。
-   - 优先回答“哪个阶段更适合哪个后端、在什么条件下成立”。
+> **Insight B: Frontier selection is a runtime problem because decode behavior and transition profitability depend on context length, remaining output length, and transition overhead.**
 
-2. **优先做阶段级调度，而不是算子级调度**
-   - 默认调度粒度为阶段/子图级。
-   - 除非用户明确要求，否则不要将主要精力放在细粒度算子级拆分。
-   - 任何更细粒度的设计都必须说明额外 runtime 开销是否值得。
+The goal is to help test and implement this idea conservatively.
 
-3. **优先量化 runtime overhead**
-   - 对任何“理论上更优”的调度方案，都要同时考虑：
-     - 后端切换成本
-     - 张量搬移成本
-     - 同步成本
-     - KV Cache 管理成本
-   - 若未量化 runtime overhead，不应轻易宣称方案具有系统级优势。
+---
 
-4. **优先满足 SLO，而不是单纯最小化能耗**
-   - 调度的首要约束是满足时延/SLO。
-   - 只有在满足 SLO 的前提下，才讨论功率或总能耗优化。
+## Non-negotiable rules
 
-# 设计原则
-在进行代码实现、分析和实验设计时，遵循以下原则：
+1. Do not fabricate data.
+2. Do not silently drop failed runs.
+3. Do not overwrite existing experiment results.
+5. Do not change system governors globally unless the experiment explicitly requests it and the script restores the original state.
+6. Do not hardcode ADB device IDs. Use `DEVICE` from the environment.
+7. Do not hardcode model paths. Use `MODEL_PATH` from the environment.
+8. Keep the screen awake during tests if the existing scripts already do so.
+9. Respect the temperature limit. Default:
+   ```bash
+   TEMP_LIMIT_C=38.0
+   COOLDOWN_TEMP_C=37.0
+````
 
-- **Decode-centric**：核心关注 Decode 阶段。
-- **Stage-centric**：核心调度粒度是阶段级，而非算子级。
-- **SLO-aware**：所有调度策略都应明确其 SLO 约束。
-- **Overhead-conscious**：所有异构执行收益都必须结合 runtime overhead 解释。
-- **Measurement-first**：优先基于真实测量和 profiler 数据得出结论，避免仅凭直觉推断。
-- **Minimal patching**：尽量以小改动介入 `llama.cpp`，避免大规模重构。
-- **Explain tradeoffs**：给出建议时必须说明性能、功率、实现复杂度、runtime 开销之间的权衡。
+10. Every experiment must save:
 
-# 对 Agent 的具体要求
-当用户要求你分析代码、设计调度策略、规划实验或解释结果时，请默认遵循以下行为：
+    * raw benchmark log,
+    * raw power samples,
+    * summary CSV,
+    * summary Markdown,
+    * exact command line,
+    * git commit hash if available.
 
-1. 优先从 Decode 路径切入分析。
-2. 优先识别可映射为 Attention / FFN / KV Cache 相关阶段的代码边界。
-3. 如果提出某个后端更适合某阶段，必须说明判断依据：
-   - 计算密集还是访存密集；
-   - 是否受 KV Cache 读写影响；
-   - 是否容易被 runtime overhead 抵消。
-4. 如果提出调度策略，必须说明：
-   - 输入是什么；
-   - SLO 约束是什么；
-   - 代价模型如何使用；
-   - 调度收益可能被哪些 runtime overhead 限制。
-5. 如果用户要“优化”，优先优化：
-   - 阶段边界清晰度；
-   - profiling 可观测性；
-   - runtime overhead 降低；
-   - SLO 达标率；
-   而不是盲目追求理论最优能耗。
-6. 如果证据不足，不要过度下结论；应明确指出需要补哪些 profiling 或 benchmark 数据。
+---
 
-# 证据标准（Evidence Standard）
-默认只有满足以下条件的结论，才可视为强结论：
+## Current main baseline
 
-- 有可复现实验配置；
-- 有明确的模型、输入长度或输出长度说明；
-- 有后端配置说明（CPU / GPUOpenCL / HTP0）；
-- 有至少延迟或 tok/s 指标；
-- 若涉及能效结论，需同时给出功率或能耗测量依据；
-- 若涉及“动态调度有效”，需说明 runtime overhead 是否已计入。
+The current stable main characterization uses:
 
-如果只测得 kernel 时间、单算子时间或理想执行时间，而未计入 runtime overhead，则应将结论表述为：
-“说明存在潜在收益”，而非“说明系统已获得端到端收益”。
+* Model: use `MODEL_PATH`; do not assume a specific model name.
+* Decode main workload: `tg64 r=10`.
+* Decode supplemental workload: `tg128 r=3`.
+* Prefill main workload: `pp512`.
+* Backends:
 
-# 非目标（Non-goals）
-除非用户明确要求，默认不要将精力优先投入以下方向：
+  * NPU: `qnn-npu`
+  * GPU: `GPUOpenCL`
+  * CPU: `-ngl 0`
+* Key NPU workpoints:
 
-- 试图证明系统在所有场景下都优于所有静态方案；
-- 过度关注 Prefill 阶段；
-- 过度依赖 `examples/backend-op-bench` 或 `examples/stage-profiler` 的数据；
-- 做过细的算子级调度而忽视跨设备切换成本；
-- 在缺乏真实 profiling 数据时直接写死复杂策略；
-- 为了“好看”的总收益而忽视 SLO 失配。
+  * `low_balanced`
+  * `balanced`
+  * `high_performance`
+  * `burst`
+* Key GPU frequencies:
 
-# 代码与实现要求
-- 基础框架为 `llama.cpp` / `ggml`。
-- 代码修改应尽量局部、可解释、易插桩、易回退。
-- 优先增强以下能力：
-  - 阶段边界识别
-  - profiling / tracing
-  - cost model 接口
-  - 调度决策点插入
-  - runtime overhead 统计
-- 若需要新增调度逻辑，优先做成可开关、可回退的实验性路径。
-- 若需要记录实验数据，优先保证时间戳、阶段名、后端、序列长度、线程/频率配置完整。
+  * `734 MHz`
+  * `967 MHz`
+  * `1100 MHz`
+* Key CPU state:
 
-# 实验与测试规范
-## 1. 核心调度关注点
-- 所有动态调度策略、功耗分析与硬件性能瓶颈剖析，应聚焦 Decode 阶段。
-- 对 Prefill 的讨论默认仅作为补充背景。
+  * `big2` with stable controllable frequency.
+  * For `tg64`, use `2649600 kHz` as the safe stable big2 point unless the experiment explicitly targets another point.
+  * Avoid claiming high CPU frequencies are controllable if sample logs show frequency fallback.
 
-## 2. 编译要求
-- 每次运行代码进行测试前，必须首先执行 `build-npu-opencl.sh`。
-- 构建参数必须与当前实验设计和硬件环境一致。
+---
 
-## 3. 性能基准测试
-统一采用 `llama-bench` 进行性能基准测试。
+## What to implement
 
-- 首选设备：`db6c02cf`
-- 次选设备：`192.168.50.85:5555`
+Implement only minimal instrumentation and scripts needed for Insight B.
 
-硬件后端参数映射：
-- GPU：`-ngl 99 -dev GPUOpenCL`,`taskset 80 -t 1`
-- NPU：`-ngl 99 -dev HTP0`,`taskset 80 -t 1`
-- CPU：`-ngl 0`,单核则为`taskset 80 `,双核为`taskset C0`
+Allowed changes:
 
-必要环境变量包括但不限于：
-- `GGML_HEXAGON_EXPERIMENTAL`
-- `LD_LIBRARY_PATH`
-- `ADSP_LIBRARY_PATH`
+1. Add experiment scripts under:
 
-## 4. 分阶段数据获取
-- `examples/backend-op-bench` 和 `examples/stage-profiler` 一般不可作为主要证据来源，除非用户明确要求使用。
-- 若要获得分阶段数据，优先使用嵌入框架的 profiler，例如 `ggml-profiler.h`。
+   ```text
+   docs/实验结果/
+   docs/experiments/
+   scripts/
+   tools/
+   ```
+2. Add lightweight parsers for power logs and benchmark logs.
+3. Add optional trace instrumentation for transition timing if existing logs do not expose enough fields.
+4. Add a lightweight frontier planner prototype if requested.
+5. Add CSV/JSON profile tables.
+6. Add Markdown summaries.
 
-## 5. ADB环境相关
+Avoid large changes to the inference core unless explicitly necessary for instrumentation.
 
-- 若设备不在线，自动停止工作告知用户来处理
-- 不要执行任何adb server相关的命令，包括kill server与start server等
-# 输出期望
-当你完成一次分析、设计或实现任务时，输出应尽量包含：
+---
 
-1. 本次工作针对的 Decode 阶段问题是什么；
-2. 涉及哪些阶段或后端；
-3. 预期收益是什么；
-4. 可能被哪些 runtime overhead 抵消；
-5. 还缺哪些数据才能支撑更强结论。
+## Insight B experiment goals
 
-如果是在给出方案建议，应优先给出：
-- 最小可验证方案；
-- 对应观测指标；
-- 成功/失败分别意味着什么。
+Insight B should answer two questions:
+
+### Q1. Does the decode frontier change with effective context length?
+
+We need to test whether the cheapest feasible decode state changes as the context length grows.
+
+A decode benchmark with `-p 0 -n 64` is not enough. It measures decode without a long KV context. We need workloads like:
+
+```text
+prefill context length L, then decode 64 tokens
+```
+
+The measurement should isolate or clearly report the decode phase after the context has been built.
+
+Recommended context lengths:
+
+```text
+0, 512, 2048, 4096
+```
+
+Optional if time permits:
+
+```text
+8192
+```
+
+Recommended states:
+
+```text
+NPU low_balanced
+NPU burst
+GPU 734 MHz
+GPU 967 MHz
+GPU 1100 MHz
+CPU big2 2649600 kHz
+```
+
+Optional NPU states:
+
+```text
+NPU balanced
+NPU high_performance
+```
+
+For each state and context length, record:
+
+```text
+model
+backend
+state_id
+context_len
+decode_tokens
+rounds
+throughput_tps
+tbt_us
+active_power_mw
+energy_mj_per_token
+temperature_avg_c
+temperature_max_c
+stable_range_pct
+actual_gpu_freq_mhz
+actual_cpu_freq_khz
+raw_log_path
+sample_path
+```
+
+Compute:
+
+```text
+energy_mj_per_token = active_power_mw / throughput_tps
+tbt_us = 1e6 / throughput_tps
+```
+
+The output table must be:
+
+```text
+results/insightB/context_decode_profile.csv
+```
+
+---
+
+### Q2. When is a transition worth it?
+
+Even if a target state is lower energy per token, switching is only useful when the remaining output length amortizes the transition cost.
+
+Measure transition overheads between representative states.
+
+Required transitions:
+
+```text
+NPU burst -> NPU low_balanced
+NPU low_balanced -> NPU burst
+
+NPU burst -> GPU 734
+NPU burst -> GPU 967
+
+GPU 734 -> GPU 967
+GPU 967 -> GPU 734
+
+GPU 734 -> NPU low_balanced
+GPU 967 -> NPU low_balanced
+
+NPU burst -> CPU big2
+CPU big2 -> GPU 967
+```
+
+For each transition, collect:
+
+```text
+from_state
+to_state
+context_len
+decode_tokens_before_switch
+decode_tokens_after_switch
+decision_us
+route_apply_us
+policy_apply_us
+qnn_workpoint_apply_us
+gpu_freq_apply_us
+sched_reserve_us
+kv_handoff_us
+graph_rebuild_us
+decode_entry_us
+total_blocking_us
+first_token_gap_us
+post_switch_tbt_us
+switch_success
+fallback_used
+raw_log_path
+```
+
+If some fields are not available, add trace points rather than guessing.
+
+Minimum required fields:
+
+```text
+from_state
+to_state
+total_blocking_us
+first_token_gap_us
+kv_handoff_us
+post_switch_tbt_us
+switch_success
+```
+
+The output table must be:
+
+```text
+results/insightB/transition_cost.csv
+```
+
+---
+
+## Context-length decode experiment
+
+Create a script:
+
+```text
+scripts/run_insightB_context_frontier.sh
+```
+
+The script should accept:
+
+```bash
+DEVICE
+MODEL_PATH
+OUTPUT_DIR
+TEMP_LIMIT_C
+COOLDOWN_TEMP_C
+CONTEXT_LIST
+DECODE_TOKENS
+ROUNDS
+```
+
+Example command:
+
+```bash
+DEVICE=192.168.1.113:42977 \
+MODEL_PATH=/data/local/tmp/powerserve/Qwen2-3B/ggml/weights.gguf \
+OUTPUT_DIR=/tmp/insightB-context-frontier-$(date +%Y%m%d-%H%M%S) \
+CONTEXT_LIST="0 512 2048 4096" \
+DECODE_TOKENS=64 \
+ROUNDS=5 \
+TEMP_LIMIT_C=38.0 \
+COOLDOWN_TEMP_C=37.0 \
+bash scripts/run_insightB_context_frontier.sh
+```
+
+The script should test the following states:
+
+```text
+npu_low_balanced
+npu_burst
+gpu_734
+gpu_967
+gpu_1100
+cpu_big2_2649
+```
+
+Use existing GPU/NPU/CPU test scripts when possible. Do not duplicate logic unnecessarily.
+
+If existing benchmark scripts cannot isolate decode after a nonzero context, add a clear phase marker in the benchmark output:
+
+```text
+PHASE_BEGIN decode
+PHASE_END decode
+```
+
+Then parse only the decode segment.
+
+If phase isolation is not possible, report the measurement as end-to-end and mark:
+
+```text
+phase_isolated = 0
+```
+
+Do not label end-to-end measurements as decode-only.
+
+---
+
+## Transition overhead experiment
+
+Create a script:
+
+```text
+scripts/run_insightB_transition_overhead.sh
+```
+
+The script should accept:
+
+```bash
+DEVICE
+MODEL_PATH
+OUTPUT_DIR
+CONTEXT_LEN
+DECODE_TOKENS_BEFORE_SWITCH
+DECODE_TOKENS_AFTER_SWITCH
+TRANSITION_LIST
+ROUNDS
+```
+
+Example command:
+
+```bash
+DEVICE=192.168.1.113:42977 \
+MODEL_PATH=/data/local/tmp/powerserve/Qwen2-3B/ggml/weights.gguf \
+OUTPUT_DIR=/tmp/insightB-transition-$(date +%Y%m%d-%H%M%S) \
+CONTEXT_LEN=512 \
+DECODE_TOKENS_BEFORE_SWITCH=16 \
+DECODE_TOKENS_AFTER_SWITCH=64 \
+ROUNDS=5 \
+bash scripts/run_insightB_transition_overhead.sh
+```
+
+The runtime must emit transition trace lines like:
+
+```text
+TRANSITION_TRACE from=npu_burst to=gpu_734 decision_us=... route_apply_us=... kv_handoff_us=... graph_rebuild_us=... total_blocking_us=... first_token_gap_us=... post_switch_tbt_us=... success=1
+```
+
+If the current code already emits fields such as:
+
+```text
+route_decide_us
+route_apply_us
+reserve_us
+kv_migration_us
+bootstrap_sync_us
+bootstrap_sched_rebuild_us
+```
+
+reuse them and map them into the transition CSV.
+
+Do not rename existing trace fields unless necessary.
+
+---
+
+## Amortization experiment
+
+Create a script:
+
+```text
+scripts/run_insightB_amortization.sh
+```
+
+Goal: show when switching is or is not worth it.
+
+Use one or two representative scenarios:
+
+### Scenario A: relaxed SLO
+
+```text
+Prefill: NPU burst, pp512
+Decode choices:
+  - stay NPU low_balanced
+  - switch GPU 734
+  - transition-aware planner
+Output lengths:
+  16, 32, 64, 128, 256
+```
+
+### Scenario B: tighter SLO
+
+```text
+Prefill: NPU burst, pp512
+Decode choices:
+  - NPU burst
+  - GPU 967
+  - CPU big2 2649600
+  - transition-aware planner
+Output lengths:
+  16, 32, 64, 128, 256
+```
+
+Record:
+
+```text
+strategy
+output_len
+prefill_state
+decode_state
+total_latency_ms
+ttft_ms
+avg_tbt_ms
+energy_mj
+slo_met
+transition_count
+transition_time_ms
+```
+
+Output:
+
+```text
+results/insightB/amortization.csv
+```
+
+If direct energy integration is not available, estimate:
+
+```text
+energy_total =
+  prefill_energy +
+  decode_tokens * decode_energy_per_token +
+  transition_energy_estimate
+```
+
+Use:
+
+```text
+transition_energy_estimate = target_active_power_mw * transition_time_ms / 1000
+```
+
+Clearly mark:
+
+```text
+energy_source = measured
+```
+
+or
+
+```text
+energy_source = estimated
+```
+
+Never mix measured and estimated values without marking them.
+
+---
+
+## Planner prototype
+
+If asked to implement a planner, implement:
+
+```text
+Context- and Amortization-Aware Frontier Selection
+```
+
+Use a profile table:
+
+```text
+results/insightB/context_decode_profile.csv
+```
+
+and a transition table:
+
+```text
+results/insightB/transition_cost.csv
+```
+
+Planner input:
+
+```cpp
+struct RuntimeCtx {
+    std::string model;
+    std::string current_state;
+    int context_len;
+    int remaining_tokens;
+    double slo_tbt_us;
+    double switch_slack_us;
+};
+```
+
+Planner output:
+
+```cpp
+struct PlannerDecision {
+    std::string target_state;
+    bool should_switch;
+    std::string reason;
+    double expected_energy_mj;
+    double expected_transition_us;
+};
+```
+
+Algorithm:
+
+```text
+1. Bucket context length.
+2. Load candidate states from the profile table.
+3. Filter states with TBT > SLO_TBT.
+4. Estimate total energy:
+     remaining_tokens * energy_mj_per_token + transition_energy_mj
+5. Pick the lowest-energy feasible state.
+6. If current state is feasible, switch only if:
+     energy_saving > transition_energy + guard
+   and:
+     transition_time <= switch_slack
+7. Apply hysteresis:
+     - immediate upshift on SLO violation
+     - conservative downshift only after stable slack window
+     - minimum switch interval in tokens
+```
+
+Do not use RL.
+Do not use online ILP.
+Do not use a large optimizer.
+This should be table-driven and lightweight.
+
+---
+
+## Planner overhead benchmark
+
+Create:
+
+```text
+scripts/bench_frontier_planner.py
+```
+
+Run 1000 or more planner decisions using synthetic contexts:
+
+```text
+context_len in [0, 512, 2048, 4096]
+remaining_tokens in [8, 16, 32, 64, 128, 256]
+slo_tbt_us from relaxed to tight
+```
+
+Report:
+
+```text
+median_us
+p95_us
+p99_us
+max_us
+```
+
+Output:
+
+```text
+results/insightB/planner_overhead.csv
+```
+
+The expected result should be microsecond-level or low-millisecond-level. If it is slower, explain why.
+
+---
+
+## Data quality rules
+
+For each experimental condition:
+
+1. Prefer 3 rounds minimum.
+2. If standard deviation is high, do not hide it.
+3. If power window fluctuation is high, mark the point as unstable.
+4. If CPU or GPU fails to hold requested frequency, mark:
+
+   ```text
+   freq_stable = 0
+   ```
+5. Do not use unstable high-frequency points as controllable operating points.
+6. If a state is infeasible under the SLO, mark it as infeasible rather than assigning a fake score.
+7. Keep baseline power separate from active power.
+8. For paper tables, use active plateau power unless explicitly doing whole-session energy.
+
+---
+
+## Required CSV schemas
+
+### `context_decode_profile.csv`
+
+```text
+date,model,backend,state_id,context_len,decode_tokens,rounds,throughput_tps,throughput_std,active_power_mw,power_std,energy_mj_per_token,tbt_us,temp_max_c,stable_range_pct,freq_stable,raw_log_path,sample_path
+```
+
+### `transition_cost.csv`
+
+```text
+date,model,context_len,from_state,to_state,rounds,total_blocking_us,first_token_gap_us,kv_handoff_us,route_apply_us,policy_apply_us,graph_rebuild_us,post_switch_tbt_us,switch_success_rate,fallback_count,raw_log_path
+```
+
+### `amortization.csv`
+
+```text
+date,model,scenario,strategy,output_len,prefill_state,decode_state,total_latency_ms,ttft_ms,avg_tbt_ms,energy_mj,energy_source,slo_tbt_us,slo_met,transition_count,transition_time_ms
+```
+
+### `planner_overhead.csv`
+
+```text
+date,iterations,median_us,p95_us,p99_us,max_us
+```
+
+---
+
+## Required Markdown summaries
+
+After each experiment, generate:
+
+```text
+docs/实验结果/InsightB_Context_Frontier_<date>.md
+docs/实验结果/InsightB_Transition_Cost_<date>.md
+docs/实验结果/InsightB_Amortization_<date>.md
+```
+
+Each summary must include:
+
+1. Experiment goal.
+2. Exact commands.
+3. Temperature range.
+4. Main result table.
+5. Anomalies.
+6. Raw output directories.
+7. Whether data is paper-ready or needs rerun.
+
+---
+
+## Expected paper interpretation
+
+Do not force a conclusion.
+
+If context length changes the frontier, the paper insight is:
+
+```text
+Decode frontiers drift with context length, so one-shot phase-boundary scheduling can become suboptimal.
+```
+
+If context length does not change the frontier much, the fallback insight is:
+
+```text
+The frontier is stable, but transitions are only profitable when the remaining output length amortizes the switching cost.
+```
+
+Both outcomes are useful.
+
+The final system story should be:
+
+```text
+Insight A:
+  Different SLOs expose an interleaved CPU/GPU/NPU decode frontier.
+
+Insight B:
+  Using the frontier online requires transition-aware decisions:
+  context length, remaining output length, and switching overhead decide whether moving to another state is worthwhile.
+
+Design:
+  Offline profile -> Pareto frontier -> transition table -> online amortized greedy selector.
+```
+
+---
+
+## What not to claim
+
+Do not claim:
+
+```text
+Host CPU policy coupling is a core insight.
+```
+
+Do not claim:
+
+```text
+NPU decode is always bad.
+```
+
+Do not claim:
+
+```text
+GPU is always better for decode.
+```
+
+Do not claim:
+
+```text
+Switching is always beneficial.
+```
+
+Do claim only what the measured data supports.
+
+---
+
+## Final response format after running tasks
+
+When reporting back, use this structure:
+
+```text
+Summary:
+- What was implemented
+- What was tested
+- Key results
+
+Changed files:
+- file1
+- file2
+
+Commands run:
+- command1
+- command2
+
+Output directories:
+- /tmp/...
+
+Data quality:
+- stable points
+- unstable points
+- reruns needed
+
+Next recommended step:
+- one concrete next action
+```
+
+```
+
+我建议你把 Codex 的第一个任务设成：**只做 `context_decode_profile.csv` 和 `transition_cost.csv`，先不实现完整 planner**。这两张表出来以后，就能判断 Insight B 应该走 “context frontier drift” 还是 “transition amortization”。
+```
