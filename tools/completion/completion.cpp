@@ -7,6 +7,7 @@
 #include "chat.h"
 
 #include <clocale>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -41,6 +42,18 @@ static std::ostringstream       * g_output_ss;
 static std::vector<llama_token> * g_output_tokens;
 static bool is_interacting  = false;
 static bool need_insert_eot = false;
+
+static bool llama_completion_fast_exit_requested() {
+    if (const char * value = std::getenv("LLAMA_COMPLETION_FAST_EXIT")) {
+        return value[0] != '\0' && std::strcmp(value, "0") != 0;
+    }
+
+#if defined(__ANDROID__)
+    return std::getenv("GGML_QNN_AOT_CONFIG") != nullptr;
+#else
+    return false;
+#endif
+}
 
 static void print_usage(int argc, char ** argv) {
     (void) argc;
@@ -992,6 +1005,15 @@ int main(int argc, char ** argv) {
 
     LOG("\n\n");
     common_perf_print(ctx, smpl);
+
+    // Android/QNN AoT currently aborts in libQnnHtpPrepare.so shared-library
+    // finalizers after generation has already completed and the final output is
+    // flushed. Bypass process teardown in this narrow CLI path so static
+    // validation remains usable while the vendor runtime issue persists.
+    if (llama_completion_fast_exit_requested()) {
+        fflush(nullptr);
+        std::_Exit(0);
+    }
 
     llama_backend_free();
 

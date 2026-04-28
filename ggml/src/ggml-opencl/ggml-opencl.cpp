@@ -108,6 +108,11 @@ static bool ggml_backend_opencl_use_direct_qnn_host_ptr_visibility(ggml_backend_
            ggml_backend_opencl_is_qnn_host_buffer(buffer);
 }
 
+static bool ggml_backend_opencl_skip_qnn_host_ptr_upload(ggml_backend_buffer_t buffer) {
+    return ggml_backend_opencl_use_direct_qnn_host_ptr_visibility(buffer) &&
+           ggml_backend_opencl_env_flag_enabled("GGML_OPENCL_EXPERIMENTAL_QNN_DIRECT_HOST_PTR_SKIP_UPLOAD");
+}
+
 // See https://gmplib.org/~tege/divcnst-pldi94.pdf figure 4.1.
 // Precompute mp (m' in the paper) and L such that division
 // can be computed using a multiply (high 32b of 64b result)
@@ -4101,11 +4106,14 @@ static bool ggml_backend_opencl_sync_external_host_buffer_timed(
         *backend_sync_us += ggml_time_us() - t_backend_sync_start_us;
     }
     if (host_to_device) {
-        if (ggml_backend_opencl_use_direct_qnn_host_ptr_visibility(buffer)) {
+        if (ggml_backend_opencl_skip_qnn_host_ptr_upload(buffer)) {
             backend_ctx->external_host_aliases_with_stale_host_mirror.erase(buffer);
             backend_ctx->external_host_aliases_pending_device_upload.erase(buffer);
-            GGML_LOG_INFO("%s: using experimental direct qnn-npu-host visibility without host->device upload\n", __func__);
+            GGML_LOG_WARN("%s: using unsafe experimental direct qnn-npu-host visibility without host->device upload\n", __func__);
             return true;
+        }
+        if (ggml_backend_opencl_use_direct_qnn_host_ptr_visibility(buffer)) {
+            GGML_LOG_INFO("%s: direct qnn-npu-host alias still requires explicit host->device upload for correctness\n", __func__);
         }
         const int64_t t_transfer_start_us = (transfer_us != nullptr) ? ggml_time_us() : 0;
         CL_CHECK(clEnqueueWriteBuffer(backend_ctx->queue, data_device, CL_TRUE, 0, size, base, 0, nullptr, nullptr));

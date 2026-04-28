@@ -200,6 +200,8 @@ llama_build_and_test(test-log.cpp)
 llama_build_and_test(test-memory-attn-v-trans.cpp)
 llama_build_and_test(test-context-qnn-request-gating.cpp)
 llama_build_and_test(test-context-qnn-phase-migration.cpp)
+llama_build(test-llama-bench-utils.cpp)
+llama_test(test-llama-bench-utils)
 llama_build_and_test(test-context-cpu-host-fallback.cpp)
 llama_build_and_test(test-model-loader-opencl-portability.cpp)
 llama_build_and_test(test-opencl-cpu-extra-copy.cpp)
@@ -207,6 +209,7 @@ llama_build_and_test(test-opencl-extra-metadata.cpp)
 llama_build_and_test(test-opencl-external-host-alias.cpp)
 llama_build_and_test(test-qnn-aot-pos-utils.cpp)
 llama_build_and_test(test-qnn-aot-kv-utils.cpp)
+llama_build_and_test(test-qnn-aot-lazy-transformer-init.cpp)
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp

@@ -229,7 +229,8 @@ class qnn_aot_runtime {
     qnn_aot_graph * select_attention_graph(size_t start_layer_id, size_t end_layer_id, size_t n_tokens) const;
     qnn_aot_graph * select_attn_proj_graph(size_t n_tokens, size_t layer_id);
     qnn_aot_graph * select_attn_core_graph(size_t n_tokens, size_t layer_id);
-    const graph_bucket * select_transformer_graphs(size_t n_tokens) const;
+    graph_bucket * select_transformer_graphs(size_t n_tokens);
+    graph_bucket * ensure_transformer_graph_bucket_loaded(size_t batch_size);
     qnn_aot_graph * select_ffn_graph(size_t n_tokens, size_t layer_id);
     qnn_aot_graph * select_lm_head_graph(size_t n_tokens);
     qnn_aot_graph * select_graph(const std::vector<qnn_aot_graph_config> & configs,
@@ -257,6 +258,7 @@ class qnn_aot_runtime {
                                        std::vector<pending_generic_kv_writeback_layer> & payloads) const;
     bool stage_generic_kv_from_graph(qnn_aot_graph & graph, const aot_match_result & match, size_t token_offset, size_t n_tokens);
     bool write_generic_kv_from_graph(qnn_aot_graph & graph, const aot_match_result & match, size_t token_offset, size_t n_tokens);
+    bool load_seed_kv_into_graph(qnn_aot_graph & graph);
     bool load_seed_kv();
     std::string resolve_model_path(const std::string & relative_path) const;
 

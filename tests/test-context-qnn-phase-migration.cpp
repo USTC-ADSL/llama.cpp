@@ -308,7 +308,7 @@ int main() {
                         /* experimental_enabled = */ true));
     });
 
-    t.test("dynamic qnn prefill and opencl decode can prewarm the direct host-ptr kv alias when the experiment is enabled", [](testing & t) {
+    t.test("dynamic qnn prefill and opencl decode do not prewarm direct host-ptr aliases before qnn writes kv", [](testing & t) {
         const auto allocated = llama_dynamic_phase_shared_qnn_kv_contract(
                 "qnn-npu",
                 "opencl",
@@ -316,8 +316,8 @@ int main() {
                 /* opencl_can_alias_qnn_host = */ true);
 
         t.assert_true(
-                "the qnn->opencl direct-host-ptr experiment should allow eager alias creation for the dynamic decode handoff",
-                llama_context_should_prewarm_dynamic_qnn_opencl_kv_aliases(
+                "qnn->opencl alias prewarm happens before qnn prefill writes KV, so it must stay disabled unless a separate alias-only prewarm path exists",
+                !llama_context_should_prewarm_dynamic_qnn_opencl_kv_aliases(
                         "qnn-npu",
                         "opencl",
                         /* generic_kv_enabled = */ true,

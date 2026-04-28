@@ -226,13 +226,17 @@ bool llama_context_should_prewarm_dynamic_qnn_opencl_kv_aliases(
         bool                generic_kv_enabled,
         const llama_hetero_kv_contract & allocated_kv_contract,
         bool                experimental_enabled) {
-    return llama_context_should_try_qnn_opencl_direct_host_ptr_visibility(
-            prefill_attn_backend,
-            decode_attn_backend,
-            1,
-            generic_kv_enabled,
-            allocated_kv_contract,
-            experimental_enabled);
+    (void) prefill_attn_backend;
+    (void) decode_attn_backend;
+    (void) generic_kv_enabled;
+    (void) allocated_kv_contract;
+    (void) experimental_enabled;
+
+    // The existing sync API creates the alias and publishes host contents in one
+    // call. Running it during context construction is too early for qnn->opencl:
+    // QNN has not written the prefill KV yet, so a correct prewarm needs a
+    // separate alias-only path.
+    return false;
 }
 
 namespace {
@@ -2387,6 +2391,10 @@ const llama_cparams & llama_context::get_cparams() const {
 
 ggml_backend_sched_t llama_context::get_sched() const {
     return sched.get();
+}
+
+const std::vector<ggml_backend_t> & llama_context::get_backend_ptrs() const {
+    return backend_ptrs;
 }
 
 uint32_t llama_context::n_ctx() const {

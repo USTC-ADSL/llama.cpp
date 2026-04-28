@@ -1,4 +1,5 @@
 #include "aot.hpp"
+#include "aot-init-policy.hpp"
 #include "aot-kv-utils.hpp"
 #include "aot-pos-utils.hpp"
 
@@ -2550,8 +2551,15 @@ bool qnn_aot_runtime::initialize(const std::string & config_path, const std::str
     };
 
     if (!_config.transformer_graphs.empty() &&
+        qnn_aot_graph_family_uses_eager_init("transformers") &&
         !load_graph_family(_config.transformer_graphs, _transformer_graphs, "transformer")) {
         return false;
+    }
+
+    if (!_config.transformer_graphs.empty() &&
+        !qnn_aot_graph_family_uses_eager_init("transformers") &&
+        aot_trace_bind_enabled()) {
+        QNN_LOG_INFO("[aot] deferring transformer graph initialization until first use\n");
     }
 
     if (!_config.attention_graphs.empty() &&
@@ -3865,31 +3873,65 @@ qnn_aot_graph * qnn_aot_runtime::select_attention_graph(size_t start_layer_id, s
     return best_ge != nullptr ? best_ge : best_lt;
 }
 
-const qnn_aot_runtime::graph_bucket * qnn_aot_runtime::select_transformer_graphs(size_t n_tokens) const {
-    if (_transformer_graphs.empty()) {
+qnn_aot_runtime::graph_bucket * qnn_aot_runtime::ensure_transformer_graph_bucket_loaded(size_t batch_size) {
+    bool has_matching_config = false;
+    for (const auto & graph_config : _config.transformer_graphs) {
+        if (graph_config.batch_size != batch_size) {
+            continue;
+        }
+
+        has_matching_config = true;
+        if (ensure_graph_loaded(graph_config, _transformer_graphs) == nullptr) {
+            return nullptr;
+        }
+    }
+
+    if (!has_matching_config) {
         return nullptr;
     }
 
-    const auto bucket_has_graph = [](const graph_bucket & bucket) {
-        return std::any_of(bucket.begin(), bucket.end(), [](const auto & graph) {
-            return graph != nullptr;
-        });
-    };
+    auto bucket_it = _transformer_graphs.find(batch_size);
+    return bucket_it != _transformer_graphs.end() ? &bucket_it->second : nullptr;
+}
+
+qnn_aot_runtime::graph_bucket * qnn_aot_runtime::select_transformer_graphs(size_t n_tokens) {
+    if (_config.transformer_graphs.empty()) {
+        return nullptr;
+    }
 
     const size_t target_tokens = std::max<size_t>(1, n_tokens);
-    for (auto it = _transformer_graphs.lower_bound(target_tokens); it != _transformer_graphs.end(); ++it) {
-        if (bucket_has_graph(it->second)) {
-            return &it->second;
+    bool have_ge = false;
+    bool have_lt = false;
+    size_t best_ge = 0;
+    size_t best_lt = 0;
+    size_t last_batch = std::numeric_limits<size_t>::max();
+
+    for (const auto & config : _config.transformer_graphs) {
+        if (config.batch_size == last_batch) {
+            continue;
+        }
+        last_batch = config.batch_size;
+
+        if (config.batch_size >= target_tokens) {
+            if (!have_ge || config.batch_size < best_ge) {
+                best_ge = config.batch_size;
+                have_ge = true;
+            }
+            continue;
+        }
+
+        if (!have_lt || config.batch_size > best_lt) {
+            best_lt = config.batch_size;
+            have_lt = true;
         }
     }
 
-    for (auto it = _transformer_graphs.rbegin(); it != _transformer_graphs.rend(); ++it) {
-        if (it->first >= target_tokens) {
-            continue;
-        }
-        if (bucket_has_graph(it->second)) {
-            return &it->second;
-        }
+    if (have_ge) {
+        return ensure_transformer_graph_bucket_loaded(best_ge);
+    }
+
+    if (have_lt) {
+        return ensure_transformer_graph_bucket_loaded(best_lt);
     }
 
     return nullptr;
@@ -3936,6 +3978,10 @@ qnn_aot_graph * qnn_aot_runtime::ensure_graph_loaded(const qnn_aot_graph_config 
 
     auto graph = std::make_unique<qnn_aot_graph>(_instance, context_it->second, runtime_config, sibling);
     if (!graph->is_valid()) {
+        return nullptr;
+    }
+
+    if (_seed_kv_loaded && _seed_kv_size > 0 && !load_seed_kv_into_graph(*graph)) {
         return nullptr;
     }
 
@@ -4825,20 +4871,7 @@ std::string qnn_aot_runtime::format_kv_path(const qnn_aot_graph_config & config,
     return resolve_model_path(relative);
 }
 
-bool qnn_aot_runtime::load_seed_kv() {
-    _seed_kv_loaded = false;
-
-    if (!aot_seed_kv_enabled()) {
-        if (aot_trace_bind_enabled()) {
-            QNN_LOG_INFO("[aot] seed KV loading disabled by GGML_QNN_AOT_DISABLE_SEED_KV\n");
-        }
-        return false;
-    }
-
-    if (_seed_kv_size == 0) {
-        return true;
-    }
-
+bool qnn_aot_runtime::load_seed_kv_into_graph(qnn_aot_graph & graph) {
     auto convert_and_store = [](char * dst,
                                 size_t elem_size,
                                 Qnn_DataType_t dtype,
@@ -4868,94 +4901,107 @@ bool qnn_aot_runtime::load_seed_kv() {
         }
     };
 
-    auto load_graph_seed_kv = [&](qnn_aot_graph & graph) -> bool {
-        const auto & graph_config = graph.config();
-        if (graph_config.kv_size == 0) {
-            return true;
-        }
+    const auto & graph_config = graph.config();
+    if (graph_config.kv_size == 0) {
+        return true;
+    }
 
-        for (size_t layer = graph_config.start_layer_id; layer < graph_config.end_layer_id; ++layer) {
-            for (size_t head = 0; head < _config.model.n_kv_heads; ++head) {
-                const auto key_cache_name   = std::string("layer_") + std::to_string(layer) + "_key_t_cache_" + std::to_string(head);
-                const auto value_cache_name = std::string("layer_") + std::to_string(layer) + "_value_cache_" + std::to_string(head);
+    for (size_t layer = graph_config.start_layer_id; layer < graph_config.end_layer_id; ++layer) {
+        for (size_t head = 0; head < _config.model.n_kv_heads; ++head) {
+            const auto key_cache_name   = std::string("layer_") + std::to_string(layer) + "_key_t_cache_" + std::to_string(head);
+            const auto value_cache_name = std::string("layer_") + std::to_string(layer) + "_value_cache_" + std::to_string(head);
 
-                auto * key_cache   = static_cast<char *>(graph.buffer_data(key_cache_name));
-                auto * value_cache = static_cast<char *>(graph.buffer_data(value_cache_name));
-                if (!key_cache || !value_cache) {
-                    QNN_LOG_WARN("[aot] missing seed KV cache buffers for layer=%zu head=%zu\n", layer, head);
+            auto * key_cache   = static_cast<char *>(graph.buffer_data(key_cache_name));
+            auto * value_cache = static_cast<char *>(graph.buffer_data(value_cache_name));
+            if (!key_cache || !value_cache) {
+                QNN_LOG_WARN("[aot] missing seed KV cache buffers for layer=%zu head=%zu\n", layer, head);
+                return false;
+            }
+
+            const size_t head_dim = _config.model.head_dim;
+            const size_t key_elem_size = graph.buffer_size(key_cache_name) / (graph_config.cache_size * head_dim);
+            const size_t value_elem_size = graph.buffer_size(value_cache_name) / (graph_config.cache_size * head_dim);
+            const auto key_dtype = graph.tensor_data_type(key_cache_name);
+            const auto value_dtype = graph.tensor_data_type(value_cache_name);
+
+            const auto key_path = format_kv_path(graph_config, layer, "key", head);
+            const auto value_path = format_kv_path(graph_config, layer, "value", head);
+            mapped_file key_file(key_path);
+            mapped_file value_file(value_path);
+
+            const size_t expected_bytes = graph_config.kv_size * head_dim * sizeof(float);
+            if (!key_file.is_valid() || key_file.size < expected_bytes || !value_file.is_valid() || value_file.size < expected_bytes) {
+                if (!_seed_kv_missing_warned) {
+                    QNN_LOG_WARN("[aot] seed KV files missing or truncated for config %s (need kv_size=%zu). "
+                                 "Expected files like %s and %s. Runtime will continue from an empty cache, "
+                                 "which does not match PowerServe artifacts.\n",
+                                 _config_path.c_str(),
+                                 _seed_kv_size,
+                                 key_path.c_str(),
+                                 value_path.c_str());
+                    _seed_kv_missing_warned = true;
+                }
+                return false;
+            }
+
+            const auto * key_src = static_cast<const float *>(key_file.data);
+            const auto * value_src = static_cast<const float *>(value_file.data);
+
+            const size_t key_dst_stride = graph_config.cache_size * key_elem_size;
+            const size_t value_row_bytes = head_dim * value_elem_size;
+            for (size_t token = 0; token < graph_config.kv_size; ++token) {
+                if (!convert_and_store(key_cache + token * key_elem_size,
+                                       key_elem_size,
+                                       key_dtype,
+                                       key_src + token * head_dim,
+                                       head_dim,
+                                       key_dst_stride)) {
+                    QNN_LOG_WARN("[aot] unsupported key cache dtype %d for layer=%zu head=%zu\n",
+                                 (int) key_dtype, layer, head);
                     return false;
                 }
 
-                const size_t head_dim = _config.model.head_dim;
-                const size_t key_elem_size = graph.buffer_size(key_cache_name) / (graph_config.cache_size * head_dim);
-                const size_t value_elem_size = graph.buffer_size(value_cache_name) / (graph_config.cache_size * head_dim);
-                const auto key_dtype = graph.tensor_data_type(key_cache_name);
-                const auto value_dtype = graph.tensor_data_type(value_cache_name);
-
-                const auto key_path = format_kv_path(graph_config, layer, "key", head);
-                const auto value_path = format_kv_path(graph_config, layer, "value", head);
-                mapped_file key_file(key_path);
-                mapped_file value_file(value_path);
-
-                const size_t expected_bytes = graph_config.kv_size * head_dim * sizeof(float);
-                if (!key_file.is_valid() || key_file.size < expected_bytes || !value_file.is_valid() || value_file.size < expected_bytes) {
-                    if (!_seed_kv_missing_warned) {
-                        QNN_LOG_WARN("[aot] seed KV files missing or truncated for config %s (need kv_size=%zu). "
-                                     "Expected files like %s and %s. Runtime will continue from an empty cache, "
-                                     "which does not match PowerServe artifacts.\n",
-                                     _config_path.c_str(),
-                                     _seed_kv_size,
-                                     key_path.c_str(),
-                                     value_path.c_str());
-                        _seed_kv_missing_warned = true;
-                    }
+                if (!convert_and_store(value_cache + token * value_row_bytes,
+                                       value_elem_size,
+                                       value_dtype,
+                                       value_src + token * head_dim,
+                                       head_dim,
+                                       value_elem_size)) {
+                    QNN_LOG_WARN("[aot] unsupported value cache dtype %d for layer=%zu head=%zu\n",
+                                 (int) value_dtype, layer, head);
                     return false;
-                }
-
-                const auto * key_src = static_cast<const float *>(key_file.data);
-                const auto * value_src = static_cast<const float *>(value_file.data);
-
-                const size_t key_dst_stride = graph_config.cache_size * key_elem_size;
-                const size_t value_row_bytes = head_dim * value_elem_size;
-                for (size_t token = 0; token < graph_config.kv_size; ++token) {
-                    if (!convert_and_store(key_cache + token * key_elem_size,
-                                           key_elem_size,
-                                           key_dtype,
-                                           key_src + token * head_dim,
-                                           head_dim,
-                                           key_dst_stride)) {
-                        QNN_LOG_WARN("[aot] unsupported key cache dtype %d for layer=%zu head=%zu\n",
-                                     (int) key_dtype, layer, head);
-                        return false;
-                    }
-
-                    if (!convert_and_store(value_cache + token * value_row_bytes,
-                                           value_elem_size,
-                                           value_dtype,
-                                           value_src + token * head_dim,
-                                           head_dim,
-                                           value_elem_size)) {
-                        QNN_LOG_WARN("[aot] unsupported value cache dtype %d for layer=%zu head=%zu\n",
-                                     (int) value_dtype, layer, head);
-                        return false;
-                    }
                 }
             }
         }
+    }
 
+    return true;
+}
+
+bool qnn_aot_runtime::load_seed_kv() {
+    _seed_kv_loaded = false;
+
+    if (!aot_seed_kv_enabled()) {
+        if (aot_trace_bind_enabled()) {
+            QNN_LOG_INFO("[aot] seed KV loading disabled by GGML_QNN_AOT_DISABLE_SEED_KV\n");
+        }
+        return false;
+    }
+
+    if (_seed_kv_size == 0) {
         return true;
-    };
+    }
 
     for (const auto & graph_group : _transformer_graphs) {
         for (const auto & graph_ptr : graph_group.second) {
-            if (graph_ptr && !load_graph_seed_kv(*graph_ptr)) {
+            if (graph_ptr && !load_seed_kv_into_graph(*graph_ptr)) {
                 return false;
             }
         }
     }
 
     for (const auto & graph_ptr : _attention_graphs) {
-        if (graph_ptr && !load_graph_seed_kv(*graph_ptr)) {
+        if (graph_ptr && !load_seed_kv_into_graph(*graph_ptr)) {
             return false;
         }
     }

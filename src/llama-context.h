@@ -83,6 +83,7 @@ struct llama_context {
     const llama_cparams & get_cparams() const;
 
     ggml_backend_sched_t get_sched() const;
+    const std::vector<ggml_backend_t> & get_backend_ptrs() const;
 
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;

@@ -20,7 +20,8 @@ PROMPT='Write two concise sentences explaining why the sky looks blue during the
 - QNN runs should use `qnn-npu` plus AoT graphs. Do not use `HTP0`, `qnn-cpu`, or `qnn-gpu`.
 - Current Qwen2-3B AoT artifact should be run with `GGML_QNN_AOT_DISABLE_SEED_KV=1`; otherwise the baked 11-token seed KV can corrupt first-token semantics and dynamic-switch validation.
 - When measuring `qnn-npu -> GPUOpenCL` switch overhead on this branch, also enable `GGML_HETERO_DYNAMIC_DECODE_TG_ONLY_RESERVE=1` to avoid paying the full `pp -> tg -> pp` reserve path during a one-token decode switch.
-- When measuring `qnn-npu -> GPUOpenCL` shared-KV handoff on this branch, enable `GGML_OPENCL_EXPERIMENTAL_QNN_DIRECT_HOST_PTR=1` together with `GGML_QNN_AOT_WRITE_GENERIC_KV=1`; the first OpenCL alias can then be prewarmed during context construction instead of being charged to the first decode token.
+- When measuring `qnn-npu -> GPUOpenCL` shared-KV handoff on this branch, enable `GGML_OPENCL_EXPERIMENTAL_QNN_DIRECT_HOST_PTR=1` together with `GGML_QNN_AOT_WRITE_GENERIC_KV=1`, but do not prewarm the OpenCL alias during context construction. QNN has not written prefill KV at that point, and reusing that early alias can corrupt decode semantics.
+- To measure the experimental no-upload lower bound after QNN prefill, additionally set `GGML_OPENCL_EXPERIMENTAL_QNN_DIRECT_HOST_PTR_SKIP_UPLOAD=1`; treat this as a validation-only path and check generated text semantics on each device.
 - Before formal device testing, rebuild once on host with `./build-npu-opencl.sh`.
 
 ## 1. Static Semantic Checks
@@ -215,6 +216,7 @@ For the `qnn->opencl` path on this branch, the script should be run with:
 - `GGML_QNN_AOT_WRITE_GENERIC_KV=1`
 - `GGML_QNN_AOT_DISABLE_SEED_KV=1`
 - `GGML_OPENCL_EXPERIMENTAL_QNN_DIRECT_HOST_PTR=1`
+- Optional lower-bound validation only: `GGML_OPENCL_EXPERIMENTAL_QNN_DIRECT_HOST_PTR_SKIP_UPLOAD=1`
 - `GGML_HETERO_DYNAMIC_DECODE_TG_ONLY_RESERVE=1`
 
 ```sh
