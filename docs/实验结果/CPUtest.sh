@@ -12,6 +12,7 @@ GEN_TOKENS="${GEN_TOKENS:-128}"
 CONTEXT_TOKENS="${CONTEXT_TOKENS:-2048}"
 BATCH_TOKENS="${BATCH_TOKENS:-1}"
 UBATCH_TOKENS="${UBATCH_TOKENS:-1}"
+DEPTH_TOKENS="${DEPTH_TOKENS:-0}"
 BENCH_REPEATS="${BENCH_REPEATS:-3}"
 MMAP="${MMAP:-0}"
 LLAMA_BENCH_FAST_EXIT_VALUE="${LLAMA_BENCH_FAST_EXIT_VALUE:-1}"
@@ -813,6 +814,7 @@ taskset ${taskset_mask} ./llama-bench -v \
   -m ${MODEL_PATH} \
   -ngl ${NGL} -t ${threads} \
   -p ${PROMPT_TOKENS} -n ${GEN_TOKENS} \
+  -d ${DEPTH_TOKENS} \
   -c ${CONTEXT_TOKENS} -b ${BATCH_TOKENS} -ub ${UBATCH_TOKENS} \
   -r ${BENCH_REPEATS} \
   --no-warmup --mmap ${MMAP}" > "${bench_log}" 2>&1 &
@@ -1088,7 +1090,7 @@ main() {
 
     log "run build-npu-opencl.sh before formal measurements when binary freshness matters"
     log "output dir: ${OUTPUT_DIR}"
-    log "decode bench: -ngl ${NGL} -p ${PROMPT_TOKENS} -n ${GEN_TOKENS} -c ${CONTEXT_TOKENS} -b ${BATCH_TOKENS} -ub ${UBATCH_TOKENS} -r ${BENCH_REPEATS}"
+    log "decode bench: -ngl ${NGL} -p ${PROMPT_TOKENS} -n ${GEN_TOKENS} -d ${DEPTH_TOKENS} -c ${CONTEXT_TOKENS} -b ${BATCH_TOKENS} -ub ${UBATCH_TOKENS} -r ${BENCH_REPEATS}"
     log "cpu governor for frequency pinning: ${CPU_PIN_GOVERNOR}"
     log "temperature limit: ${TEMP_LIMIT_C}C"
 

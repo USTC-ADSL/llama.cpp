@@ -15,6 +15,7 @@ NGL="${NGL:-99}"
 PROMPT_TOKENS="${PROMPT_TOKENS:-32}"
 GEN_TOKENS="${GEN_TOKENS:-0}"
 CONTEXT_TOKENS="${CONTEXT_TOKENS:-1024}"
+DEPTH_TOKENS="${DEPTH_TOKENS:-0}"
 BENCH_REPEATS="${BENCH_REPEATS:-100}"
 MMAP="${MMAP:-0}"
 
@@ -42,6 +43,11 @@ GPU_MAX_FREQ_PATH="${GPU_MAX_FREQ_PATH:-}"
 GPU_CUR_FREQ_PATH="${GPU_CUR_FREQ_PATH:-}"
 GPU_GOVERNOR_PATH="${GPU_GOVERNOR_PATH:-}"
 GPU_PIN_GOVERNOR="${GPU_PIN_GOVERNOR:-}"
+
+QNN_AOT_CONFIG="${QNN_AOT_CONFIG:-${GGML_QNN_AOT_CONFIG:-${QNN_DIR:+${QNN_DIR}/config.json}}}"
+QNN_AOT_MODEL_DIR="${QNN_AOT_MODEL_DIR:-${GGML_QNN_AOT_MODEL_DIR:-${QNN_DIR}}}"
+QNN_AOT_WRITE_GENERIC_KV="${QNN_AOT_WRITE_GENERIC_KV:-1}"
+QNN_AOT_DISABLE_SEED_KV="${QNN_AOT_DISABLE_SEED_KV:-1}"
 
 BATTERY_VOLTAGE_PATH="${BATTERY_VOLTAGE_PATH:-}"
 BATTERY_CURRENT_PATH="${BATTERY_CURRENT_PATH:-}"
@@ -194,7 +200,19 @@ check_device_online() {
 require_runtime_inputs() {
     [[ -n "${DEVICE}" ]] || die "DEVICE must be set"
     [[ -n "${MODEL_PATH}" ]] || die "MODEL_PATH must be set"
-    [[ -n "${QNN_DIR}" ]] || die "QNN_DIR must be set"
+}
+
+build_remote_qnn_env() {
+    local out=""
+    if [[ -n "${QNN_AOT_CONFIG}" ]]; then
+        out="${out}export GGML_QNN_AOT_CONFIG=${QNN_AOT_CONFIG} && "
+    fi
+    if [[ -n "${QNN_AOT_MODEL_DIR}" ]]; then
+        out="${out}export GGML_QNN_AOT_MODEL_DIR=${QNN_AOT_MODEL_DIR} && "
+    fi
+    out="${out}export GGML_QNN_AOT_WRITE_GENERIC_KV=${QNN_AOT_WRITE_GENERIC_KV} && "
+    out="${out}export GGML_QNN_AOT_DISABLE_SEED_KV=${QNN_AOT_DISABLE_SEED_KV} && "
+    printf '%s' "${out}"
 }
 
 save_display_state() {
@@ -365,15 +383,13 @@ export LD_LIBRARY_PATH=${QNN_BIN} && \
 export ADSP_LIBRARY_PATH=${QNN_BIN} && \
 export GGML_HEXAGON_EXPERIMENTAL=1 && \
 export GGML_QNN_HTP_WORKPOINT=${HTP_WORKPOINT} && \
-export GGML_QNN_AOT_CONFIG=${QNN_DIR}/config.json && \
-export GGML_QNN_AOT_MODEL_DIR=${QNN_DIR} && \
-export GGML_QNN_AOT_WRITE_GENERIC_KV=1 && \
-export GGML_QNN_AOT_DISABLE_SEED_KV=1 && \
+$(build_remote_qnn_env)\
 export LLAMA_BENCH_FAST_EXIT=1 && \
 taskset ${TASKSET_MASK} ./llama-bench -v \
   -m ${MODEL_PATH} \
   -ngl ${NGL} -dev ${LLAMA_DEV} -t ${LLAMA_THREADS} \
   -p ${PROMPT_TOKENS} -n ${GEN_TOKENS} \
+  -d ${DEPTH_TOKENS} \
   -c ${CONTEXT_TOKENS} -r ${BENCH_REPEATS} \
   --no-warmup --mmap ${MMAP}" > "${bench_log}" 2>&1 &
     REMOTE_BENCH_PID=$!
@@ -510,15 +526,13 @@ export LD_LIBRARY_PATH=${QNN_BIN} &&
 export ADSP_LIBRARY_PATH=${QNN_BIN} &&
 export GGML_HEXAGON_EXPERIMENTAL=1 &&
 export GGML_QNN_HTP_WORKPOINT=${HTP_WORKPOINT} &&
-export GGML_QNN_AOT_CONFIG=${QNN_DIR}/config.json &&
-export GGML_QNN_AOT_MODEL_DIR=${QNN_DIR} &&
-export GGML_QNN_AOT_WRITE_GENERIC_KV=1 &&
-export GGML_QNN_AOT_DISABLE_SEED_KV=1 &&
+$(build_remote_qnn_env)
 export LLAMA_BENCH_FAST_EXIT=1 &&
 taskset ${TASKSET_MASK} ./llama-bench -v \
     -m ${MODEL_PATH} \
     -ngl ${NGL} -dev ${LLAMA_DEV} -t ${LLAMA_THREADS} \
     -p ${PROMPT_TOKENS} -n ${GEN_TOKENS} \
+    -d ${DEPTH_TOKENS} \
     -c ${CONTEXT_TOKENS} -r ${BENCH_REPEATS} \
     --no-warmup --mmap ${MMAP} > ${REMOTE_BENCH_LOG} 2>&1 &
 bench_pid=\$!
@@ -791,6 +805,7 @@ main() {
     log "run build-npu-opencl.sh before real measurements to keep the binary consistent with the experiment setup"
     log "output dir: ${OUTPUT_DIR}"
     log "frequencies: ${GPU_FREQS[*]}"
+    log "decode bench: -ngl ${NGL} -dev ${LLAMA_DEV} -p ${PROMPT_TOKENS} -n ${GEN_TOKENS} -d ${DEPTH_TOKENS} -c ${CONTEXT_TOKENS} -r ${BENCH_REPEATS}"
     log "temperature limit: ${TEMP_LIMIT_C}C"
 
     local freq_hz
