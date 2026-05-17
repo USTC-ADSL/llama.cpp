@@ -678,6 +678,19 @@ bool ggml_backend_qnn_aot_reset_state(ggml_backend_t backend) {
     return true;
 }
 
+bool ggml_backend_qnn_set_htp_workpoint(ggml_backend_t backend, const char * workpoint) {
+    if (backend == nullptr || backend->device == nullptr || workpoint == nullptr || workpoint[0] == '\0') {
+        return false;
+    }
+
+    auto * device_ctx = reinterpret_cast<qnn::ggml_backend_qnn_device_context *>(backend->device->context);
+    if (device_ctx == nullptr || device_ctx->device != QNN_BACKEND_NPU || device_ctx->instance == nullptr) {
+        return false;
+    }
+
+    return device_ctx->instance->set_htp_power_workpoint(workpoint) == 0;
+}
+
 backend_device_proxy_ptr create_qnn_backend_context(backend_index_type device) {
     if (device >= QNN_BACKEND_COUNT) {
         QNN_LOG_ERROR("[qnn]invalid device %d\n", device);

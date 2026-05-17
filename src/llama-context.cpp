@@ -82,6 +82,13 @@ bool llama_context_should_prewarm_dynamic_qnn_opencl_kv_aliases(
         const llama_hetero_kv_contract & allocated_kv_contract,
         bool                experimental_enabled);
 
+bool llama_context_should_apply_qnn_workpoint_switch(
+        const llama_hetero_route_spec & current_route,
+        const llama_hetero_route_spec & target_route,
+        uint32_t                        n_tokens,
+        const std::string &             current_workpoint,
+        const char *                    target_workpoint);
+
 llama_hetero_kv_contract llama_dynamic_phase_migration_kv_contract(
         const std::string & producer_backend,
         const std::string & consumer_backend,
@@ -239,11 +246,75 @@ bool llama_context_should_prewarm_dynamic_qnn_opencl_kv_aliases(
     return false;
 }
 
+static std::string llama_context_canonical_qnn_workpoint(const char * value) {
+    std::string normalized;
+    if (value == nullptr) {
+        return normalized;
+    }
+
+    for (const unsigned char c : std::string(value)) {
+        if (std::isalnum(c) != 0) {
+            normalized.push_back(static_cast<char>(std::tolower(c)));
+        }
+    }
+
+    if (normalized == "max" || normalized == "performance") {
+        return "burst";
+    }
+    if (normalized == "highperformance" || normalized == "sustainedhighperformance") {
+        return "high_performance";
+    }
+    if (normalized == "default") {
+        return "balanced";
+    }
+    if (normalized == "lowbalanced") {
+        return "low_balanced";
+    }
+    if (normalized == "highpowersaver") {
+        return "high_power_saver";
+    }
+    if (normalized == "powersaver") {
+        return "power_saver";
+    }
+    if (normalized == "lowpowersaver") {
+        return "low_power_saver";
+    }
+    if (normalized == "extremepowersaver") {
+        return "extreme_power_saver";
+    }
+
+    return normalized;
+}
+
+bool llama_context_should_apply_qnn_workpoint_switch(
+        const llama_hetero_route_spec & current_route,
+        const llama_hetero_route_spec & target_route,
+        uint32_t                        n_tokens,
+        const std::string &             current_workpoint,
+        const char *                    target_workpoint) {
+    if (n_tokens != 1 || target_workpoint == nullptr || target_workpoint[0] == '\0') {
+        return false;
+    }
+
+    const std::string current_backend =
+        llama_hetero_canonical_backend(llama_hetero_phase_backend_for_route(current_route));
+    const std::string target_backend =
+        llama_hetero_canonical_backend(llama_hetero_phase_backend_for_route(target_route));
+    if (current_backend != "qnn-npu" || target_backend != "qnn-npu") {
+        return false;
+    }
+
+    const std::string current = llama_context_canonical_qnn_workpoint(current_workpoint.c_str());
+    const std::string target  = llama_context_canonical_qnn_workpoint(target_workpoint);
+    return !target.empty() && current != target;
+}
+
 namespace {
 
 using ggml_backend_qnn_aot_has_pending_generic_kv_writeback_t = bool (*)(ggml_backend_t backend);
 using ggml_backend_qnn_aot_flush_pending_generic_kv_writeback_t = bool (*)(ggml_backend_t backend);
 using ggml_backend_qnn_aot_reset_state_t = bool (*)(ggml_backend_t backend);
+using ggml_backend_qnn_set_htp_workpoint_t = bool (*)(ggml_backend_t backend, const char * workpoint);
 
 bool hetero_dynamic_trace_timing_enabled() {
     static int enabled = -1;
@@ -1641,6 +1712,78 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         hetero_phase_trace.route_reason = decision.reason;
     }
 
+    const std::string target_route = llama_hetero_format_route_spec(decision.plan.route);
+    const char * decode_qnn_workpoint = std::getenv("GGML_HETERO_DYNAMIC_DECODE_QNN_WORKPOINT");
+    if (qnn_htp_current_workpoint.empty()) {
+        const char * initial_workpoint = std::getenv("GGML_QNN_HTP_WORKPOINT");
+        if (initial_workpoint == nullptr || initial_workpoint[0] == '\0') {
+            initial_workpoint = std::getenv("GGML_QNN_HTP_POWER_MODE");
+        }
+        qnn_htp_current_workpoint = llama_context_canonical_qnn_workpoint(initial_workpoint);
+    }
+
+    if (!decision.should_apply &&
+        llama_context_should_apply_qnn_workpoint_switch(
+                hetero_plan.route,
+                decision.plan.route,
+                n_tokens,
+                qnn_htp_current_workpoint,
+                decode_qnn_workpoint)) {
+        ggml_backend_t qnn_backend = find_backend_for_route("qnn-npu");
+        bool applied = false;
+        const int64_t t_qnn_workpoint_start_us = trace_timing ? ggml_time_us() : 0;
+        if (qnn_backend != nullptr) {
+            auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(qnn_backend));
+            auto * set_workpoint_fn =
+                reg != nullptr
+                    ? (ggml_backend_qnn_set_htp_workpoint_t)
+                          ggml_backend_reg_get_proc_address(reg, "ggml_backend_qnn_set_htp_workpoint")
+                    : nullptr;
+            if (set_workpoint_fn != nullptr) {
+                applied = set_workpoint_fn(qnn_backend, decode_qnn_workpoint);
+            } else {
+                LLAMA_LOG_ERROR("%s: qnn backend does not expose ggml_backend_qnn_set_htp_workpoint\n", __func__);
+            }
+        } else {
+            LLAMA_LOG_ERROR("%s: qnn-npu backend unavailable for runtime HTP workpoint switch\n", __func__);
+        }
+        const int64_t t_qnn_workpoint_end_us = trace_timing ? ggml_time_us() : 0;
+        const int64_t qnn_workpoint_apply_us =
+            trace_timing ? t_qnn_workpoint_end_us - t_qnn_workpoint_start_us : 0;
+
+        if (trace_timing && hetero_phase_trace.active) {
+            hetero_phase_trace.route_applied = applied;
+            hetero_phase_trace.route_noop = true;
+            hetero_phase_trace.route_apply_us = 0;
+            hetero_phase_trace.qnn_workpoint_apply_us = qnn_workpoint_apply_us;
+            hetero_phase_trace.route_label = decision.plan_label.empty() ? "decode" : decision.plan_label;
+            hetero_phase_trace.route_reason = applied ? "qnn-workpoint-only" : "qnn-workpoint-apply-failed";
+            hetero_phase_trace.target_route = target_route;
+        }
+
+        if (applied) {
+            qnn_htp_current_workpoint = llama_context_canonical_qnn_workpoint(decode_qnn_workpoint);
+            dynamic_route_state.route_switches++;
+            LLAMA_LOG_INFO("%s: applied qnn HTP workpoint switch to %s\n", __func__, decode_qnn_workpoint);
+        } else {
+            LLAMA_LOG_ERROR("%s: failed to apply qnn HTP workpoint switch to %s\n", __func__, decode_qnn_workpoint);
+        }
+
+        if (trace_timing) {
+            LLAMA_LOG_INFO("%s: timing phase=%s n_tokens=%u qnn_workpoint_apply=%s target_workpoint=%s "
+                    "decide_us=%" PRId64 " qnn_workpoint_apply_us=%" PRId64 " target=%s\n",
+                    __func__,
+                    hetero_phase_name(n_tokens),
+                    n_tokens,
+                    applied ? "true" : "false",
+                    decode_qnn_workpoint,
+                    t_decide_end_us - t_decide_start_us,
+                    qnn_workpoint_apply_us,
+                    target_route.empty() ? "<default>" : target_route.c_str());
+        }
+        return;
+    }
+
     if (!decision.should_apply) {
         if (dynamic_route_config.trace_enabled) {
             LLAMA_LOG_INFO("%s: dynamic route skip phase=%s reason=%s\n",
@@ -1659,7 +1802,6 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         return;
     }
 
-    const std::string target_route = llama_hetero_format_route_spec(decision.plan.route);
     const std::string current_attn_backend =
         llama_hetero_canonical_backend(hetero_plan.route.backend_for(llama_hetero_route_stage::ATTN_CORE));
     const std::string target_attn_backend =
@@ -2321,13 +2463,14 @@ void llama_context::synchronize() {
             hetero_phase_trace.kv_transfer_us;
         const int64_t kv_unattributed_us =
             std::max<int64_t>(int64_t(0), hetero_phase_trace.kv_migration_us - kv_accounted_us);
-        LLAMA_LOG_INFO("%s: timing phase=%s n_tokens=%u total_wall_us=%" PRId64 " decide_us=%" PRId64 " apply_us=%" PRId64 " reserve_us=%" PRId64 " memory_update_us=%" PRId64 " kv_migration_us=%" PRId64 " process_ubatch_us=%" PRId64 " bootstrap_sync_us=%" PRId64 " bootstrap_sched_rebuild_us=%" PRId64 " ubatches=%d graph_runs_reused=%d graph_runs_rebuilt=%d route_applied=%s route_noop=%s bootstrap_ran=%s label=%s reason=%s target=%s\n",
+        LLAMA_LOG_INFO("%s: timing phase=%s n_tokens=%u total_wall_us=%" PRId64 " decide_us=%" PRId64 " apply_us=%" PRId64 " qnn_workpoint_apply_us=%" PRId64 " reserve_us=%" PRId64 " memory_update_us=%" PRId64 " kv_migration_us=%" PRId64 " process_ubatch_us=%" PRId64 " bootstrap_sync_us=%" PRId64 " bootstrap_sched_rebuild_us=%" PRId64 " ubatches=%d graph_runs_reused=%d graph_runs_rebuilt=%d route_applied=%s route_noop=%s bootstrap_ran=%s label=%s reason=%s target=%s\n",
                 __func__,
                 hetero_phase_name(hetero_phase_trace.n_tokens),
                 hetero_phase_trace.n_tokens,
                 total_us,
                 hetero_phase_trace.route_decide_us,
                 hetero_phase_trace.route_apply_us,
+                hetero_phase_trace.qnn_workpoint_apply_us,
                 hetero_phase_trace.reserve_us,
                 hetero_phase_trace.memory_update_us,
                 hetero_phase_trace.kv_migration_us,

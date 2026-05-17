@@ -187,6 +187,7 @@ class qnn_instance {
 
     int init_htp_perfinfra();
     int set_htp_power_workpoint();
+    int set_htp_power_workpoint(const char * workpoint);
 
     std::string & get_qnn_graph_name() { return _graph_name; }
 

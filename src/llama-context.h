@@ -435,6 +435,7 @@ private:
     llama_hetero_kv_contract    hetero_kv_contract_allocated;
     llama_dynamic_route_runtime_config dynamic_route_config;
     llama_dynamic_route_runtime_state  dynamic_route_state;
+    std::string qnn_htp_current_workpoint;
 
     struct hetero_phase_timing_trace {
         bool active = false;
@@ -447,6 +448,7 @@ private:
         int64_t batch_start_us = 0;
         int64_t route_decide_us = 0;
         int64_t route_apply_us = 0;
+        int64_t qnn_workpoint_apply_us = 0;
         int64_t reserve_us = 0;
         int64_t reserve_sched_new_us = 0;
         int64_t reserve_memory_init_us = 0;

@@ -49,6 +49,13 @@ bool llama_context_should_prewarm_dynamic_qnn_opencl_kv_aliases(
         const llama_hetero_kv_contract & allocated_kv_contract,
         bool                experimental_enabled);
 
+bool llama_context_should_apply_qnn_workpoint_switch(
+        const llama_hetero_route_spec & current_route,
+        const llama_hetero_route_spec & target_route,
+        uint32_t                        n_tokens,
+        const std::string &             current_workpoint,
+        const char *                    target_workpoint);
+
 int main() {
     testing t;
 
@@ -116,6 +123,47 @@ int main() {
         t.assert_equal("clear should reset plan_reserve timing", total.plan_reserve_us, (int64_t) 0);
         t.assert_equal("clear should reset finalize timing", total.finalize_us, (int64_t) 0);
         t.assert_equal("clear should reset accounted timing", total.accounted_us(), (int64_t) 0);
+    });
+
+    t.test("qnn same-backend decode can switch HTP workpoints without a route change", [](testing & t) {
+        const auto qnn_plan = llama_hetero_build_execution_plan("qnn-npu", nullptr);
+        const auto gpu_plan = llama_hetero_build_execution_plan("opencl", nullptr);
+
+        t.assert_true(
+                "qnn->qnn single-token decode with a different target workpoint should apply runtime HTP control",
+                llama_context_should_apply_qnn_workpoint_switch(
+                        qnn_plan.route,
+                        qnn_plan.route,
+                        1,
+                        "burst",
+                        "low_balanced"));
+
+        t.assert_true(
+                "the same workpoint should not be re-applied every decode token",
+                !llama_context_should_apply_qnn_workpoint_switch(
+                        qnn_plan.route,
+                        qnn_plan.route,
+                        1,
+                        "low_balanced",
+                        "low_balanced"));
+
+        t.assert_true(
+                "prefill-sized batches must not trigger decode workpoint-only switching",
+                !llama_context_should_apply_qnn_workpoint_switch(
+                        qnn_plan.route,
+                        qnn_plan.route,
+                        512,
+                        "burst",
+                        "low_balanced"));
+
+        t.assert_true(
+                "qnn workpoint-only switching only applies when both phase routes stay on qnn",
+                !llama_context_should_apply_qnn_workpoint_switch(
+                        qnn_plan.route,
+                        gpu_plan.route,
+                        1,
+                        "burst",
+                        "low_balanced"));
     });
 
     t.test("qnn to opencl phase migration uses qnn shared host contract", [](testing & t) {

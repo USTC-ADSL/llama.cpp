@@ -511,13 +511,17 @@ void maybe_override_single_corner(const char * env_name,
     }
 }
 
-qnn_htp_power_workpoint get_qnn_htp_power_workpoint_from_env() {
+qnn_htp_power_workpoint get_qnn_htp_power_workpoint(const char * explicit_workpoint) {
     qnn_htp_power_workpoint cfg;
 
-    if (const char * preset = get_nonempty_env("GGML_QNN_HTP_WORKPOINT")) {
-        apply_workpoint_preset(cfg, preset);
-    } else if (const char * preset = get_nonempty_env("GGML_QNN_HTP_POWER_MODE")) {
-        apply_workpoint_preset(cfg, preset);
+    if (explicit_workpoint != nullptr && explicit_workpoint[0] != '\0') {
+        apply_workpoint_preset(cfg, explicit_workpoint);
+    } else {
+        if (const char * preset = get_nonempty_env("GGML_QNN_HTP_WORKPOINT")) {
+            apply_workpoint_preset(cfg, preset);
+        } else if (const char * preset = get_nonempty_env("GGML_QNN_HTP_POWER_MODE")) {
+            apply_workpoint_preset(cfg, preset);
+        }
     }
 
     parse_env_u32("GGML_QNN_HTP_RPC_POLLING_US", cfg.rpc_polling_us);
@@ -640,12 +644,16 @@ int qnn_instance::init_htp_perfinfra() {
 }
 
 int qnn_instance::set_htp_power_workpoint() {
+    return set_htp_power_workpoint(nullptr);
+}
+
+int qnn_instance::set_htp_power_workpoint(const char * workpoint) {
     if (_qnn_htp_perfinfra == nullptr) {
         QNN_LOG_WARN("perf infra is null\n");
         return 1;
     }
 
-    const qnn_htp_power_workpoint cfg = get_qnn_htp_power_workpoint_from_env();
+    const qnn_htp_power_workpoint cfg = get_qnn_htp_power_workpoint(workpoint);
 
     std::vector<QnnHtpPerfInfrastructure_PowerConfig_t> config_storage;
     config_storage.reserve(3);

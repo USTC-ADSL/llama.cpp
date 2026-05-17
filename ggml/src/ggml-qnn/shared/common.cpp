@@ -18,6 +18,7 @@
 bool ggml_backend_qnn_aot_reset_state(ggml_backend_t backend);
 bool ggml_backend_qnn_aot_has_pending_generic_kv_writeback(ggml_backend_t backend);
 bool ggml_backend_qnn_aot_flush_pending_generic_kv_writeback(ggml_backend_t backend);
+bool ggml_backend_qnn_set_htp_workpoint(ggml_backend_t backend, const char * workpoint);
 
 namespace {
 
@@ -98,6 +99,9 @@ void * ggml_backend_qnn_reg_get_proc_address(ggml_backend_reg_t reg, const char 
     }
     if (std::strcmp(name, "ggml_backend_qnn_aot_reset_state") == 0) {
         return reinterpret_cast<void *>(ggml_backend_qnn_aot_reset_state);
+    }
+    if (std::strcmp(name, "ggml_backend_qnn_set_htp_workpoint") == 0) {
+        return reinterpret_cast<void *>(ggml_backend_qnn_set_htp_workpoint);
     }
 
     return nullptr;
