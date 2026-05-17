@@ -1334,6 +1334,18 @@ void llama_context::validate_dynamic_seq0_token_history() {
     dynamic_seq0_token_history.clear();
 }
 
+const std::vector<llama_token> & llama_context::get_dynamic_seq0_token_history() const {
+    return dynamic_seq0_token_history;
+}
+
+void llama_context::set_dynamic_seq0_token_history(const std::vector<llama_token> & tokens) {
+    dynamic_seq0_token_history = tokens;
+}
+
+void llama_context::clear_dynamic_seq0_token_history() {
+    dynamic_seq0_token_history.clear();
+}
+
 void llama_context::record_dynamic_seq0_token_history(const llama_batch & batch_inp, size_t prefix_tokens_before_decode) {
     if (qnn_prefix_replay_active) {
         return;

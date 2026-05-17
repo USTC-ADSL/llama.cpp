@@ -203,6 +203,10 @@ struct llama_context {
 
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> memory_breakdown() const;
 
+    const std::vector<llama_token> & get_dynamic_seq0_token_history() const;
+    void set_dynamic_seq0_token_history(const std::vector<llama_token> & tokens);
+    void clear_dynamic_seq0_token_history();
+
     //
     // training
     //

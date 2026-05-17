@@ -2082,6 +2082,7 @@ struct ctx_state {
     int depth = 0; // in tokens
 
     std::vector<uint8_t> buf; // the llama_context state buffer
+    std::vector<llama_token> dynamic_seq0_token_history;
 };
 
 static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_threads) {
@@ -2315,7 +2316,8 @@ int main(int argc, char ** argv) {
             const int round_idx = i + 1;
             const bool print_round_events = params.progress || params.verbose;
 
-            const auto qnn_reset_result = llama_bench_reset_qnn_aot_backends(collect_qnn_aot_reset_entries(ctx));
+            const auto qnn_reset_entries = collect_qnn_aot_reset_entries(ctx);
+            const auto qnn_reset_result  = llama_bench_reset_qnn_aot_backends(qnn_reset_entries);
             if (!qnn_reset_result.ok()) {
                 fprintf(stderr,
                         "%s: error: failed to reset qnn AoT state before %s (failed backends: %s)\n",
@@ -2328,6 +2330,36 @@ int main(int argc, char ** argv) {
             }
 
             llama_memory_clear(llama_get_memory(ctx), false);
+            ctx->clear_dynamic_seq0_token_history();
+
+            if (llama_bench_should_run_qnn_decode_prewarm(
+                        qnn_reset_entries,
+                        t.n_gen,
+                        llama_bench_qnn_decode_prewarm_enabled())) {
+                if (print_round_events) {
+                    fprintf(stderr, "llama-bench: benchmark %d/%zu: qnn decode prewarm run %d/%d\n", params_idx,
+                            params_count, i + 1, params.reps);
+                }
+                bool res = test_gen(ctx, 1, t.n_threads);
+                if (!res) {
+                    fprintf(stderr, "%s: error: failed to run qnn decode prewarm\n", __func__);
+                    llama_free(ctx);
+                    llama_model_free(lmodel);
+                    exit(1);
+                }
+                const auto qnn_post_prewarm_reset_result = llama_bench_reset_qnn_aot_backends(qnn_reset_entries);
+                if (!qnn_post_prewarm_reset_result.ok()) {
+                    fprintf(stderr,
+                            "%s: error: failed to reset qnn AoT state after qnn decode prewarm (failed backends: %s)\n",
+                            __func__,
+                            join(qnn_post_prewarm_reset_result.failed_backends, ", ").c_str());
+                    llama_free(ctx);
+                    llama_model_free(lmodel);
+                    exit(1);
+                }
+                llama_memory_clear(llama_get_memory(ctx), false);
+                ctx->clear_dynamic_seq0_token_history();
+            }
 
             if (print_round_events) {
                 fprintf(stderr,
@@ -2344,6 +2376,9 @@ int main(int argc, char ** argv) {
                     if (ret == 0) {
                         // if the old state is incompatible with the current context - reprocess from scratch
                         is_cached = false;
+                        ctx->clear_dynamic_seq0_token_history();
+                    } else {
+                        ctx->set_dynamic_seq0_token_history(cstate.dynamic_seq0_token_history);
                     }
                 }
 
@@ -2364,6 +2399,7 @@ int main(int argc, char ** argv) {
                     cstate.depth = t.n_depth;
                     cstate.buf.resize(llama_state_seq_get_size(ctx, 0));
                     llama_state_seq_get_data(ctx, cstate.buf.data(), cstate.buf.size(), 0);
+                    cstate.dynamic_seq0_token_history = ctx->get_dynamic_seq0_token_history();
                 } else {
                     if (params.progress) {
                         fprintf(stderr, "llama-bench: benchmark %d/%zu: depth run %d/%d (cached)\n", params_idx, params_count,
