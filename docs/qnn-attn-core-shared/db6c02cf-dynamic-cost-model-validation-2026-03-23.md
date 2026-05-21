@@ -101,7 +101,7 @@ decode 阶段 trace：
 当前第一版 cost model 仍是明显的 first cut，不应过度表述：
 
 1. 这次验证主要依赖 `GGML_HETERO_DYNAMIC_*_EST_US` 覆盖值来强制分离候选顺序。
-2. 当前 estimator 只有单目标“预计时延最小”排序，没有功率或能耗目标。
+2. 当前 estimator 只有单目标“预计时延最小”排序。
 3. 因为排序目标仍是单调 latency，`slo_us` 当前更多是在区分：
    - “候选满足 SLO”
    - “没有候选满足 SLO，于是退化为 best effort”
@@ -122,11 +122,11 @@ decode 阶段 trace：
 
 ### 保守结论
 
-- 这还不是研究主线意义上的完整 `SLO-aware power-aware scheduler`。
+- 这还不是研究主线意义上的完整 `SLO-aware` scheduler。
 - 更准确的表述应是：
   - “已完成第一版 latency-only cost-model 运行闭环”
   - “`slo_us` 已进入 runtime 决策路径”
-  - “但还没有把功率、能效、切换成本和达标率统一进正式调度策略”
+  - “但还没有把切换成本和达标率统一进正式调度策略”
 
 ## 对主线的意义
 

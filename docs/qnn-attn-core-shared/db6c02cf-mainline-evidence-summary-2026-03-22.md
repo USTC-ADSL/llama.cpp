@@ -8,7 +8,7 @@
 
 - 阶段异构性矩阵
 - runtime overhead 分解
-- 功率可调空间与 `SLO-aware` 调度
+- Prefill/Decode 后端分离与切换优化
 
 这里不试图证明“动态异构调度已经端到端优于所有静态方案”，而是更严格地回答：
 
@@ -61,7 +61,7 @@
   - `tg1` 上 `CPU 2c` 更慢；
   - `tg128` 上 `CPU 2c` 略快。
 
-这说明后续若做功率/延迟二元权衡，`CPU 1c` 与 `CPU 2c` 应视为不同 operating points，而不是同一个 CPU backend 的线性放大。
+这说明后续做 route selection 或 phase switch 对比时，`CPU 1c` 与 `CPU 2c` 应视为不同 operating points，而不是同一个 CPU backend 的线性放大。
 
 ## 2. Decode 阶段级 mixed-route 证据
 
@@ -313,7 +313,7 @@ stage-profiler 结果，见：
 
 - 阶段 heterogeneity
 - 不同 operating points
-- 功率/能耗差异
+- 不同 phase/backend 的切换开销差异
 - SLO 约束
 
 这些更完整的系统视角上。
@@ -343,7 +343,7 @@ stage-profiler 结果，见：
 
 - 正式的 `phase × stage × backend` latency 矩阵；
 - decode/prefill 边界 overhead 分解；
-- 功率/能耗测量；
+- combined Prefill/Decode phase-switch 复测；
 - 计入 `SLO` 约束的 route 选择结果。
 
 当前更准确的说法是：
@@ -372,4 +372,4 @@ stage-profiler 结果，见：
 
 - `Decode` 已经具备研究级的阶段异构证据；
 - `Prefill` 已经具备研究级的 overhead 证据；
-- 但功率可调空间和 `SLO-aware` 动态调度闭环仍需后续实验支持。
+- 但 combined workload 下的 Prefill/Decode 动态切换闭环仍需后续实验支持。

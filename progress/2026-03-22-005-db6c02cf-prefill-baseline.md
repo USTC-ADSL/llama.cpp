@@ -128,14 +128,14 @@ NPU 路线额外使用：
 
 1. `GPUOpenCL` 是当前主设备上 prefill 的最强静态后端。
 2. `CPU` 与 `qnn-npu` 在 prefill 上接近，且都远低于 `GPUOpenCL`。
-3. 到较大 prompt (`pp512`) 时，`CPU` 和 `qnn-npu` 都出现明显下降，说明后续还需要结合功率与稳定性判断不同工作点。
+3. 到较大 prompt (`pp512`) 时，`CPU` 和 `qnn-npu` 都出现明显下降，说明后续还需要结合稳定性和 phase-switch overhead 判断不同工作点。
 
 ## 还缺什么
 
 当前这组 baseline 仍有几个限制：
 
 1. 只有 `r=1`，还没有稳定方差。
-2. 还没有同步功率/能耗测量。
+2. 还没有多轮复测与 phase-switch overhead 关联分析。
 3. 目前只完成了“单后端 static baseline”，还没有把它和：
    - full-graph AoT prefill
    - split prefill

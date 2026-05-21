@@ -38,7 +38,7 @@
   - 再 baseline
   - 再阶段矩阵
   - 再 overhead 分解
-  - 再功率
+  - 再 combined Prefill/Decode phase-switch 复测
   - 最后才是 `SLO-aware` 调度与工程优化
 
 ## 当前结论

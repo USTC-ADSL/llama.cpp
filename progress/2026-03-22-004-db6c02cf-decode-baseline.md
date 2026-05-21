@@ -137,7 +137,7 @@ NPU 路线额外使用：
 这说明：
 
 - decode 的“工作点”不应只看后端，也要看 CPU 线程/核掩码；
-- 后续功率可调空间与 SLO routing 里，`CPU 1c/2c` 应当被视为不同 operating points，而不是同一个 CPU backend 的简单放大版。
+- 后续 route selection 或 phase switch 对比里，`CPU 1c/2c` 应当被视为不同 operating points，而不是同一个 CPU backend 的简单放大版。
 
 ## 还缺什么
 
@@ -145,7 +145,7 @@ NPU 路线额外使用：
 
 1. 只有 `r=1`，还不能作为高置信方差结论。
 2. 只覆盖了 decode，还缺主设备 `prefill` baseline。
-3. 还没有同步功率/能耗读数，因此目前只能作为性能 baseline。
+3. 还缺多轮复测，因此目前只能作为性能 baseline。
 
 ## 下一步
 
@@ -155,4 +155,4 @@ NPU 路线额外使用：
 2. 将这组 decode baseline 与现有 mixed-route 结果放在一起，开始构造正式的“静态后端对照 + 阶段异构性”分析表。
 3. 在 overhead 阶段重点解释：
    - 为什么 static `GPUOpenCL` 当前显著强于 static `qnn-npu`
-   - 为什么 mixed stage route 仍然可能有研究价值，因为调度目标是 `stage × SLO × power`，而不是单纯静态单后端最强。
+   - 为什么 mixed stage route 仍然可能有研究价值，因为目标是 `stage × SLO × runtime overhead`，而不是单纯静态单后端最强。

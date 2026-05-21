@@ -19,4 +19,4 @@
 1. 调查 `Qwen3` 适配是否导致 `Qwen2 attn_core` unmatched
 2. 更新主线工作计划，使其与新版 `AGENTS.md` 的 `Prefill/Decode` 主线一致
 3. 收口最高优先级稳定性问题
-4. 继续推进基线、阶段矩阵、overhead、功率、SLO 调度任务
+4. 继续推进基线、阶段矩阵、Prefill/Decode phase switch overhead 与路由稳定性任务
