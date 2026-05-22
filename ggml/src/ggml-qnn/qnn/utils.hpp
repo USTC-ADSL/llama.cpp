@@ -42,6 +42,10 @@ const char * get_qnn_error_string(Qnn_ErrorHandle_t error);
 
 constexpr const Qnn_TensorVersion_t kDefaultQnnTensorVersion = QNN_TENSOR_VERSION_1;
 
+inline bool qnn_tensor_has_v1_layout(const Qnn_Tensor_t & tensor) {
+    return tensor.version == QNN_TENSOR_VERSION_1 || tensor.version == QNN_TENSOR_VERSION_2;
+}
+
 inline Qnn_Tensor_t qnn_tensor_init(Qnn_TensorVersion_t version) {
     Qnn_Tensor_t tensor;
     tensor.version = version;
@@ -54,7 +58,7 @@ inline Qnn_Tensor_t qnn_tensor_init(Qnn_TensorVersion_t version) {
 }
 
 inline uint32_t get_qnn_tensorid(const Qnn_Tensor_t & tensor) {
-    if (tensor.version == kDefaultQnnTensorVersion) {
+    if (qnn_tensor_has_v1_layout(tensor)) {
         return QNN_TENSOR_VER(tensor).id;
     }
 
@@ -62,130 +66,130 @@ inline uint32_t get_qnn_tensorid(const Qnn_Tensor_t & tensor) {
 }
 
 inline const char * get_qnn_tensorname(const Qnn_Tensor_t & tensor) {
-    if (tensor.version == kDefaultQnnTensorVersion) {
+    if (qnn_tensor_has_v1_layout(tensor)) {
         return QNN_TENSOR_VER(tensor).name;
     }
     return nullptr;
 }
 
 inline Qnn_TensorType_t get_qnn_tensortype(const Qnn_Tensor_t & tensor) {
-    if (tensor.version == kDefaultQnnTensorVersion) {
+    if (qnn_tensor_has_v1_layout(tensor)) {
         return QNN_TENSOR_VER(tensor).type;
     }
     return QNN_TENSOR_TYPE_UNDEFINED;
 }
 
 inline Qnn_TensorDataFormat_t get_qnn_tensor_dataformat(const Qnn_Tensor_t & tensor) {
-    if (tensor.version == kDefaultQnnTensorVersion) {
+    if (qnn_tensor_has_v1_layout(tensor)) {
         return QNN_TENSOR_VER(tensor).dataFormat;
     }
     return QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER;
 }
 
 inline Qnn_DataType_t get_qnn_tensor_datatype(const Qnn_Tensor_t & tensor) {
-    if (tensor.version == kDefaultQnnTensorVersion) {
+    if (qnn_tensor_has_v1_layout(tensor)) {
         return QNN_TENSOR_VER(tensor).dataType;
     }
     return QNN_DATATYPE_UNDEFINED;
 }
 
 inline Qnn_QuantizeParams_t get_qnn_tensor_quantparams(const Qnn_Tensor_t & tensor) {
-    if (tensor.version == kDefaultQnnTensorVersion) {
+    if (qnn_tensor_has_v1_layout(tensor)) {
         return QNN_TENSOR_VER(tensor).quantizeParams;
     }
     return QNN_QUANTIZE_PARAMS_INIT;
 }
 
 inline uint32_t get_qnn_tensor_rank(const Qnn_Tensor_t & tensor) {
-    if (tensor.version == kDefaultQnnTensorVersion) {
+    if (qnn_tensor_has_v1_layout(tensor)) {
         return QNN_TENSOR_VER(tensor).rank;
     }
     return 0u;
 }
 
 inline uint32_t * get_qnn_tensor_dimensions(const Qnn_Tensor_t & tensor) {
-    if (tensor.version == kDefaultQnnTensorVersion) {
+    if (qnn_tensor_has_v1_layout(tensor)) {
         return QNN_TENSOR_VER(tensor).dimensions;
     }
     return nullptr;
 }
 
 inline Qnn_TensorMemType_t get_qnn_tensor_memtype(const Qnn_Tensor_t & tensor) {
-    if (tensor.version == kDefaultQnnTensorVersion) {
+    if (qnn_tensor_has_v1_layout(tensor)) {
         return QNN_TENSOR_VER(tensor).memType;
     }
     return QNN_TENSORMEMTYPE_UNDEFINED;
 }
 
 inline Qnn_MemHandle_t get_qnn_tensor_memhandle(const Qnn_Tensor_t & tensor) {
-    if (tensor.version == kDefaultQnnTensorVersion) {
+    if (qnn_tensor_has_v1_layout(tensor)) {
         return QNN_TENSOR_VER(tensor).memHandle;
     }
     return nullptr;
 }
 
 inline void set_qnn_tensor_id(Qnn_Tensor_t & tensor, uint32_t id) {
-    if (tensor.version == kDefaultQnnTensorVersion) {
+    if (qnn_tensor_has_v1_layout(tensor)) {
         QNN_TENSOR_VER(tensor).id = id;
     }
 }
 
 inline void set_qnn_tensor_name(Qnn_Tensor_t & tensor, const char * name) {
-    if (tensor.version == kDefaultQnnTensorVersion) {
+    if (qnn_tensor_has_v1_layout(tensor)) {
         QNN_TENSOR_VER(tensor).name = name;
     }
 }
 
 inline void set_qnn_tensor_type(Qnn_Tensor_t & tensor, Qnn_TensorType_t type) {
-    if (tensor.version == kDefaultQnnTensorVersion) {
+    if (qnn_tensor_has_v1_layout(tensor)) {
         QNN_TENSOR_VER(tensor).type = type;
     }
 }
 
 inline void set_qnn_tensor_dataformat(Qnn_Tensor_t & tensor, Qnn_TensorDataFormat_t format) {
-    if (tensor.version == kDefaultQnnTensorVersion) {
+    if (qnn_tensor_has_v1_layout(tensor)) {
         QNN_TENSOR_VER(tensor).dataFormat = format;
     }
 }
 
 inline void set_qnn_tensor_datatype(Qnn_Tensor_t & tensor, Qnn_DataType_t dataType) {
-    if (tensor.version == kDefaultQnnTensorVersion) {
+    if (qnn_tensor_has_v1_layout(tensor)) {
         QNN_TENSOR_VER(tensor).dataType = dataType;
     }
 }
 
 inline void set_qnn_tensor_quantparams(Qnn_Tensor_t & tensor, Qnn_QuantizeParams_t params) {
-    if (tensor.version == kDefaultQnnTensorVersion) {
+    if (qnn_tensor_has_v1_layout(tensor)) {
         QNN_TENSOR_VER(tensor).quantizeParams = params;
     }
 }
 
 inline void set_qnn_tensor_rank(Qnn_Tensor_t & tensor, uint32_t rank) {
-    if (tensor.version == kDefaultQnnTensorVersion) {
+    if (qnn_tensor_has_v1_layout(tensor)) {
         QNN_TENSOR_VER(tensor).rank = rank;
     }
 }
 
 inline void set_qnn_tensor_dimensions(Qnn_Tensor_t & tensor, uint32_t * dims) {
-    if (tensor.version == kDefaultQnnTensorVersion) {
+    if (qnn_tensor_has_v1_layout(tensor)) {
         QNN_TENSOR_VER(tensor).dimensions = dims;
     }
 }
 
 inline void set_qnn_tensor_memtype(Qnn_Tensor_t & tensor, Qnn_TensorMemType_t mem_type) {
-    if (tensor.version == kDefaultQnnTensorVersion) {
+    if (qnn_tensor_has_v1_layout(tensor)) {
         QNN_TENSOR_VER(tensor).memType = mem_type;
     }
 }
 
 inline void set_qnn_tensor_clientbuf(Qnn_Tensor_t & tensor, Qnn_ClientBuffer_t client_buf) {
-    if (tensor.version == kDefaultQnnTensorVersion) {
+    if (qnn_tensor_has_v1_layout(tensor)) {
         QNN_TENSOR_VER(tensor).clientBuf = client_buf;
     }
 }
 
 inline void set_qnn_tensor_memhandle(Qnn_Tensor_t & tensor, Qnn_MemHandle_t handle) {
-    if (tensor.version == kDefaultQnnTensorVersion) {
+    if (qnn_tensor_has_v1_layout(tensor)) {
         QNN_TENSOR_VER(tensor).memHandle = handle;
     }
 }

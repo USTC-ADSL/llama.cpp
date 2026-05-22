@@ -249,6 +249,12 @@ class qnn_aot_runtime {
                                            size_t source_token_offset,
                                            size_t dest_token_offset,
                                            size_t n_tokens);
+    bool import_missing_generic_kv_prefix_to_graph(qnn_aot_graph & graph,
+                                                   const aot_match_result & match,
+                                                   size_t required_prefix_tokens,
+                                                   bool apply_seed_prefix_offset);
+    bool generic_kv_writeback_needed(const aot_match_result & match) const;
+    bool private_kv_migration_needs_generic_kv(const aot_match_result & match) const;
     bool should_write_generic_kv(const aot_match_result & match) const;
     bool should_defer_generic_kv_writeback(const aot_match_result & match) const;
     bool collect_generic_kv_from_graph(qnn_aot_graph & graph,
@@ -261,6 +267,11 @@ class qnn_aot_runtime {
     bool load_seed_kv_into_graph(qnn_aot_graph & graph);
     bool load_seed_kv();
     std::string resolve_model_path(const std::string & relative_path) const;
+    std::string kv_state_key_for_graph(const qnn_aot_graph_config & config) const;
+    size_t graph_kv_position(const qnn_aot_graph_config & config) const;
+    void mark_graph_kv_position(const qnn_aot_graph_config & config, size_t kv_position);
+    void mark_loaded_seed_kv_position(qnn_aot_graph & graph);
+    void mark_all_graph_kv_positions(size_t kv_position);
 
     void zero_transformer_state();
     size_t infer_start_pos(const std::vector<ggml_tensor *> & inputs, size_t n_tokens) const;
@@ -290,6 +301,7 @@ class qnn_aot_runtime {
     size_t _seed_kv_size = 0;
     bool _seed_kv_missing_warned = false;
     std::vector<pending_generic_kv_writeback_layer> _pending_generic_kv_writeback;
+    std::unordered_map<std::string, size_t> _graph_kv_positions;
 };
 
 }  // namespace qnn

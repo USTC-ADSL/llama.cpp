@@ -906,6 +906,10 @@ bool env_flag_enabled(const char * name) {
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
+bool aot_trace_load_timing_enabled() {
+    return env_flag_enabled("GGML_QNN_AOT_TRACE_LOAD_TIMING");
+}
+
 const char * aot_debug_dump_dir() {
     const char * value = std::getenv("GGML_QNN_AOT_DEBUG_DUMP_DIR");
     return value != nullptr && value[0] != '\0' ? value : nullptr;
@@ -1814,16 +1818,38 @@ bool qnn_aot_config::load(const std::string & config_path) {
 qnn_aot_context::qnn_aot_context(qnn_instance_ptr instance, const std::string & binary_path) :
     instance(std::move(instance)),
     binary_path(binary_path) {
+    const bool trace_timing = aot_trace_load_timing_enabled();
+    const int64_t t_total_start_us = trace_timing ? ggml_time_us() : 0;
+    int64_t mmap_us = 0;
+    int64_t context_create_from_binary_us = 0;
+    int64_t system_context_create_us = 0;
+    int64_t binary_info_us = 0;
+
     auto qnn_interface = this->instance->get_qnn_interface();
     auto qnn_system    = this->instance->get_qnn_system_interface();
     if (!qnn_interface || !qnn_system) {
         QNN_LOG_WARN("[aot] qnn interface is not initialized\n");
+        if (trace_timing) {
+            QNN_LOG_INFO("AOT_LOAD_TRACE kind=context model_path=%s binary_bytes=0 mmap_us=0 context_create_from_binary_us=0 system_context_create_us=0 binary_info_us=0 total_us=%lld success=0 reason=qnn_interface_uninitialized\n",
+                         binary_path.c_str(),
+                         (long long) (ggml_time_us() - t_total_start_us));
+        }
         return;
     }
 
+    const int64_t t_mmap_start_us = trace_timing ? ggml_time_us() : 0;
     mapped_file binary(binary_path);
+    if (trace_timing) {
+        mmap_us = ggml_time_us() - t_mmap_start_us;
+    }
     if (!binary.is_valid()) {
         QNN_LOG_WARN("[aot] failed to mmap binary: %s, errno=%d\n", binary_path.c_str(), errno);
+        if (trace_timing) {
+            QNN_LOG_INFO("AOT_LOAD_TRACE kind=context model_path=%s binary_bytes=0 mmap_us=%lld context_create_from_binary_us=0 system_context_create_us=0 binary_info_us=0 total_us=%lld success=0 reason=mmap_failed\n",
+                         binary_path.c_str(),
+                         (long long) mmap_us,
+                         (long long) (ggml_time_us() - t_total_start_us));
+        }
         return;
     }
 
@@ -1839,6 +1865,7 @@ qnn_aot_context::qnn_aot_context(qnn_instance_ptr instance, const std::string & 
     context_configs.push_back(&io_estimation_config);
     context_configs.push_back(nullptr);
 
+    const int64_t t_context_create_start_us = trace_timing ? ggml_time_us() : 0;
     auto error = qnn_interface->qnn_context_create_from_binary(
         this->instance->get_qnn_backend_handle(),
         this->instance->get_qnn_device_handle(),
@@ -1847,28 +1874,76 @@ qnn_aot_context::qnn_aot_context(qnn_instance_ptr instance, const std::string & 
         binary.size,
         &context_handle,
         nullptr);
+    if (trace_timing) {
+        context_create_from_binary_us = ggml_time_us() - t_context_create_start_us;
+    }
     if (error != QNN_SUCCESS || context_handle == nullptr) {
         QNN_LOG_WARN("[aot] contextCreateFromBinary failed for %s: %s\n", binary_path.c_str(), get_qnn_error_string(error));
         context_handle = nullptr;
+        if (trace_timing) {
+            QNN_LOG_INFO("AOT_LOAD_TRACE kind=context model_path=%s binary_bytes=%zu mmap_us=%lld context_create_from_binary_us=%lld system_context_create_us=0 binary_info_us=0 total_us=%lld success=0 reason=context_create_from_binary_failed\n",
+                         binary_path.c_str(),
+                         binary.size,
+                         (long long) mmap_us,
+                         (long long) context_create_from_binary_us,
+                         (long long) (ggml_time_us() - t_total_start_us));
+        }
         return;
     }
 
+    const int64_t t_system_context_start_us = trace_timing ? ggml_time_us() : 0;
     error = qnn_system->qnn_system_context_create(&system_context);
+    if (trace_timing) {
+        system_context_create_us = ggml_time_us() - t_system_context_start_us;
+    }
     if (error != QNN_SUCCESS || system_context == nullptr) {
         QNN_LOG_WARN("[aot] systemContextCreate failed for %s: %s\n", binary_path.c_str(), get_qnn_error_string(error));
+        if (trace_timing) {
+            QNN_LOG_INFO("AOT_LOAD_TRACE kind=context model_path=%s binary_bytes=%zu mmap_us=%lld context_create_from_binary_us=%lld system_context_create_us=%lld binary_info_us=0 total_us=%lld success=0 reason=system_context_create_failed\n",
+                         binary_path.c_str(),
+                         binary.size,
+                         (long long) mmap_us,
+                         (long long) context_create_from_binary_us,
+                         (long long) system_context_create_us,
+                         (long long) (ggml_time_us() - t_total_start_us));
+        }
         return;
     }
 
+    const int64_t t_binary_info_start_us = trace_timing ? ggml_time_us() : 0;
     error = qnn_system->qnn_system_context_get_binary_info(system_context, const_cast<void *>(binary.data), binary.size,
                                                            &binary_info, &binary_info_size);
+    if (trace_timing) {
+        binary_info_us = ggml_time_us() - t_binary_info_start_us;
+    }
     if (error != QNN_SUCCESS || binary_info == nullptr) {
         QNN_LOG_WARN("[aot] systemContextGetBinaryInfo failed for %s: %s\n", binary_path.c_str(), get_qnn_error_string(error));
         binary_info      = nullptr;
         binary_info_size = 0;
+        if (trace_timing) {
+            QNN_LOG_INFO("AOT_LOAD_TRACE kind=context model_path=%s binary_bytes=%zu mmap_us=%lld context_create_from_binary_us=%lld system_context_create_us=%lld binary_info_us=%lld total_us=%lld success=0 reason=binary_info_failed\n",
+                         binary_path.c_str(),
+                         binary.size,
+                         (long long) mmap_us,
+                         (long long) context_create_from_binary_us,
+                         (long long) system_context_create_us,
+                         (long long) binary_info_us,
+                         (long long) (ggml_time_us() - t_total_start_us));
+        }
         return;
     }
 
     QNN_LOG_INFO("[aot] loaded context binary %s\n", binary_path.c_str());
+    if (trace_timing) {
+        QNN_LOG_INFO("AOT_LOAD_TRACE kind=context model_path=%s binary_bytes=%zu mmap_us=%lld context_create_from_binary_us=%lld system_context_create_us=%lld binary_info_us=%lld total_us=%lld success=1 reason=ok\n",
+                     binary_path.c_str(),
+                     binary.size,
+                     (long long) mmap_us,
+                     (long long) context_create_from_binary_us,
+                     (long long) system_context_create_us,
+                     (long long) binary_info_us,
+                     (long long) (ggml_time_us() - t_total_start_us));
+    }
 }
 
 qnn_aot_context::~qnn_aot_context() {
@@ -1908,7 +1983,51 @@ qnn_aot_graph::qnn_aot_graph(qnn_instance_ptr instance,
         return;
     }
 
-    _valid = retrieve_graph_metadata() && allocate_tensor_buffers() && set_hvx_threads(_config.n_hvx_threads);
+    const bool trace_timing = aot_trace_load_timing_enabled();
+    const int64_t t_total_start_us = trace_timing ? ggml_time_us() : 0;
+    int64_t retrieve_graph_metadata_us = 0;
+    int64_t allocate_tensor_buffers_us = 0;
+    int64_t set_hvx_threads_us = 0;
+
+    const int64_t t_retrieve_start_us = trace_timing ? ggml_time_us() : 0;
+    const bool metadata_ok = retrieve_graph_metadata();
+    if (trace_timing) {
+        retrieve_graph_metadata_us = ggml_time_us() - t_retrieve_start_us;
+    }
+
+    bool buffers_ok = false;
+    if (metadata_ok) {
+        const int64_t t_buffers_start_us = trace_timing ? ggml_time_us() : 0;
+        buffers_ok = allocate_tensor_buffers();
+        if (trace_timing) {
+            allocate_tensor_buffers_us = ggml_time_us() - t_buffers_start_us;
+        }
+    }
+
+    bool hvx_ok = false;
+    if (metadata_ok && buffers_ok) {
+        const int64_t t_hvx_start_us = trace_timing ? ggml_time_us() : 0;
+        hvx_ok = set_hvx_threads(_config.n_hvx_threads);
+        if (trace_timing) {
+            set_hvx_threads_us = ggml_time_us() - t_hvx_start_us;
+        }
+    }
+
+    _valid = metadata_ok && buffers_ok && hvx_ok;
+    if (trace_timing) {
+        QNN_LOG_INFO("AOT_LOAD_TRACE kind=graph graph_name=%s model_path=%s batch_size=%zu cache_size=%zu context_size=%zu retrieve_graph_metadata_us=%lld allocate_tensor_buffers_us=%lld set_hvx_threads_us=%lld total_us=%lld success=%d sibling_used=%d\n",
+                     _config.graph_name.c_str(),
+                     _config.model_path.c_str(),
+                     _config.batch_size,
+                     _config.cache_size,
+                     _config.context_size,
+                     (long long) retrieve_graph_metadata_us,
+                     (long long) allocate_tensor_buffers_us,
+                     (long long) set_hvx_threads_us,
+                     (long long) (ggml_time_us() - t_total_start_us),
+                     _valid ? 1 : 0,
+                     _sibling != nullptr ? 1 : 0);
+    }
 }
 
 qnn_aot_graph::~qnn_aot_graph() {
@@ -3939,7 +4058,10 @@ qnn_aot_runtime::graph_bucket * qnn_aot_runtime::select_transformer_graphs(size_
 
 qnn_aot_graph * qnn_aot_runtime::ensure_graph_loaded(const qnn_aot_graph_config & graph_config,
                                                      graph_family &                family) {
-    std::lock_guard<std::mutex> lock(_lazy_graph_mutex);
+    const bool trace_timing = aot_trace_load_timing_enabled();
+    const int64_t t_total_start_us = trace_timing ? ggml_time_us() : 0;
+    std::unique_lock<std::mutex> lock(_lazy_graph_mutex);
+    const int64_t lock_wait_us = trace_timing ? ggml_time_us() - t_total_start_us : 0;
     auto & bucket = family[graph_config.batch_size];
     for (auto & graph_ptr : bucket) {
         if (!graph_ptr) {
@@ -3951,6 +4073,16 @@ qnn_aot_graph * qnn_aot_runtime::ensure_graph_loaded(const qnn_aot_graph_config 
             loaded.start_layer_id == graph_config.start_layer_id &&
             loaded.end_layer_id == graph_config.end_layer_id &&
             loaded.batch_size == graph_config.batch_size) {
+            if (trace_timing) {
+                QNN_LOG_INFO("AOT_LOAD_TRACE kind=ensure_graph_loaded graph_name=%s model_path=%s batch_size=%zu cache_size=%zu context_size=%zu graph_cache_hit=1 context_cache_hit=1 lock_wait_us=%lld context_resolve_us=0 graph_create_us=0 seed_kv_us=0 total_us=%lld success=1\n",
+                             graph_config.graph_name.c_str(),
+                             graph_config.model_path.c_str(),
+                             graph_config.batch_size,
+                             graph_config.cache_size,
+                             graph_config.context_size,
+                             (long long) lock_wait_us,
+                             (long long) (ggml_time_us() - t_total_start_us));
+            }
             return graph_ptr.get();
         }
     }
@@ -3959,14 +4091,28 @@ qnn_aot_graph * qnn_aot_runtime::ensure_graph_loaded(const qnn_aot_graph_config 
     runtime_config.n_hvx_threads        = _config.n_hvx_threads;
 
     const auto model_path = resolve_model_path(runtime_config.model_path);
+    const int64_t t_context_start_us = trace_timing ? ggml_time_us() : 0;
     auto context_it = _contexts.find(model_path);
+    const bool context_cache_hit = context_it != _contexts.end();
     if (context_it == _contexts.end()) {
         auto context = std::make_shared<qnn_aot_context>(_instance, model_path);
         if (!context->is_valid()) {
+            if (trace_timing) {
+                QNN_LOG_INFO("AOT_LOAD_TRACE kind=ensure_graph_loaded graph_name=%s model_path=%s batch_size=%zu cache_size=%zu context_size=%zu graph_cache_hit=0 context_cache_hit=0 lock_wait_us=%lld context_resolve_us=%lld graph_create_us=0 seed_kv_us=0 total_us=%lld success=0\n",
+                             runtime_config.graph_name.c_str(),
+                             model_path.c_str(),
+                             runtime_config.batch_size,
+                             runtime_config.cache_size,
+                             runtime_config.context_size,
+                             (long long) lock_wait_us,
+                             (long long) (ggml_time_us() - t_context_start_us),
+                             (long long) (ggml_time_us() - t_total_start_us));
+            }
             return nullptr;
         }
         context_it = _contexts.emplace(model_path, std::move(context)).first;
     }
+    const int64_t context_resolve_us = trace_timing ? ggml_time_us() - t_context_start_us : 0;
 
     const qnn_aot_graph * sibling = nullptr;
     // Match eager graph loading so lazily loaded batch buckets can share stateful KV buffers.
@@ -3988,13 +4134,51 @@ qnn_aot_graph * qnn_aot_runtime::ensure_graph_loaded(const qnn_aot_graph_config 
                      runtime_config.batch_size);
     }
 
+    const int64_t t_graph_create_start_us = trace_timing ? ggml_time_us() : 0;
     auto graph = std::make_unique<qnn_aot_graph>(_instance, context_it->second, runtime_config, sibling);
+    const int64_t graph_create_us = trace_timing ? ggml_time_us() - t_graph_create_start_us : 0;
     if (!graph->is_valid()) {
+        if (trace_timing) {
+            QNN_LOG_INFO("AOT_LOAD_TRACE kind=ensure_graph_loaded graph_name=%s model_path=%s batch_size=%zu cache_size=%zu context_size=%zu graph_cache_hit=0 context_cache_hit=%d lock_wait_us=%lld context_resolve_us=%lld graph_create_us=%lld seed_kv_us=0 total_us=%lld success=0\n",
+                         runtime_config.graph_name.c_str(),
+                         model_path.c_str(),
+                         runtime_config.batch_size,
+                         runtime_config.cache_size,
+                         runtime_config.context_size,
+                         context_cache_hit ? 1 : 0,
+                         (long long) lock_wait_us,
+                         (long long) context_resolve_us,
+                         (long long) graph_create_us,
+                         (long long) (ggml_time_us() - t_total_start_us));
+        }
         return nullptr;
     }
 
-    if (_seed_kv_loaded && _seed_kv_size > 0 && !load_seed_kv_into_graph(*graph)) {
-        return nullptr;
+    int64_t seed_kv_us = 0;
+    if (_seed_kv_loaded && _seed_kv_size > 0) {
+        const int64_t t_seed_kv_start_us = trace_timing ? ggml_time_us() : 0;
+        const bool seed_kv_ok = load_seed_kv_into_graph(*graph);
+        if (trace_timing) {
+            seed_kv_us = ggml_time_us() - t_seed_kv_start_us;
+        }
+        if (!seed_kv_ok) {
+            if (trace_timing) {
+                QNN_LOG_INFO("AOT_LOAD_TRACE kind=ensure_graph_loaded graph_name=%s model_path=%s batch_size=%zu cache_size=%zu context_size=%zu graph_cache_hit=0 context_cache_hit=%d lock_wait_us=%lld context_resolve_us=%lld graph_create_us=%lld seed_kv_us=%lld total_us=%lld success=0\n",
+                             runtime_config.graph_name.c_str(),
+                             model_path.c_str(),
+                             runtime_config.batch_size,
+                             runtime_config.cache_size,
+                             runtime_config.context_size,
+                             context_cache_hit ? 1 : 0,
+                             (long long) lock_wait_us,
+                             (long long) context_resolve_us,
+                             (long long) graph_create_us,
+                             (long long) seed_kv_us,
+                             (long long) (ggml_time_us() - t_total_start_us));
+            }
+            return nullptr;
+        }
+        mark_loaded_seed_kv_position(*graph);
     }
 
     QNN_LOG_INFO("[aot] lazy-initialized %s graph %s (layers=[%zu,%zu), batch=%zu) from %s\n",
@@ -4005,6 +4189,20 @@ qnn_aot_graph * qnn_aot_runtime::ensure_graph_loaded(const qnn_aot_graph_config 
                  runtime_config.batch_size,
                  model_path.c_str());
     bucket.push_back(std::move(graph));
+    if (trace_timing) {
+        QNN_LOG_INFO("AOT_LOAD_TRACE kind=ensure_graph_loaded graph_name=%s model_path=%s batch_size=%zu cache_size=%zu context_size=%zu graph_cache_hit=0 context_cache_hit=%d lock_wait_us=%lld context_resolve_us=%lld graph_create_us=%lld seed_kv_us=%lld total_us=%lld success=1\n",
+                     runtime_config.graph_name.c_str(),
+                     model_path.c_str(),
+                     runtime_config.batch_size,
+                     runtime_config.cache_size,
+                     runtime_config.context_size,
+                     context_cache_hit ? 1 : 0,
+                     (long long) lock_wait_us,
+                     (long long) context_resolve_us,
+                     (long long) graph_create_us,
+                     (long long) seed_kv_us,
+                     (long long) (ggml_time_us() - t_total_start_us));
+    }
     return bucket.back().get();
 }
 
@@ -4473,6 +4671,16 @@ bool qnn_aot_runtime::import_generic_kv_prefix_to_graph(qnn_aot_graph & graph,
                 return false;
             }
 
+            if (!qnn_aot_apply_attention_scaled_key_rows_for_private_kv(key_rows,
+                                                                        n_tokens,
+                                                                        generic_k_values,
+                                                                        _config.model.n_kv_heads,
+                                                                        _config.model.head_dim)) {
+                QNN_LOG_WARN("[aot] import_generic_kv_prefix_to_graph failed to scale generic K rows for private QNN cache at layer=%zu head=%zu graph=%s\n",
+                             layer, head, graph_config.graph_name.c_str());
+                return false;
+            }
+
             if (aot_trace_bind_enabled() &&
                 layer == graph_config.start_layer_id &&
                 head == 0 &&
@@ -4534,8 +4742,142 @@ bool qnn_aot_runtime::import_generic_kv_prefix_to_graph(qnn_aot_graph & graph,
     return true;
 }
 
+std::string qnn_aot_runtime::kv_state_key_for_graph(const qnn_aot_graph_config & config) const {
+    return resolve_model_path(config.model_path) +
+           "|type=" + config.type +
+           "|layers=" + std::to_string(config.start_layer_id) + "-" + std::to_string(config.end_layer_id) +
+           "|cache=" + std::to_string(config.cache_size) +
+           "|context=" + std::to_string(config.context_size);
+}
+
+size_t qnn_aot_runtime::graph_kv_position(const qnn_aot_graph_config & config) const {
+    const auto it = _graph_kv_positions.find(kv_state_key_for_graph(config));
+    if (it != _graph_kv_positions.end()) {
+        return it->second;
+    }
+
+    if (_seed_kv_loaded && _seed_kv_size > 0 && config.kv_size > 0) {
+        return std::min(_seed_kv_size, config.kv_size);
+    }
+
+    return 0;
+}
+
+void qnn_aot_runtime::mark_graph_kv_position(const qnn_aot_graph_config & config, size_t kv_position) {
+    _graph_kv_positions[kv_state_key_for_graph(config)] = kv_position;
+}
+
+void qnn_aot_runtime::mark_loaded_seed_kv_position(qnn_aot_graph & graph) {
+    const auto & config = graph.config();
+    const size_t seed_position = _seed_kv_loaded && config.kv_size > 0 ? std::min(_seed_kv_size, config.kv_size) : 0;
+    const auto key = kv_state_key_for_graph(config);
+    const auto it = _graph_kv_positions.find(key);
+    if (it != _graph_kv_positions.end()) {
+        it->second = std::max(it->second, seed_position);
+        return;
+    }
+    _graph_kv_positions.emplace(key, seed_position);
+}
+
+void qnn_aot_runtime::mark_all_graph_kv_positions(size_t kv_position) {
+    auto mark_graph_family = [this, kv_position](graph_family & family) {
+        for (auto & graph_group : family) {
+            for (auto & graph_ptr : graph_group.second) {
+                if (graph_ptr) {
+                    mark_graph_kv_position(graph_ptr->config(), kv_position);
+                }
+            }
+        }
+    };
+
+    mark_graph_family(_transformer_graphs);
+    for (auto & graph_ptr : _attention_graphs) {
+        if (graph_ptr) {
+            mark_graph_kv_position(graph_ptr->config(), kv_position);
+        }
+    }
+}
+
+bool qnn_aot_runtime::import_missing_generic_kv_prefix_to_graph(qnn_aot_graph & graph,
+                                                                const aot_match_result & match,
+                                                                size_t required_prefix_tokens,
+                                                                bool apply_seed_prefix_offset) {
+    const auto & graph_config = graph.config();
+    const size_t graph_pos = graph_kv_position(graph_config);
+    if (!qnn::qnn_aot_kv_prefix_import_required(graph_pos, required_prefix_tokens)) {
+        return true;
+    }
+
+    if (!flush_pending_generic_kv_writeback()) {
+        QNN_LOG_WARN("[aot] failed to flush pending generic KV before importing prefix into graph=%s\n",
+                     graph_config.graph_name.c_str());
+        return false;
+    }
+
+    const size_t import_tokens = required_prefix_tokens - graph_pos;
+    const size_t import_source_offset =
+        apply_seed_prefix_offset && graph_pos >= _seed_kv_size
+            ? (graph_pos - _seed_kv_size)
+            : graph_pos;
+    if (apply_seed_prefix_offset && import_source_offset + import_tokens > match.inferred_pos) {
+        QNN_LOG_WARN("[aot] import source range invalid: src_offset=%zu tokens=%zu raw_inferred_pos=%zu graph=%s\n",
+                     import_source_offset,
+                     import_tokens,
+                     match.inferred_pos,
+                     graph_config.graph_name.c_str());
+        return false;
+    }
+
+    if (!import_generic_kv_prefix_to_graph(graph, match, import_source_offset, graph_pos, import_tokens)) {
+        return false;
+    }
+
+    mark_graph_kv_position(graph_config, required_prefix_tokens);
+    return true;
+}
+
+bool qnn_aot_runtime::private_kv_migration_needs_generic_kv(const aot_match_result & match) const {
+    const std::vector<qnn_aot_graph_config> * configs = nullptr;
+    if (match.is_transformer) {
+        configs = &_config.transformer_graphs;
+    } else if (match.is_attention) {
+        configs = &_config.attention_graphs;
+    }
+
+    if (configs == nullptr || configs->empty()) {
+        return false;
+    }
+
+    std::unordered_map<std::string, std::unordered_set<std::string>> states_by_layer_range;
+    for (const auto & config : *configs) {
+        if (config.kv_size == 0) {
+            continue;
+        }
+
+        const std::string layer_key =
+            config.type +
+            "|layers=" + std::to_string(config.start_layer_id) + "-" + std::to_string(config.end_layer_id);
+        const std::string state_key =
+            resolve_model_path(config.model_path) +
+            "|cache=" + std::to_string(config.cache_size) +
+            "|context=" + std::to_string(config.context_size);
+        auto & states = states_by_layer_range[layer_key];
+        states.insert(state_key);
+        if (states.size() > 1) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool qnn_aot_runtime::generic_kv_writeback_needed(const aot_match_result & match) const {
+    return aot_generic_kv_writeback_needed_for_phase_switch() ||
+           private_kv_migration_needs_generic_kv(match);
+}
+
 bool qnn_aot_runtime::should_write_generic_kv(const aot_match_result & match) const {
-    return aot_generic_kv_writeback_needed_for_phase_switch() &&
+    return generic_kv_writeback_needed(match) &&
            match.n_tokens > 1 &&
            match.kq_mask != nullptr &&
            !match.cache_k_layers.empty() &&
@@ -4543,7 +4885,7 @@ bool qnn_aot_runtime::should_write_generic_kv(const aot_match_result & match) co
 }
 
 bool qnn_aot_runtime::should_defer_generic_kv_writeback(const aot_match_result & match) const {
-    if (!aot_generic_kv_writeback_needed_for_phase_switch()) {
+    if (!generic_kv_writeback_needed(match)) {
         return false;
     }
 
@@ -5009,12 +5351,18 @@ bool qnn_aot_runtime::load_seed_kv() {
             if (graph_ptr && !load_seed_kv_into_graph(*graph_ptr)) {
                 return false;
             }
+            if (graph_ptr) {
+                mark_graph_kv_position(graph_ptr->config(), _seed_kv_size);
+            }
         }
     }
 
     for (const auto & graph_ptr : _attention_graphs) {
         if (graph_ptr && !load_seed_kv_into_graph(*graph_ptr)) {
             return false;
+        }
+        if (graph_ptr) {
+            mark_graph_kv_position(graph_ptr->config(), _seed_kv_size);
         }
     }
 
@@ -5191,26 +5539,11 @@ bool qnn_aot_runtime::execute_attention(ggml_cgraph * cgraph, const aot_match_re
                      mask_inferred && !inferred_slots.empty() ? (long long) inferred_slots[0] : -1LL);
     }
 
-    if (generic_prefix_tokens > _kv_position) {
-        const size_t import_tokens = generic_prefix_tokens - _kv_position;
-        const size_t import_source_offset =
-            apply_seed_prefix_offset && _kv_position >= _seed_kv_size
-                ? (_kv_position - _seed_kv_size)
-                : _kv_position;
-        if (apply_seed_prefix_offset && import_source_offset + import_tokens > match.inferred_pos) {
-            QNN_LOG_WARN("[aot] attention import source range invalid: src_offset=%zu tokens=%zu raw_inferred_pos=%zu graph=%s\n",
-                         import_source_offset,
-                         import_tokens,
-                         match.inferred_pos,
-                         graph->config().graph_name.c_str());
-            return false;
-        }
-        if (!import_generic_kv_prefix_to_graph(*graph, match, import_source_offset, _kv_position, import_tokens)) {
-            QNN_LOG_WARN("[aot] attention failed to import generic KV prefix for graph=%s inferred_pos=%zu\n",
-                         graph->config().graph_name.c_str(),
-                         generic_prefix_tokens);
-            return false;
-        }
+    if (!import_missing_generic_kv_prefix_to_graph(*graph, match, generic_prefix_tokens, apply_seed_prefix_offset)) {
+        QNN_LOG_WARN("[aot] attention failed to import generic KV prefix for graph=%s inferred_pos=%zu\n",
+                     graph->config().graph_name.c_str(),
+                     generic_prefix_tokens);
+        return false;
     }
     _kv_position = std::max(_kv_position, generic_prefix_tokens);
 
@@ -5274,6 +5607,7 @@ bool qnn_aot_runtime::execute_attention(ggml_cgraph * cgraph, const aot_match_re
             return false;
         }
 
+        mark_graph_kv_position(graph->config(), _kv_position + step);
         _kv_position += step;
         offset += step;
     }
@@ -5419,27 +5753,12 @@ bool qnn_aot_runtime::execute_transformer(ggml_cgraph * cgraph, const aot_match_
                      mask_inferred && !inferred_slots.empty() ? (long long) inferred_slots[0] : -1LL);
     }
 
-    if (generic_prefix_tokens > _kv_position) {
-        const size_t import_tokens = generic_prefix_tokens - _kv_position;
-        const size_t import_source_offset =
-            apply_seed_prefix_offset && _kv_position >= _seed_kv_size
-                ? (_kv_position - _seed_kv_size)
-                : _kv_position;
-        if (apply_seed_prefix_offset && import_source_offset + import_tokens > match.inferred_pos) {
-            QNN_LOG_WARN("[aot] transformer import source range invalid: src_offset=%zu tokens=%zu raw_inferred_pos=%zu graph=%s\n",
-                         import_source_offset,
-                         import_tokens,
-                         match.inferred_pos,
-                         graphs.front()->config().graph_name.c_str());
+    for (auto * graph : graphs) {
+        if (!import_missing_generic_kv_prefix_to_graph(*graph, match, generic_prefix_tokens, apply_seed_prefix_offset)) {
+            QNN_LOG_WARN("[aot] transformer failed to import generic KV prefix for graph=%s inferred_pos=%zu\n",
+                         graph->config().graph_name.c_str(),
+                         generic_prefix_tokens);
             return false;
-        }
-        for (auto * graph : graphs) {
-            if (!import_generic_kv_prefix_to_graph(*graph, match, import_source_offset, _kv_position, import_tokens)) {
-                QNN_LOG_WARN("[aot] transformer failed to import generic KV prefix for graph=%s inferred_pos=%zu\n",
-                             graph->config().graph_name.c_str(),
-                             generic_prefix_tokens);
-                return false;
-            }
         }
     }
     _kv_position = std::max(_kv_position, generic_prefix_tokens);
@@ -5567,6 +5886,7 @@ bool qnn_aot_runtime::execute_transformer(ggml_cgraph * cgraph, const aot_match_
             if (!write_generic_kv_from_graph(*graph, match, offset, step)) {
                 return false;
             }
+            mark_graph_kv_position(graph->config(), _kv_position + step);
 
             stage_input = out_buffer;
         }
@@ -7173,11 +7493,15 @@ void qnn_aot_runtime::reset_state() {
     zero_transformer_state();
     _kv_position = 0;
     _pending_generic_kv_writeback.clear();
+    _graph_kv_positions.clear();
     if (_seed_kv_size > 0 && load_seed_kv()) {
         _kv_position = _seed_kv_size;
     } else if (_seed_kv_size > 0 && !aot_seed_kv_enabled() && aot_trace_bind_enabled()) {
         QNN_LOG_INFO("[aot] reset_state starting from empty KV because seed KV is disabled (artifact seed_kv_size=%zu)\n",
                      _seed_kv_size);
+        mark_all_graph_kv_positions(0);
+    } else {
+        mark_all_graph_kv_positions(0);
     }
 }
 
