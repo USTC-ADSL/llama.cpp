@@ -82,6 +82,14 @@ bool llama_context_should_prewarm_dynamic_qnn_opencl_kv_aliases(
         const llama_hetero_kv_contract & allocated_kv_contract,
         bool                experimental_enabled);
 
+int64_t llama_context_transition_blocking_us(
+        int64_t total_wall_us,
+        int64_t process_ubatch_us);
+
+int64_t llama_context_decode_token_gap_us(
+        int64_t previous_decode_done_us,
+        int64_t current_decode_done_us);
+
 bool llama_context_should_apply_qnn_workpoint_switch(
         const llama_hetero_route_spec & current_route,
         const llama_hetero_route_spec & target_route,
@@ -244,6 +252,21 @@ bool llama_context_should_prewarm_dynamic_qnn_opencl_kv_aliases(
     // QNN has not written the prefill KV yet, so a correct prewarm needs a
     // separate alias-only path.
     return false;
+}
+
+int64_t llama_context_transition_blocking_us(
+        int64_t total_wall_us,
+        int64_t process_ubatch_us) {
+    return std::max<int64_t>(int64_t(0), total_wall_us - std::max<int64_t>(int64_t(0), process_ubatch_us));
+}
+
+int64_t llama_context_decode_token_gap_us(
+        int64_t previous_decode_done_us,
+        int64_t current_decode_done_us) {
+    if (previous_decode_done_us <= 0 || current_decode_done_us <= 0 || current_decode_done_us < previous_decode_done_us) {
+        return -1;
+    }
+    return current_decode_done_us - previous_decode_done_us;
 }
 
 static std::string llama_context_canonical_qnn_workpoint(const char * value) {
@@ -2448,7 +2471,8 @@ void llama_context::synchronize() {
         hetero_dynamic_trace_timing_enabled() &&
         hetero_phase_trace.active &&
         hetero_phase_trace.batch_start_us > 0) {
-        const int64_t total_us = ggml_time_us() - hetero_phase_trace.batch_start_us;
+        const int64_t sync_done_us = ggml_time_us();
+        const int64_t total_us = sync_done_us - hetero_phase_trace.batch_start_us;
         const int64_t reserve_accounted_us =
             hetero_phase_trace.reserve_sched_new_us +
             hetero_phase_trace.reserve_memory_init_us +
@@ -2500,6 +2524,49 @@ void llama_context::synchronize() {
                 hetero_phase_trace.kv_backend_sync_us,
                 hetero_phase_trace.kv_transfer_us,
                 kv_unattributed_us);
+        if (hetero_phase_trace.route_applied && hetero_phase_trace.n_tokens == 1) {
+            const int64_t transition_blocking_us =
+                llama_context_transition_blocking_us(total_us, hetero_phase_trace.process_ubatch_us);
+            const int64_t first_token_gap_us =
+                llama_context_decode_token_gap_us(hetero_last_decode_token_done_us, sync_done_us);
+            const std::string first_token_gap =
+                first_token_gap_us >= 0 ? std::to_string(first_token_gap_us) : "";
+            LLAMA_LOG_INFO("TRANSITION_TRACE phase=prefill_to_decode "
+                    "decision_us=%" PRId64 " route_apply_us=%" PRId64 " "
+                    "policy_apply_us= qnn_workpoint_apply_us=%" PRId64 " gpu_freq_apply_us= "
+                    "sched_reserve_us=%" PRId64 " kv_handoff_us=%" PRId64 " "
+                    "graph_rebuild_us=%" PRId64 " decode_entry_us=%" PRId64 " "
+                    "total_blocking_us=%" PRId64 " first_token_gap_us=%s post_switch_tbt_us= "
+                    "transition_energy_mj= transition_energy_source=unavailable "
+                    "success=1 fallback=0 support_status=ok "
+                    "process_ubatch_us=%" PRId64 " total_wall_us=%" PRId64 " "
+                    "graph_runs_reused=%d graph_runs_rebuilt=%d\n",
+                    hetero_phase_trace.route_decide_us,
+                    hetero_phase_trace.route_apply_us,
+                    hetero_phase_trace.qnn_workpoint_apply_us,
+                    hetero_phase_trace.reserve_us,
+                    hetero_phase_trace.kv_migration_us,
+                    hetero_phase_trace.bootstrap_sched_rebuild_us,
+                    total_us,
+                    transition_blocking_us,
+                    first_token_gap.c_str(),
+                    hetero_phase_trace.process_ubatch_us,
+                    total_us,
+                    hetero_phase_trace.graph_runs_reused,
+                    hetero_phase_trace.graph_runs_rebuilt);
+        }
+        if (hetero_phase_trace.n_tokens == 1) {
+            hetero_decode_trace_index++;
+            LLAMA_LOG_INFO("DECODE_TOKEN_TRACE phase=decode token_index=%" PRId64 " done_us=%" PRId64 " route_applied=%d total_wall_us=%" PRId64 " process_ubatch_us=%" PRId64 "\n",
+                    hetero_decode_trace_index,
+                    sync_done_us,
+                    hetero_phase_trace.route_applied ? 1 : 0,
+                    total_us,
+                    hetero_phase_trace.process_ubatch_us);
+            hetero_last_decode_token_done_us = sync_done_us;
+        } else {
+            hetero_last_decode_token_done_us = 0;
+        }
         hetero_phase_trace.reset();
     }
 

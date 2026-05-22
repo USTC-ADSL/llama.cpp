@@ -479,6 +479,8 @@ private:
 
     hetero_phase_timing_trace hetero_phase_trace;
     bool hetero_phase_trace_suppress_sync_log = false;
+    int64_t hetero_decode_trace_index = 0;
+    int64_t hetero_last_decode_token_done_us = 0;
 
     // perf
     mutable int64_t t_start_us  = 0;
