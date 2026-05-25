@@ -22,6 +22,7 @@
 #include <string.h>
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -84,6 +85,86 @@ static bool ggml_backend_hetero_trace_share_enabled(void) {
         enabled = (env != NULL && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
     }
     return enabled != 0;
+}
+
+static bool ggml_backend_fg_sync_trace_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * sync_env = getenv("GGML_HETERO_FG_SYNC_TRACE");
+        const char * fg_env   = getenv("GGML_HETERO_FG_SPLIT");
+        enabled =
+            ((sync_env != NULL && sync_env[0] != '\0' && strcmp(sync_env, "0") != 0) ||
+             (fg_env   != NULL && fg_env[0]   != '\0' && strcmp(fg_env,   "0") != 0)) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
+static bool ggml_backend_name_contains_ci(const char * value, const char * needle) {
+    if (value == NULL || needle == NULL) {
+        return false;
+    }
+
+    std::string haystack(value);
+    std::string pattern(needle);
+    std::transform(haystack.begin(), haystack.end(), haystack.begin(), [](unsigned char c) {
+        return (char) std::tolower(c);
+    });
+    std::transform(pattern.begin(), pattern.end(), pattern.begin(), [](unsigned char c) {
+        return (char) std::tolower(c);
+    });
+    return haystack.find(pattern) != std::string::npos;
+}
+
+static const char * ggml_backend_fg_sync_endpoint(const char * backend_name) {
+    if (ggml_backend_name_contains_ci(backend_name, "qnn")) {
+        return "qnn";
+    }
+    if (ggml_backend_name_contains_ci(backend_name, "opencl") ||
+        ggml_backend_name_contains_ci(backend_name, "gpu")) {
+        return "gpu";
+    }
+    if (ggml_backend_name_contains_ci(backend_name, "cpu")) {
+        return "cpu";
+    }
+    return NULL;
+}
+
+static void ggml_backend_fg_sync_trace_record(
+        int         split_id,
+        const char * src_backend_name,
+        const char * dst_backend_name,
+        const char * tensor_name,
+        size_t      nbytes,
+        int64_t     latency_us,
+        int64_t     wait_us) {
+    if (!ggml_backend_fg_sync_trace_enabled()) {
+        return;
+    }
+
+    const char * src = ggml_backend_fg_sync_endpoint(src_backend_name);
+    const char * dst = ggml_backend_fg_sync_endpoint(dst_backend_name);
+    if (src == NULL || dst == NULL || strcmp(src, dst) == 0) {
+        return;
+    }
+
+    const bool is_qnn_gpu_boundary =
+        (strcmp(src, "qnn") == 0 && strcmp(dst, "gpu") == 0) ||
+        (strcmp(src, "gpu") == 0 && strcmp(dst, "qnn") == 0);
+    if (!is_qnn_gpu_boundary) {
+        return;
+    }
+
+    GGML_LOG_INFO(
+            "FG_SYNC_TRACE from=%s to=%s us=%lld wait_us=%lld bytes=%zu tensor=%s split=%d src_backend=%s dst_backend=%s\n",
+            src,
+            dst,
+            (long long) latency_us,
+            (long long) wait_us,
+            nbytes,
+            tensor_name != NULL ? tensor_name : "<unnamed>",
+            split_id,
+            src_backend_name != NULL ? src_backend_name : "<unknown>",
+            dst_backend_name != NULL ? dst_backend_name : "<unknown>");
 }
 
 struct ggml_backend_hetero_profile_state {
@@ -1665,6 +1746,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     struct ggml_backend_sched_split * splits = sched->splits;
     const bool hetero_profile = ggml_backend_hetero_profile_enabled();
     const bool hetero_profile_sync_splits = hetero_profile && ggml_backend_hetero_profile_sync_splits();
+    const bool fg_sync_trace = ggml_backend_fg_sync_trace_enabled();
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
@@ -1686,11 +1768,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
             const char * input_backend_name = ggml_backend_name(input_backend);
-            const bool profile_copy = hetero_profile && input_backend != split_backend;
-            const int64_t copy_start_us = profile_copy ? ggml_time_us() : 0;
+            const bool cross_backend_copy = input_backend != split_backend;
+            const bool profile_copy = hetero_profile && cross_backend_copy;
+            const bool trace_sync_copy = fg_sync_trace && cross_backend_copy;
+            const bool measure_copy = profile_copy || trace_sync_copy;
+            const int64_t copy_start_us = measure_copy ? ggml_time_us() : 0;
             int64_t copy_wait_us = 0;
             auto measure_blocking_sync = [&](auto && fn) {
-                if (!profile_copy) {
+                if (!measure_copy) {
                     fn();
                     return;
                 }
@@ -1864,6 +1949,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         split->i_end,
                         split_first_name,
                         split_last_name);
+            }
+            if (trace_sync_copy) {
+                ggml_backend_fg_sync_trace_record(
+                        split_id,
+                        input_backend_name,
+                        split_backend_name,
+                        input->name,
+                        ggml_nbytes(input),
+                        ggml_time_us() - copy_start_us,
+                        copy_wait_us);
             }
         }
 

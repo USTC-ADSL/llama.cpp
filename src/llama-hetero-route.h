@@ -187,6 +187,10 @@ static inline int llama_hetero_backend_kind(const std::string & value) {
     return 3;
 }
 
+static inline bool llama_hetero_fg_layer_allowed(int layer_id, int max_layers) {
+    return max_layers <= 0 || layer_id < 0 || layer_id < max_layers;
+}
+
 static inline bool llama_hetero_is_cpu_backend(const std::string & value) {
     return llama_hetero_canonical_backend(value) == "cpu";
 }
@@ -435,6 +439,28 @@ static inline bool llama_hetero_route_is_phase_homogeneous(const llama_hetero_ro
     return true;
 }
 
+template <typename Predicate>
+static inline bool llama_hetero_route_uses_backend(
+        const llama_hetero_route_spec & spec,
+        Predicate predicate) {
+    static constexpr std::array<llama_hetero_route_stage, 5> kStages = {{
+        llama_hetero_route_stage::ATTN_PROJ,
+        llama_hetero_route_stage::ATTN_CORE,
+        llama_hetero_route_stage::ATTN_OUT,
+        llama_hetero_route_stage::FFN,
+        llama_hetero_route_stage::OUTPUT,
+    }};
+
+    for (const auto stage : kStages) {
+        const std::string backend = spec.backend_for(stage);
+        if (!backend.empty() && predicate(backend)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static inline llama_hetero_route_spec llama_hetero_canonicalize_phase_route_spec(const llama_hetero_route_spec & spec) {
     llama_hetero_route_spec canonical;
     const std::string backend = llama_hetero_phase_backend_for_route(spec);
@@ -489,14 +515,11 @@ static inline llama_hetero_route_spec llama_hetero_parse_route_spec(const char *
 
     }
 
-    if (!llama_hetero_route_is_phase_homogeneous(spec)) {
-        std::fprintf(stderr,
-                     "[hetero] mixed-stage routes are disabled on this branch; ignoring route=%s\n",
-                     route_value != nullptr ? route_value : "<null>");
-        return {};
+    if (llama_hetero_route_is_phase_homogeneous(spec)) {
+        return llama_hetero_canonicalize_phase_route_spec(spec);
     }
 
-    return llama_hetero_canonicalize_phase_route_spec(spec);
+    return spec;
 }
 
 static inline llama_hetero_route_spec llama_hetero_parse_route_spec_from_env() {

@@ -35,7 +35,7 @@ int64_t env_i64_value(const char * name, int64_t default_value) {
 bool candidate_uses_backend(
         const llama_hetero_execution_plan & plan,
         bool (*predicate)(const std::string &)) {
-    if (predicate(llama_hetero_phase_backend_for_route(plan.route))) {
+    if (llama_hetero_route_uses_backend(plan.route, predicate)) {
         return true;
     }
     return predicate(plan.attn_kv.producer_backend) ||

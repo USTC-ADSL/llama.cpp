@@ -200,6 +200,8 @@ llama_build_and_test(test-log.cpp)
 llama_build_and_test(test-memory-attn-v-trans.cpp)
 llama_build_and_test(test-context-qnn-request-gating.cpp)
 llama_build_and_test(test-context-qnn-phase-migration.cpp)
+llama_build_and_test(test-hetero-stage-route.cpp)
+llama_test_cmd(${CMAKE_CURRENT_SOURCE_DIR}/test-fgsplit-parser.sh WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 llama_build(test-llama-bench-utils.cpp)
 llama_test(test-llama-bench-utils)
 llama_build_and_test(test-context-cpu-host-fallback.cpp)
@@ -210,6 +212,7 @@ llama_build_and_test(test-opencl-external-host-alias.cpp)
 llama_build_and_test(test-qnn-aot-pos-utils.cpp)
 llama_build_and_test(test-qnn-aot-kv-utils.cpp)
 llama_build_and_test(test-qnn-aot-lazy-transformer-init.cpp)
+llama_build_and_test(test-qnn-aot-support-policy.cpp)
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp

@@ -23,6 +23,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <fstream>
 #include <vector>
 #include <string>
@@ -33,6 +36,8 @@
 #include <unordered_map>
 #include <charconv>
 #include <mutex>
+#include <thread>
+#include <array>
 #ifdef _WIN32
 #include <malloc.h>
 #endif
@@ -92,6 +97,21 @@ struct ggml_backend_opencl_external_host_alias_timing {
 static bool ggml_backend_opencl_env_flag_enabled(const char * name) {
     const char * value = std::getenv(name);
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+static uint64_t ggml_backend_opencl_env_u64(const char * name, uint64_t default_value) {
+    const char * value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_value;
+    }
+
+    char * end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (end == value) {
+        return default_value;
+    }
+
+    return (uint64_t) parsed;
 }
 
 static bool ggml_backend_opencl_is_qnn_host_buffer(ggml_backend_buffer_t buffer) {
@@ -429,6 +449,103 @@ static void populateProfilingInfo(
     info.output_size[3] = tensor->ne[3];
 }
 
+static bool ggml_opencl_kernel_trace_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * env = std::getenv("GGML_OPENCL_KERNEL_TRACE");
+        enabled = (env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
+struct ggml_opencl_kernel_trace_state {
+    std::mutex mutex;
+    uint64_t total = 0;
+    std::array<uint64_t, GGML_STAGE_COUNT> by_stage = {};
+    std::array<uint64_t, 3> by_phase = {};
+};
+
+static ggml_opencl_kernel_trace_state & ggml_opencl_kernel_trace_state_get() {
+    static ggml_opencl_kernel_trace_state state;
+    return state;
+}
+
+static void ggml_opencl_kernel_trace_record(const ggml_tensor * tensor) {
+    if (!ggml_opencl_kernel_trace_enabled() || tensor == nullptr) {
+        return;
+    }
+
+    const char * name_src = tensor->name;
+    if (name_src == nullptr || name_src[0] == '\0') {
+        name_src = ggml_op_name(tensor->op);
+    }
+
+    const enum ggml_stage_type stage = ggml_classify_stage(name_src);
+    const enum ggml_inference_phase phase = ggml_profiler_get_inference_phase();
+
+    auto & state = ggml_opencl_kernel_trace_state_get();
+    std::lock_guard<std::mutex> guard(state.mutex);
+    state.total++;
+    if (stage >= 0 && stage < GGML_STAGE_COUNT) {
+        state.by_stage[stage]++;
+    }
+    if (phase >= 0 && phase < (int) state.by_phase.size()) {
+        state.by_phase[phase]++;
+    }
+}
+
+static void ggml_opencl_kernel_trace_write() {
+    if (!ggml_opencl_kernel_trace_enabled()) {
+        return;
+    }
+
+    auto & state = ggml_opencl_kernel_trace_state_get();
+    std::lock_guard<std::mutex> guard(state.mutex);
+    if (state.total == 0) {
+        GGML_LOG_INFO("OPENCL_KERNEL_TRACE total=0\n");
+        return;
+    }
+
+    GGML_LOG_INFO("OPENCL_KERNEL_TRACE total=%" PRIu64 "\n", state.total);
+    for (int i = 0; i < GGML_STAGE_COUNT; ++i) {
+        if (state.by_stage[i] == 0) {
+            continue;
+        }
+        GGML_LOG_INFO("OPENCL_KERNEL_TRACE stage=%s count=%" PRIu64 "\n",
+                ggml_stage_name((enum ggml_stage_type) i), state.by_stage[i]);
+    }
+    for (int i = 0; i < (int) state.by_phase.size(); ++i) {
+        if (state.by_phase[i] == 0) {
+            continue;
+        }
+        GGML_LOG_INFO("OPENCL_KERNEL_TRACE phase=%s count=%" PRIu64 "\n",
+                ggml_inference_phase_name((enum ggml_inference_phase) i), state.by_phase[i]);
+    }
+
+    const char * csv_path = std::getenv("GGML_OPENCL_KERNEL_TRACE_CSV");
+    if (csv_path == nullptr || csv_path[0] == '\0') {
+        return;
+    }
+
+    FILE * file = fopen(csv_path, "w");
+    if (file == nullptr) {
+        GGML_LOG_WARN("ggml_opencl: failed to open kernel trace csv %s\n", csv_path);
+        return;
+    }
+
+    fprintf(file, "kind,name,count\n");
+    fprintf(file, "total,all,%" PRIu64 "\n", state.total);
+    for (int i = 0; i < GGML_STAGE_COUNT; ++i) {
+        fprintf(file, "stage,%s,%" PRIu64 "\n",
+                ggml_stage_name((enum ggml_stage_type) i), state.by_stage[i]);
+    }
+    for (int i = 0; i < (int) state.by_phase.size(); ++i) {
+        fprintf(file, "phase,%s,%" PRIu64 "\n",
+                ggml_inference_phase_name((enum ggml_inference_phase) i), state.by_phase[i]);
+    }
+    fclose(file);
+}
+
 struct ggml_backend_opencl_context;
 struct ggml_tensor_extra_cl;
 
@@ -468,6 +585,7 @@ struct ggml_backend_opencl_context {
     std::string device_name;
 
     std::string driver_version;
+    ggml_cl_version opencl_c_version;
 
     GPU_FAMILY gpu_family;
     ADRENO_GPU_GEN adreno_gen;
@@ -670,6 +788,16 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mm_q8_0_f32_l4_lm;
     cl_kernel kernel_mul_mm_q6_k_f32_l4_lm;
 
+    bool sim_busy_enabled = false;
+    std::atomic<bool> sim_busy_stop { false };
+    std::atomic<uint64_t> sim_busy_launches { 0 };
+    std::atomic<uint64_t> sim_busy_errors { 0 };
+    cl_command_queue sim_busy_queue = nullptr;
+    cl_program sim_busy_program = nullptr;
+    cl_kernel sim_busy_kernel = nullptr;
+    cl_mem sim_busy_buffer = nullptr;
+    std::thread sim_busy_thread;
+
     std::vector<ProfilingInfo> profiling_info;
 
     void write_profiling_info() {
@@ -830,6 +958,7 @@ struct ggml_backend_opencl_context {
     }
 
     void enqueue_ndrange_kernel(cl_kernel kernel, cl_uint work_dim, size_t *global_work_size, size_t *local_work_size, const ggml_tensor * tensor) {
+        ggml_opencl_kernel_trace_record(tensor);
 #ifdef GGML_OPENCL_PROFILING
         cl_event evt;
         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, &evt));
@@ -874,14 +1003,20 @@ struct ggml_backend_opencl_context {
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
     void release_external_host_views();
+    void start_sim_busy_load(ggml_cl_version opencl_c_version);
+    void stop_sim_busy_load();
 
     void free() {
         ref_count--;
         if (ref_count == 0) {
+            stop_sim_busy_load();
             release_external_host_views();
 #ifdef GGML_OPENCL_PROFILING
             write_profiling_info();
+            ggml_opencl_kernel_trace_write();
             profiling_info.clear();
+#else
+            ggml_opencl_kernel_trace_write();
 #endif
         }
     }
@@ -934,6 +1069,215 @@ static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, co
     }
 
     return p;
+}
+
+static cl_program ggml_opencl_build_program_from_source_optional(
+        cl_context ctx,
+        cl_device_id dev,
+        const char * program_buffer,
+        const std::string & compile_opts) {
+    cl_int err = CL_SUCCESS;
+    const size_t program_size = strlen(program_buffer);
+    cl_program program = clCreateProgramWithSource(ctx, 1, &program_buffer, &program_size, &err);
+    if (err != CL_SUCCESS) {
+        GGML_LOG_WARN("ggml_opencl: simulation busy load could not create program, err=%d\n", err);
+        return nullptr;
+    }
+
+    err = clBuildProgram(program, 0, nullptr, compile_opts.c_str(), nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        size_t log_size = 0;
+        clGetProgramBuildInfo(program, dev, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_size);
+        std::vector<char> log(log_size + 1, '\0');
+        if (log_size > 0) {
+            clGetProgramBuildInfo(program, dev, CL_PROGRAM_BUILD_LOG, log_size, log.data(), nullptr);
+        }
+        GGML_LOG_WARN("ggml_opencl: simulation busy load kernel compile failed, err=%d:\n%s\n", err, log.data());
+        clReleaseProgram(program);
+        return nullptr;
+    }
+
+    return program;
+}
+
+void ggml_backend_opencl_context::start_sim_busy_load(ggml_cl_version opencl_c_version) {
+    if (!ggml_backend_opencl_env_flag_enabled("GGML_OPENCL_SIM_BUSY") &&
+        !ggml_backend_opencl_env_flag_enabled("GGML_OPENCL_SIM_BUSY_ENABLE")) {
+        return;
+    }
+
+    if (sim_busy_enabled) {
+        return;
+    }
+
+    const uint64_t default_global = 262144;
+    const uint64_t default_iters = 8192;
+    const uint64_t default_buffer_elems = 1 << 20;
+
+    const size_t global_env = (size_t) ggml_backend_opencl_env_u64("GGML_OPENCL_SIM_BUSY_GLOBAL", default_global);
+    const cl_uint iters = (cl_uint) std::min<uint64_t>(
+            ggml_backend_opencl_env_u64("GGML_OPENCL_SIM_BUSY_ITERS", default_iters),
+            UINT32_MAX);
+    const cl_uint buffer_elems = (cl_uint) std::min<uint64_t>(
+            std::max<uint64_t>(ggml_backend_opencl_env_u64("GGML_OPENCL_SIM_BUSY_BUFFER_ELEMS", default_buffer_elems), 1),
+            UINT32_MAX);
+    const uint64_t sleep_us = ggml_backend_opencl_env_u64("GGML_OPENCL_SIM_BUSY_SLEEP_US", 0);
+    size_t local = 1;
+    const size_t local_candidates[] = { 256, 128, 64, 32, 16, 8, 4, 2 };
+    for (const size_t candidate : local_candidates) {
+        if (candidate <= max_workgroup_size) {
+            local = candidate;
+            break;
+        }
+    }
+    const size_t global = align_to(std::max<size_t>(global_env, local), local);
+
+    auto opencl_c_std =
+        std::string("CL") + std::to_string(opencl_c_version.major) + "." + std::to_string(opencl_c_version.minor);
+    std::string compile_opts = std::string("-cl-std=") + opencl_c_std +
+                               " -cl-mad-enable -cl-unsafe-math-optimizations"
+                               " -cl-finite-math-only -cl-fast-relaxed-math";
+
+    static const char * sim_busy_source = R"CLC(
+__kernel void ggml_opencl_sim_busy(__global uint * buf, const uint iters, const uint elems, const uint seed) {
+    const size_t gid = get_global_id(0);
+    const uint idx = (uint) (gid % (size_t) elems);
+    uint x = buf[idx] ^ (uint) gid ^ seed;
+    for (uint i = 0; i < iters; ++i) {
+        x = x * 1664525u + 1013904223u;
+        x ^= x >> 13;
+        x ^= x << 17;
+    }
+    buf[idx] = x;
+}
+)CLC";
+
+    sim_busy_program = ggml_opencl_build_program_from_source_optional(context, device, sim_busy_source, compile_opts);
+    if (sim_busy_program == nullptr) {
+        return;
+    }
+
+    cl_int err = CL_SUCCESS;
+    sim_busy_kernel = clCreateKernel(sim_busy_program, "ggml_opencl_sim_busy", &err);
+    if (err != CL_SUCCESS) {
+        GGML_LOG_WARN("ggml_opencl: simulation busy load could not create kernel, err=%d\n", err);
+        clReleaseProgram(sim_busy_program);
+        sim_busy_program = nullptr;
+        return;
+    }
+
+    sim_busy_buffer = clCreateBuffer(context, CL_MEM_READ_WRITE, (size_t) buffer_elems * sizeof(cl_uint), nullptr, &err);
+    if (err != CL_SUCCESS) {
+        GGML_LOG_WARN("ggml_opencl: simulation busy load could not allocate buffer, err=%d elems=%u\n", err, buffer_elems);
+        clReleaseKernel(sim_busy_kernel);
+        clReleaseProgram(sim_busy_program);
+        sim_busy_kernel = nullptr;
+        sim_busy_program = nullptr;
+        return;
+    }
+
+    cl_command_queue_properties props = 0;
+    sim_busy_queue = clCreateCommandQueue(context, device, props, &err);
+    if (err != CL_SUCCESS) {
+        GGML_LOG_WARN("ggml_opencl: simulation busy load could not create queue, err=%d\n", err);
+        clReleaseMemObject(sim_busy_buffer);
+        clReleaseKernel(sim_busy_kernel);
+        clReleaseProgram(sim_busy_program);
+        sim_busy_buffer = nullptr;
+        sim_busy_kernel = nullptr;
+        sim_busy_program = nullptr;
+        return;
+    }
+
+    sim_busy_stop.store(false, std::memory_order_relaxed);
+    sim_busy_launches.store(0, std::memory_order_relaxed);
+    sim_busy_errors.store(0, std::memory_order_relaxed);
+    sim_busy_enabled = true;
+
+    GGML_LOG_INFO(
+            "ggml_opencl: simulation busy load enabled global=%zu local=%zu iters=%u buffer_elems=%u sleep_us=%" PRIu64 "\n",
+            global, local, iters, buffer_elems, sleep_us);
+
+    sim_busy_thread = std::thread([this, global, local, iters, buffer_elems, sleep_us]() {
+        const size_t global_work_size[1] = { global };
+        const size_t local_work_size[1] = { local };
+
+        cl_int err = CL_SUCCESS;
+        while (!sim_busy_stop.load(std::memory_order_relaxed)) {
+            const cl_uint seed = (cl_uint) sim_busy_launches.load(std::memory_order_relaxed);
+            err = clSetKernelArg(sim_busy_kernel, 0, sizeof(cl_mem), &sim_busy_buffer);
+            if (err == CL_SUCCESS) {
+                err = clSetKernelArg(sim_busy_kernel, 1, sizeof(cl_uint), &iters);
+            }
+            if (err == CL_SUCCESS) {
+                err = clSetKernelArg(sim_busy_kernel, 2, sizeof(cl_uint), &buffer_elems);
+            }
+            if (err == CL_SUCCESS) {
+                err = clSetKernelArg(sim_busy_kernel, 3, sizeof(cl_uint), &seed);
+            }
+            if (err == CL_SUCCESS) {
+                err = clEnqueueNDRangeKernel(
+                        sim_busy_queue,
+                        sim_busy_kernel,
+                        1,
+                        nullptr,
+                        global_work_size,
+                        local_work_size,
+                        0,
+                        nullptr,
+                        nullptr);
+            }
+            if (err == CL_SUCCESS) {
+                err = clFinish(sim_busy_queue);
+            }
+
+            if (err != CL_SUCCESS) {
+                sim_busy_errors.fetch_add(1, std::memory_order_relaxed);
+                GGML_LOG_WARN("ggml_opencl: simulation busy load stopped after OpenCL err=%d\n", err);
+                break;
+            }
+
+            sim_busy_launches.fetch_add(1, std::memory_order_relaxed);
+            if (sleep_us > 0) {
+                std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
+            }
+        }
+    });
+}
+
+void ggml_backend_opencl_context::stop_sim_busy_load() {
+    if (!sim_busy_enabled) {
+        return;
+    }
+
+    sim_busy_stop.store(true, std::memory_order_relaxed);
+    if (sim_busy_thread.joinable()) {
+        sim_busy_thread.join();
+    }
+
+    GGML_LOG_INFO(
+            "ggml_opencl: simulation busy load stopped launches=%" PRIu64 " errors=%" PRIu64 "\n",
+            sim_busy_launches.load(std::memory_order_relaxed),
+            sim_busy_errors.load(std::memory_order_relaxed));
+
+    if (sim_busy_queue != nullptr) {
+        clReleaseCommandQueue(sim_busy_queue);
+        sim_busy_queue = nullptr;
+    }
+    if (sim_busy_buffer != nullptr) {
+        clReleaseMemObject(sim_busy_buffer);
+        sim_busy_buffer = nullptr;
+    }
+    if (sim_busy_kernel != nullptr) {
+        clReleaseKernel(sim_busy_kernel);
+        sim_busy_kernel = nullptr;
+    }
+    if (sim_busy_program != nullptr) {
+        clReleaseProgram(sim_busy_program);
+        sim_busy_program = nullptr;
+    }
+
+    sim_busy_enabled = false;
 }
 
 static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_version opencl_c_version) {
@@ -3218,6 +3562,8 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
     backend_ctx->disable_fusion = getenv("GGML_OPENCL_DISABLE_FUSION") != nullptr;
+    backend_ctx->opencl_c_version = opencl_c_version;
+    backend_ctx->start_sim_busy_load(opencl_c_version);
 
     dev_ctx->backend_ctx = backend_ctx.release();
     return dev_ctx->backend_ctx;
@@ -4612,6 +4958,8 @@ static ggml_backend_i ggml_backend_opencl_i = {
 ggml_backend_t ggml_backend_opencl_init(void) {
     ggml_backend_dev_t dev = ggml_backend_reg_dev_get(ggml_backend_opencl_reg(), 0);
     ggml_backend_opencl_context *backend_ctx = ggml_cl2_init(dev);
+    backend_ctx->ref_count++;
+    backend_ctx->start_sim_busy_load(backend_ctx->opencl_c_version);
 
     ggml_backend_t backend = new ggml_backend {
         /* .guid    = */ ggml_backend_opencl_guid(),
@@ -6685,6 +7033,7 @@ static ggml_backend_t ggml_backend_opencl_device_init(ggml_backend_dev_t dev, co
     ggml_backend_opencl_context * backend_ctx = ggml_cl2_init(dev);
     // Getting a new reference to the backend, increase ref_count
     backend_ctx->ref_count++;
+    backend_ctx->start_sim_busy_load(backend_ctx->opencl_c_version);
 
     ggml_backend_t backend = new ggml_backend {
         /* .guid      = */ ggml_backend_opencl_guid(),

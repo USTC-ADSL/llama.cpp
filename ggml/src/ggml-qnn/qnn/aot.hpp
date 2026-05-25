@@ -218,6 +218,7 @@ class qnn_aot_runtime {
     aot_match_result match_lm_head_graph(ggml_cgraph * cgraph) const;
     bool execute_fragment_view(ggml_cgraph * cgraph, int i0, int i1);
     bool try_execute_fragmented_transformer(ggml_cgraph * cgraph);
+    bool try_execute_adjacent_stage_sequence(ggml_cgraph * cgraph);
     bool execute_attention(ggml_cgraph * cgraph, const aot_match_result & match);
     bool execute_attn_proj(ggml_cgraph * cgraph, const aot_match_result & match);
     bool execute_attn_core(ggml_cgraph * cgraph, const aot_match_result & match);
@@ -239,11 +240,15 @@ class qnn_aot_runtime {
                                  size_t                                      layer_id);
     qnn_aot_graph * ensure_graph_loaded(const qnn_aot_graph_config & graph_config,
                                         graph_family &                family);
+    bool any_loaded_graph_uses_model_path(const std::string & resolved_model_path) const;
+    void evict_stateless_stage_graphs_for_model(graph_family & family,
+                                                const qnn_aot_graph_config & config,
+                                                const char * stage);
 
     void compute_rope_embeds();
     void fill_rope_embeds(qnn_aot_graph & graph, size_t start_pos, size_t n_tokens);
     void fill_attention_bias(qnn_aot_graph & graph, size_t n_tokens);
-    void save_kv(qnn_aot_graph & graph, size_t n_tokens);
+    void save_kv(qnn_aot_graph & graph, size_t kv_position, size_t n_tokens);
     bool import_generic_kv_prefix_to_graph(qnn_aot_graph & graph,
                                            const aot_match_result & match,
                                            size_t source_token_offset,

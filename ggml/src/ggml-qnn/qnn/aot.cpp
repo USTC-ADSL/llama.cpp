@@ -2,6 +2,7 @@
 #include "aot-init-policy.hpp"
 #include "aot-kv-utils.hpp"
 #include "aot-pos-utils.hpp"
+#include "aot-support-policy.hpp"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -908,6 +909,44 @@ bool env_flag_enabled(const char * name) {
 
 bool aot_trace_load_timing_enabled() {
     return env_flag_enabled("GGML_QNN_AOT_TRACE_LOAD_TIMING");
+}
+
+bool aot_evict_stateless_stage_graphs_enabled() {
+    return env_flag_enabled("GGML_QNN_AOT_EVICT_STATELESS_STAGE_GRAPHS");
+}
+
+bool aot_fg_trace_enabled() {
+    return env_flag_enabled("GGML_QNN_AOT_FG_TRACE") ||
+           env_flag_enabled("GGML_HETERO_FG_TRACE") ||
+           env_flag_enabled("GGML_HETERO_FG_SPLIT");
+}
+
+void aot_fg_trace(
+        const char * subgraph,
+        size_t       layer_id,
+        size_t       tokens,
+        size_t       step_tokens,
+        size_t       offset,
+        int64_t      begin_us,
+        int64_t      end_us,
+        const char * graph_name,
+        bool         ok) {
+    if (!aot_fg_trace_enabled()) {
+        return;
+    }
+
+    QNN_LOG_INFO(
+            "FG_TRACE backend=qnn-npu layer=%zu subgraph=%s begin_us=%lld end_us=%lld duration_us=%lld tokens=%zu step_tokens=%zu offset=%zu graph=%s ok=%d\n",
+            layer_id,
+            subgraph != nullptr ? subgraph : "<unknown>",
+            (long long) begin_us,
+            (long long) end_us,
+            (long long) (end_us - begin_us),
+            tokens,
+            step_tokens,
+            offset,
+            graph_name != nullptr ? graph_name : "<unknown>",
+            ok ? 1 : 0);
 }
 
 const char * aot_debug_dump_dir() {
@@ -2860,7 +2899,12 @@ bool qnn_aot_runtime::prefers_cpu_op(const ggml_tensor * op) const {
         return true;
     }
 
-    if (_config.transformer_graphs.empty() && _config.attn_core_graphs.empty() && !_config.ffn_graphs.empty()) {
+    if (qnn_aot_should_prefer_cpu_for_ffn_only_boundary(
+                !_config.transformer_graphs.empty(),
+                !_config.attention_graphs.empty(),
+                !_config.attn_proj_graphs.empty(),
+                !_config.attn_core_graphs.empty(),
+                !_config.ffn_graphs.empty())) {
         if (name != nullptr && has_prefix(name, "ffn_inp-")) {
             return true;
         }
@@ -3029,10 +3073,11 @@ qnn_aot_runtime::aot_match_result qnn_aot_runtime::match_attention_graph(ggml_cg
                tensor->ne[1] > 0;
     };
 
-    auto is_attention_output_name = [this](const char * name) {
+    auto is_attention_output_name = [](const char * name) {
         return has_prefix(name, "__fattn__-") ||
                has_prefix(name, "attn_out-") ||
-               has_prefix(name, "kqv_out-");
+               has_prefix(name, "kqv_out-") ||
+               has_prefix(name, "ffn_inp-");
     };
 
     bool   seen_attention = false;
@@ -3043,7 +3088,9 @@ qnn_aot_runtime::aot_match_result qnn_aot_runtime::match_attention_graph(ggml_cg
         auto *       node = cgraph->nodes[i];
         const char * name = ggml_get_name(node);
         seen_attention = seen_attention || is_attention_stage_name(name);
-        seen_ffn       = seen_ffn || is_ffn_stage_name(name);
+        const bool is_attention_boundary =
+            name != nullptr && (has_prefix(name, "ffn_inp-") || has_prefix(name, "l_out-tail-"));
+        seen_ffn = seen_ffn || (is_ffn_stage_name(name) && !is_attention_boundary);
 
         size_t layer_id = 0;
         if (is_attention_stage_name(name) && parse_stage_layer_id(name, layer_id)) {
@@ -4206,6 +4253,78 @@ qnn_aot_graph * qnn_aot_runtime::ensure_graph_loaded(const qnn_aot_graph_config 
     return bucket.back().get();
 }
 
+bool qnn_aot_runtime::any_loaded_graph_uses_model_path(const std::string & resolved_model_path) const {
+    const auto graph_matches = [this, &resolved_model_path](const qnn_aot_graph * graph) {
+        return graph != nullptr && resolve_model_path(graph->config().model_path) == resolved_model_path;
+    };
+
+    const auto family_uses_path = [&graph_matches](const graph_family & family) {
+        for (const auto & bucket_kv : family) {
+            for (const auto & graph_ptr : bucket_kv.second) {
+                if (graph_matches(graph_ptr.get())) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    const auto vector_uses_path = [&graph_matches](const std::vector<std::unique_ptr<qnn_aot_graph>> & graphs) {
+        for (const auto & graph_ptr : graphs) {
+            if (graph_matches(graph_ptr.get())) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    return family_uses_path(_transformer_graphs) ||
+           vector_uses_path(_attention_graphs) ||
+           family_uses_path(_attn_proj_graphs) ||
+           family_uses_path(_attn_core_graphs) ||
+           family_uses_path(_ffn_graphs) ||
+           family_uses_path(_lm_head_graphs);
+}
+
+void qnn_aot_runtime::evict_stateless_stage_graphs_for_model(graph_family & family,
+                                                             const qnn_aot_graph_config & config,
+                                                             const char * stage) {
+    if (!aot_evict_stateless_stage_graphs_enabled()) {
+        return;
+    }
+
+    const std::string resolved_model_path = resolve_model_path(config.model_path);
+    size_t erased_graphs = 0;
+    for (auto bucket_it = family.begin(); bucket_it != family.end(); ) {
+        auto & bucket = bucket_it->second;
+        const auto before = bucket.size();
+        bucket.erase(std::remove_if(bucket.begin(), bucket.end(), [this, &resolved_model_path](const std::unique_ptr<qnn_aot_graph> & graph_ptr) {
+            return graph_ptr != nullptr && resolve_model_path(graph_ptr->config().model_path) == resolved_model_path;
+        }), bucket.end());
+        erased_graphs += before - bucket.size();
+
+        if (bucket.empty()) {
+            bucket_it = family.erase(bucket_it);
+        } else {
+            ++bucket_it;
+        }
+    }
+
+    bool erased_context = false;
+    if (!any_loaded_graph_uses_model_path(resolved_model_path)) {
+        erased_context = _contexts.erase(resolved_model_path) > 0;
+    }
+
+    if (erased_graphs > 0 || erased_context) {
+        QNN_LOG_INFO("[aot] evicted stateless stage graph cache stage=%s graph=%s model_path=%s erased_graphs=%zu erased_context=%d\n",
+                     stage != nullptr ? stage : "<unknown>",
+                     config.graph_name.c_str(),
+                     resolved_model_path.c_str(),
+                     erased_graphs,
+                     erased_context ? 1 : 0);
+    }
+}
+
 qnn_aot_graph * qnn_aot_runtime::select_graph(const std::vector<qnn_aot_graph_config> & configs,
                                               graph_family &                              family,
                                               size_t                                      n_tokens,
@@ -4469,7 +4588,7 @@ static bool materialize_attention_bias_for_graph(const ggml_tensor * mask,
     return false;
 }
 
-void qnn_aot_runtime::save_kv(qnn_aot_graph & graph, size_t n_tokens) {
+void qnn_aot_runtime::save_kv(qnn_aot_graph & graph, size_t kv_position, size_t n_tokens) {
     const auto & graph_config = graph.config();
     const size_t head_dim     = _config.model.head_dim;
 
@@ -4500,7 +4619,7 @@ void qnn_aot_runtime::save_kv(qnn_aot_graph & graph, size_t n_tokens) {
                 QNN_LOG_INFO(
                     "[aot] save_kv sample: graph=%s base=%zu tokens=%zu layer=%zu k0=[%.5f %.5f %.5f %.5f] v0=[%.5f %.5f %.5f %.5f]\n",
                     graph_config.graph_name.c_str(),
-                    _kv_position,
+                    kv_position,
                     n_tokens,
                     layer,
                     read_fp_value(key_out + 0 * key_element_size, key_element_size),
@@ -4515,7 +4634,7 @@ void qnn_aot_runtime::save_kv(qnn_aot_graph & graph, size_t n_tokens) {
 
             for (size_t token = 0; token < n_tokens; ++token) {
                 // Bug 5 fix: guard against writing past the end of the KV cache.
-                const size_t cache_slot = _kv_position + token;
+                const size_t cache_slot = kv_position + token;
                 if (cache_slot >= graph_config.cache_size) {
                     QNN_LOG_WARN("[aot] save_kv: cache slot %zu >= cache_size %zu, dropping token %zu\n",
                                  cache_slot, graph_config.cache_size, token);
@@ -5476,17 +5595,20 @@ bool qnn_aot_runtime::execute_attention(ggml_cgraph * cgraph, const aot_match_re
         return false;
     }
 
+    const auto & graph_config = graph->config();
+    size_t graph_pos = graph_kv_position(graph_config);
     const bool apply_seed_prefix_offset =
         _seed_kv_loaded &&
         _seed_kv_size > 0 &&
-        _kv_position == _seed_kv_size &&
+        graph_pos == _seed_kv_size &&
         aot_phase_switch_into_seeded_qnn_from_non_qnn_prefill();
-    const size_t effective_inferred_pos =
+    size_t effective_inferred_pos =
         apply_seed_prefix_offset ? match.inferred_pos + _seed_kv_size : match.inferred_pos;
 
     if (aot_trace_bind_enabled()) {
-        QNN_LOG_INFO("[aot] attention prefix state: graph=%s kv_position=%zu seed_kv_size=%zu inferred_pos=%zu effective_pos=%zu n_tokens=%zu\n",
-                     graph->config().graph_name.c_str(),
+        QNN_LOG_INFO("[aot] attention prefix state: graph=%s graph_pos=%zu global_kv_position=%zu seed_kv_size=%zu inferred_pos=%zu effective_pos=%zu n_tokens=%zu\n",
+                     graph_config.graph_name.c_str(),
+                     graph_pos,
                      _kv_position,
                      _seed_kv_size,
                      match.inferred_pos,
@@ -5494,24 +5616,24 @@ bool qnn_aot_runtime::execute_attention(ggml_cgraph * cgraph, const aot_match_re
                      match.n_tokens);
     }
 
-    if ((effective_inferred_pos == 0 && _kv_position != 0) ||
-        (_kv_position + match.n_tokens > graph->config().cache_size && effective_inferred_pos == 0)) {
+    size_t inferred_from_k_idxs = 0;
+    if (qnn_aot_try_infer_contiguous_start_pos(match.k_idxs, match.n_tokens, inferred_from_k_idxs)) {
+        effective_inferred_pos = apply_seed_prefix_offset ? inferred_from_k_idxs + _seed_kv_size : inferred_from_k_idxs;
+        if (aot_trace_bind_enabled()) {
+            QNN_LOG_INFO("[aot] inferred generic KV prefix from k_idxs: graph=%s inferred_pos=%zu\n",
+                         graph_config.graph_name.c_str(),
+                         effective_inferred_pos);
+        }
+    }
+
+    if ((effective_inferred_pos == 0 && graph_pos != 0) ||
+        (graph_pos + match.n_tokens > graph_config.cache_size && effective_inferred_pos == 0)) {
         reset_state();
+        graph_pos = graph_kv_position(graph_config);
     }
 
     size_t generic_prefix_tokens = effective_inferred_pos;
-    if (_kv_position == 0 && generic_prefix_tokens == 0) {
-        size_t inferred_from_k_idxs = 0;
-        if (qnn_aot_try_infer_contiguous_start_pos(match.k_idxs, match.n_tokens, inferred_from_k_idxs)) {
-            generic_prefix_tokens = inferred_from_k_idxs;
-            if (aot_trace_bind_enabled()) {
-                QNN_LOG_INFO("[aot] inferred generic KV prefix from k_idxs: graph=%s inferred_pos=%zu\n",
-                             graph->config().graph_name.c_str(),
-                             generic_prefix_tokens);
-            }
-        }
-    }
-    if (_kv_position == 0 && generic_prefix_tokens == 0 && match.kq_mask != nullptr && match.n_tokens == 1) {
+    if (graph_pos == 0 && generic_prefix_tokens == 0 && match.kq_mask != nullptr && match.n_tokens == 1) {
         std::vector<int64_t> inferred_slots;
         if (infer_current_token_slots_from_kq_mask(match.kq_mask,
                                                    match.n_tokens,
@@ -5522,7 +5644,7 @@ bool qnn_aot_runtime::execute_attention(ggml_cgraph * cgraph, const aot_match_re
             generic_prefix_tokens = static_cast<size_t>(inferred_slots[0]);
         }
     }
-    if (_kv_position == 0 && generic_prefix_tokens == 0 && aot_trace_bind_enabled()) {
+    if (graph_pos == 0 && generic_prefix_tokens == 0 && aot_trace_bind_enabled()) {
         std::vector<int64_t> k_idx_sample;
         const bool has_k_idx_sample = copy_i64_tensor_slice(match.k_idxs, 0, std::min<size_t>(match.n_tokens, 4), k_idx_sample);
         std::vector<int64_t> inferred_slots;
@@ -5530,9 +5652,9 @@ bool qnn_aot_runtime::execute_attention(ggml_cgraph * cgraph, const aot_match_re
                                    infer_current_token_slots_from_kq_mask(match.kq_mask,
                                                                           match.n_tokens,
                                                                           _config.model.attention_mask_value,
-                                                                          inferred_slots);
+                                                                           inferred_slots);
         QNN_LOG_INFO("[aot] generic KV prefix unresolved: graph=%s k_idxs=%s kq_mask=%s k_idx_sample=%s mask_slot0=%lld\n",
-                     graph->config().graph_name.c_str(),
+                     graph_config.graph_name.c_str(),
                      match.k_idxs ? ggml_type_name(match.k_idxs->type) : "<null>",
                      match.kq_mask ? ggml_type_name(match.kq_mask->type) : "<null>",
                      has_k_idx_sample && !k_idx_sample.empty() ? std::to_string(k_idx_sample[0]).c_str() : "<none>",
@@ -5541,11 +5663,12 @@ bool qnn_aot_runtime::execute_attention(ggml_cgraph * cgraph, const aot_match_re
 
     if (!import_missing_generic_kv_prefix_to_graph(*graph, match, generic_prefix_tokens, apply_seed_prefix_offset)) {
         QNN_LOG_WARN("[aot] attention failed to import generic KV prefix for graph=%s inferred_pos=%zu\n",
-                     graph->config().graph_name.c_str(),
+                     graph_config.graph_name.c_str(),
                      generic_prefix_tokens);
         return false;
     }
-    _kv_position = std::max(_kv_position, generic_prefix_tokens);
+    graph_pos = generic_prefix_tokens;
+    _kv_position = std::max(_kv_position, graph_pos);
 
     if (match.embd->type != GGML_TYPE_F32 || match.out->type != GGML_TYPE_F32) {
         QNN_LOG_WARN("[aot] attention IO expects F32 tensors, got %s -> %s\n",
@@ -5583,18 +5706,19 @@ bool qnn_aot_runtime::execute_attention(ggml_cgraph * cgraph, const aot_match_re
 
         copy_ggml_rows_to_contiguous(match.embd, offset, step, embed_dim, x_buffer);
 
-        fill_rope_embeds(*graph, _kv_position, step);
+        const size_t step_kv_position = graph_pos + offset;
+        fill_rope_embeds(*graph, step_kv_position, step);
         if (!materialize_attention_bias_for_graph(match.kq_mask,
                                                   *graph,
                                                   _config.model.attention_mask_value,
                                                   step,
-                                                  _kv_position)) {
+                                                  step_kv_position)) {
             fill_attention_bias(*graph, step);
             maybe_trace_attention_bias_compare(match.kq_mask,
                                                *graph,
                                                _config.model.attention_mask_value,
                                                step,
-                                               _kv_position);
+                                               step_kv_position);
         }
 
         if (!graph->execute()) {
@@ -5602,13 +5726,13 @@ bool qnn_aot_runtime::execute_attention(ggml_cgraph * cgraph, const aot_match_re
         }
 
         copy_contiguous_rows_to_ggml(match.out, offset, step, embed_dim, out_buffer);
-        save_kv(*graph, step);
+        save_kv(*graph, step_kv_position, step);
         if (!write_generic_kv_from_graph(*graph, match, offset, step)) {
             return false;
         }
 
-        mark_graph_kv_position(graph->config(), _kv_position + step);
-        _kv_position += step;
+        mark_graph_kv_position(graph_config, step_kv_position + step);
+        _kv_position = std::max(_kv_position, step_kv_position + step);
         offset += step;
     }
 
@@ -5882,7 +6006,7 @@ bool qnn_aot_runtime::execute_transformer(ggml_cgraph * cgraph, const aot_match_
                 return false;
             }
 
-            save_kv(*graph, step);
+            save_kv(*graph, _kv_position, step);
             if (!write_generic_kv_from_graph(*graph, match, offset, step)) {
                 return false;
             }
@@ -6039,7 +6163,19 @@ bool qnn_aot_runtime::execute_attn_proj(ggml_cgraph * cgraph, const aot_match_re
 
         fill_rope_embeds(*graph, match.inferred_pos + offset, step);
 
-        if (!graph->execute()) {
+        const int64_t t_fg_begin_us = aot_fg_trace_enabled() ? ggml_time_us() : 0;
+        const bool graph_ok = graph->execute();
+        const int64_t t_fg_end_us = aot_fg_trace_enabled() ? ggml_time_us() : 0;
+        aot_fg_trace("qnn_proj",
+                     match.layer_id,
+                     match.n_tokens,
+                     step,
+                     offset,
+                     t_fg_begin_us,
+                     t_fg_end_us,
+                     graph->config().graph_name.c_str(),
+                     graph_ok);
+        if (!graph_ok) {
             graph->clear_external_tensor_bindings();
             return false;
         }
@@ -6061,6 +6197,8 @@ bool qnn_aot_runtime::execute_attn_proj(ggml_cgraph * cgraph, const aot_match_re
     }
 
     graph->clear_external_tensor_bindings();
+    const qnn_aot_graph_config executed_config = graph->config();
+    evict_stateless_stage_graphs_for_model(_attn_proj_graphs, executed_config, "attn_proj");
     return true;
 }
 
@@ -6660,12 +6798,25 @@ bool qnn_aot_runtime::execute_ffn(ggml_cgraph * cgraph, const aot_match_result &
                              ggml_get_name(match.out) != nullptr ? ggml_get_name(match.out) : "<unnamed>",
                              match.n_tokens);
             }
+            const int64_t t_fg_begin_us = aot_fg_trace_enabled() ? ggml_time_us() : 0;
             const bool ok = graph->execute();
+            const int64_t t_fg_end_us = aot_fg_trace_enabled() ? ggml_time_us() : 0;
+            aot_fg_trace("qnn_ffn",
+                         match.layer_id,
+                         match.n_tokens,
+                         match.n_tokens,
+                         0,
+                         t_fg_begin_us,
+                         t_fg_end_us,
+                         graph->config().graph_name.c_str(),
+                         ok);
             if (!ok) {
                 QNN_LOG_WARN("[aot] ffn graph execute failed: layer=%zu graph=%s tokens=%zu direct_bind=1\n",
                              match.layer_id, graph->config().graph_name.c_str(), match.n_tokens);
             }
+            const qnn_aot_graph_config executed_config = graph->config();
             graph->clear_external_tensor_bindings();
+            evict_stateless_stage_graphs_for_model(_ffn_graphs, executed_config, "ffn");
             return ok;
         }
 
@@ -6705,7 +6856,19 @@ bool qnn_aot_runtime::execute_ffn(ggml_cgraph * cgraph, const aot_match_result &
 
         copy_ggml_rows_to_contiguous(match.embd, offset, step, embed_dim, x_buffer);
 
-        if (!graph->execute()) {
+        const int64_t t_fg_begin_us = aot_fg_trace_enabled() ? ggml_time_us() : 0;
+        const bool graph_ok = graph->execute();
+        const int64_t t_fg_end_us = aot_fg_trace_enabled() ? ggml_time_us() : 0;
+        aot_fg_trace("qnn_ffn",
+                     match.layer_id,
+                     match.n_tokens,
+                     step,
+                     offset,
+                     t_fg_begin_us,
+                     t_fg_end_us,
+                     graph->config().graph_name.c_str(),
+                     graph_ok);
+        if (!graph_ok) {
             QNN_LOG_WARN("[aot] ffn graph execute failed: layer=%zu graph=%s tokens=%zu direct_bind=0 step=%zu offset=%zu\n",
                          match.layer_id, graph->config().graph_name.c_str(), match.n_tokens, step, offset);
             return false;
@@ -6715,6 +6878,8 @@ bool qnn_aot_runtime::execute_ffn(ggml_cgraph * cgraph, const aot_match_result &
         offset += step;
     }
 
+    const qnn_aot_graph_config executed_config = graph->config();
+    evict_stateless_stage_graphs_for_model(_ffn_graphs, executed_config, "ffn");
     return true;
 }
 
@@ -6926,11 +7091,20 @@ bool qnn_aot_runtime::try_execute_fragmented_transformer(ggml_cgraph * cgraph) {
         return false;
     }
 
-    if (!_config.transformer_graphs.empty() || !_config.attention_graphs.empty()) {
+    if (!qnn_aot_can_decompose_stage_fragments(
+                !_config.transformer_graphs.empty(),
+                !_config.attention_graphs.empty(),
+                !_config.attn_proj_graphs.empty(),
+                !_config.attn_core_graphs.empty(),
+                !_config.ffn_graphs.empty())) {
         return false;
     }
-
-    if (_config.attn_proj_graphs.empty() || _config.attn_core_graphs.empty() || _config.ffn_graphs.empty()) {
+    const auto fragment_plan = qnn_aot_select_stage_fragment_plan(
+            !_config.attention_graphs.empty(),
+            !_config.attn_proj_graphs.empty(),
+            !_config.attn_core_graphs.empty(),
+            !_config.ffn_graphs.empty());
+    if (fragment_plan == qnn_aot_stage_fragment_plan::unsupported) {
         return false;
     }
 
@@ -7015,6 +7189,30 @@ bool qnn_aot_runtime::try_execute_fragmented_transformer(ggml_cgraph * cgraph) {
                          bounds.ffn_inp,
                          bounds.l_out);
         }
+        if (fragment_plan == qnn_aot_stage_fragment_plan::full_attention_then_ffn) {
+            if (!execute_fragment_view(cgraph, bounds.begin, bounds.ffn_inp + 1)) {
+                if (aot_trace_match_enabled()) {
+                    std::fprintf(stderr,
+                                 "[aot] layer=%zu fragment stage=attention failed: nodes=[%d,%d)\n",
+                                 bounds.layer_id,
+                                 bounds.begin,
+                                 bounds.ffn_inp + 1);
+                }
+                return false;
+            }
+            if (!execute_fragment_view(cgraph, bounds.ffn_inp + 1, bounds.l_out + 1)) {
+                if (aot_trace_match_enabled()) {
+                    std::fprintf(stderr,
+                                 "[aot] layer=%zu fragment stage=ffn failed: nodes=[%d,%d)\n",
+                                 bounds.layer_id,
+                                 bounds.ffn_inp + 1,
+                                 bounds.l_out + 1);
+                }
+                return false;
+            }
+            continue;
+        }
+
         if (!execute_fragment_view(cgraph, bounds.begin, bounds.core_begin)) {
             if (aot_trace_match_enabled()) {
                 std::fprintf(stderr,
@@ -7042,6 +7240,101 @@ bool qnn_aot_runtime::try_execute_fragmented_transformer(ggml_cgraph * cgraph) {
                              bounds.layer_id,
                              bounds.ffn_inp + 1,
                              bounds.l_out + 1);
+            }
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool qnn_aot_runtime::try_execute_adjacent_stage_sequence(ggml_cgraph * cgraph) {
+    if (!_enabled || cgraph == nullptr || cgraph->n_nodes <= 1) {
+        return false;
+    }
+
+    if (!qnn_aot_can_execute_adjacent_stage_sequence(
+                !_config.transformer_graphs.empty(),
+                !_config.attention_graphs.empty(),
+                !_config.attn_proj_graphs.empty(),
+                !_config.attn_core_graphs.empty(),
+                !_config.ffn_graphs.empty())) {
+        return false;
+    }
+
+    const bool trace_match = aot_trace_match_enabled();
+    auto fragment_matches_stage = [&](int i0, int i1) {
+        ggml_cgraph view = ggml_graph_view(cgraph, i0, i1);
+
+        if (match_attn_proj_graph(&view).is_attn_proj) {
+            return true;
+        }
+        if (match_attn_core_graph(&view).is_attn_core) {
+            return true;
+        }
+        if (match_attention_graph(&view).is_attention) {
+            return true;
+        }
+        if (match_ffn_graph(&view).is_ffn) {
+            return true;
+        }
+        if (match_lm_head_graph(&view).is_lm_head) {
+            return true;
+        }
+        return false;
+    };
+
+    std::vector<std::pair<int, int>> fragments;
+    for (int begin = 0; begin < cgraph->n_nodes; ) {
+        int end = -1;
+        for (int candidate_end = cgraph->n_nodes; candidate_end > begin; --candidate_end) {
+            if (fragment_matches_stage(begin, candidate_end)) {
+                end = candidate_end;
+                break;
+            }
+        }
+
+        if (end < 0) {
+            if (trace_match) {
+                const char * first_name = ggml_get_name(cgraph->nodes[begin]);
+                std::fprintf(stderr,
+                             "[aot] adjacent stage sequence unmatched: begin=%d first=%s fragments=%zu\n",
+                             begin,
+                             first_name ? first_name : "<null>",
+                             fragments.size());
+            }
+            return false;
+        }
+
+        fragments.push_back({ begin, end });
+        begin = end;
+    }
+
+    if (fragments.size() <= 1) {
+        return false;
+    }
+
+    if (trace_match) {
+        const char * first_name = cgraph->n_nodes > 0 ? ggml_get_name(cgraph->nodes[0]) : nullptr;
+        const char * last_name  = cgraph->n_nodes > 0 ? ggml_get_name(cgraph->nodes[cgraph->n_nodes - 1]) : nullptr;
+        std::fprintf(stderr,
+                     "[aot] execute adjacent stage sequence fragments=%zu first=%s last=%s\n",
+                     fragments.size(),
+                     first_name ? first_name : "<null>",
+                     last_name ? last_name : "<null>");
+    }
+
+    for (const auto & fragment : fragments) {
+        if (!execute_fragment_view(cgraph, fragment.first, fragment.second)) {
+            if (trace_match) {
+                const char * first_name = ggml_get_name(cgraph->nodes[fragment.first]);
+                const char * last_name  = ggml_get_name(cgraph->nodes[fragment.second - 1]);
+                std::fprintf(stderr,
+                             "[aot] adjacent stage sequence fragment failed: nodes=[%d,%d) first=%s last=%s\n",
+                             fragment.first,
+                             fragment.second,
+                             first_name ? first_name : "<null>",
+                             last_name ? last_name : "<null>");
             }
             return false;
         }
@@ -7406,6 +7699,10 @@ bool qnn_aot_runtime::maybe_execute(ggml_cgraph * cgraph) {
     }
 
     if (try_execute_fragmented_transformer(cgraph)) {
+        return true;
+    }
+
+    if (try_execute_adjacent_stage_sequence(cgraph)) {
         return true;
     }
 
