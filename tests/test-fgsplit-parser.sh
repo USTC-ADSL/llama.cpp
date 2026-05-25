@@ -133,6 +133,30 @@ python3 "${ROOT_DIR}/tools/parse_fgsplit_trace.py" \
     --rounds 2 \
     --qnn-workpoint burst
 
+cat > "${TMP_DIR}/ffn_only_qnn_route.log" <<'EOF_FFN_ONLY'
+FG_TRACE backend=qnn-npu layer=0 subgraph=qnn_ffn begin_us=300 end_us=520 duration_us=220 tokens=16 step_tokens=16 offset=0 graph=ffn_layer_0 ok=1
+OPENCL_KERNEL_TRACE total=7
+OPENCL_KERNEL_TRACE stage=ATTN_CORE count=2
+{"model_filename":"fixture.gguf","n_prompt":0,"n_gen":16,"n_depth":512,"test_time":"2026-05-24T00:00:00Z","avg_ns":1000000000,"stddev_ns":0,"avg_ts":20.0,"stddev_ts":0.0}
+FG_RUN_EXIT_CODE=0
+EOF_FFN_ONLY
+
+python3 "${ROOT_DIR}/tools/parse_fgsplit_trace.py" \
+    --bench-log "${TMP_DIR}/ffn_only_qnn_route.log" \
+    --sample-log "${TMP_DIR}/power_samples.csv" \
+    --output-csv "${TMP_DIR}/out_ffn_only_qnn_route.csv" \
+    --mode synthetic \
+    --backend-policy fine_grained_qnn_gpu \
+    --fg-route "attn_proj=opencl,attn_core=opencl,attn_out=opencl,ffn=qnn-npu,output=opencl" \
+    --state-id fg_qnn_burst_gpu_967 \
+    --context-len 512 \
+    --prompt-tokens 512 \
+    --decode-tokens 16 \
+    --layers 1 \
+    --rounds 1 \
+    --gpu-freq-mhz 967 \
+    --qnn-workpoint burst
+
 python3 - "${TMP_DIR}/out.csv" <<'PY'
 import csv
 import sys
@@ -191,7 +215,7 @@ if row["support_status"] != "unsupported_by_shape":
     raise SystemExit(f"layer mismatch should be unsupported_by_shape, got {row['support_status']!r}")
 PY
 
-python3 - "${TMP_DIR}/out_gpu.csv" "${TMP_DIR}/out_qnn.csv" <<'PY'
+python3 - "${TMP_DIR}/out_gpu.csv" "${TMP_DIR}/out_qnn.csv" "${TMP_DIR}/out_ffn_only_qnn_route.csv" <<'PY'
 import csv
 import sys
 
@@ -199,6 +223,8 @@ with open(sys.argv[1], newline="") as handle:
     gpu = next(csv.DictReader(handle))
 with open(sys.argv[2], newline="") as handle:
     qnn = next(csv.DictReader(handle))
+with open(sys.argv[3], newline="") as handle:
+    ffn_only_qnn = next(csv.DictReader(handle))
 
 if gpu["backend_policy"] != "single_gpu_opencl":
     raise SystemExit(f"gpu backend policy mismatch: {gpu['backend_policy']!r}")
@@ -213,6 +239,14 @@ if qnn["support_status"] != "ok":
     raise SystemExit(f"qnn baseline should be ok, got {qnn['support_status']!r}")
 if qnn["fallback_used"] != "0":
     raise SystemExit(f"qnn baseline fallback should be 0, got {qnn['fallback_used']!r}")
+
+if ffn_only_qnn["support_status"] != "ok":
+    raise SystemExit(
+        f"ffn-only QNN route should not require qnn_proj events, got {ffn_only_qnn['support_status']!r}")
+if ffn_only_qnn["qnn_proj_us"] != "":
+    raise SystemExit(f"ffn-only QNN route should not report qnn_proj_us, got {ffn_only_qnn['qnn_proj_us']!r}")
+if ffn_only_qnn["qnn_ffn_us"] != "220.000":
+    raise SystemExit(f"ffn-only QNN route should report qnn_ffn_us, got {ffn_only_qnn['qnn_ffn_us']!r}")
 PY
 
 cat > "${TMP_DIR}/missing_qnn_proj.log" <<'EOF_MISSING_PROJ'
@@ -419,6 +453,8 @@ grep -F "rm -f cl_profiling.csv cl_stage_profiling.csv cl_trace.json" \
 grep -F 'BACKEND_POLICY="${BACKEND_POLICY:-fine_grained_qnn_gpu}"' \
     "${ROOT_DIR}/scripts/run_fgsplit_synthetic.sh" >/dev/null
 grep -F 'DEFAULT_FG_ROUTE="attn_proj=qnn-npu,attn_core=opencl,attn_out=cpu,ffn=qnn-npu,output=cpu"' \
+    "${ROOT_DIR}/scripts/run_fgsplit_synthetic.sh" >/dev/null
+grep -F -- "--fg-route \"\${FG_ROUTE}\"" \
     "${ROOT_DIR}/scripts/run_fgsplit_synthetic.sh" >/dev/null
 grep -F "export LLAMA_BENCH_QNN_PREWARM_DECODE=" \
     "${ROOT_DIR}/scripts/run_fgsplit_synthetic.sh" >/dev/null

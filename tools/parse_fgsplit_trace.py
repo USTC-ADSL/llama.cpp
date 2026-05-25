@@ -71,6 +71,7 @@ def parse_args():
     parser.add_argument("--remote-output-dir", default="")
     parser.add_argument("--mode", default="synthetic")
     parser.add_argument("--backend-policy", default="fine_grained_qnn_gpu")
+    parser.add_argument("--fg-route", default="")
     parser.add_argument("--state-id", default="")
     parser.add_argument("--workload-type", default="decode_like")
     parser.add_argument("--context-len", default="")
@@ -168,6 +169,42 @@ def parse_gpu_busy_value(value):
     if percent or first > 1.0:
         return first / 100.0
     return first
+
+
+def parse_fg_route(route_text):
+    text = (route_text or "").strip().lower()
+    default_route = {
+        "attn_proj": "qnn-npu",
+        "attn_core": "opencl",
+        "attn_out": "cpu",
+        "ffn": "qnn-npu",
+        "output": "cpu",
+    }
+    if not text:
+        return default_route
+    if "=" not in text:
+        return {stage: text for stage in default_route}
+
+    route = dict(default_route)
+    for token in text.split(","):
+        token = token.strip()
+        if not token or "=" not in token:
+            continue
+        stage, backend = token.split("=", 1)
+        stage = stage.strip().lower()
+        backend = backend.strip().lower()
+        if stage:
+            route[stage] = backend
+    return route
+
+
+def backend_is_qnn(backend):
+    return "qnn" in (backend or "").lower()
+
+
+def backend_is_opencl(backend):
+    text = (backend or "").lower()
+    return "opencl" in text or "gpu" in text
 
 
 def parse_measured_windows(text):
@@ -501,6 +538,7 @@ def detect_support_status(
         qnn_events,
         gpu_events,
         backend_policy,
+        fg_route="",
         qnn_proj_events=0,
         qnn_ffn_events=0,
         gpu_attn_core_events=0):
@@ -524,9 +562,20 @@ def detect_support_status(
         if qnn_events > 0:
             return "ok"
         return "unsupported_by_qnn_graph"
-    if qnn_proj_events <= 0 or qnn_ffn_events <= 0:
+
+    route = parse_fg_route(fg_route)
+    if backend_is_qnn(route.get("attn_proj")) and qnn_proj_events <= 0:
         return "unsupported_by_qnn_graph"
-    if gpu_attn_core_events <= 0:
+    if backend_is_qnn(route.get("ffn")) and qnn_ffn_events <= 0:
+        return "unsupported_by_qnn_graph"
+    if backend_is_opencl(route.get("attn_core")) and gpu_attn_core_events <= 0:
+        return "unsupported_by_gpu_kernel"
+
+    requires_qnn = any(backend_is_qnn(backend) for backend in route.values())
+    requires_opencl = any(backend_is_opencl(backend) for backend in route.values())
+    if requires_qnn and qnn_events <= 0:
+        return "unsupported_by_qnn_graph"
+    if requires_opencl and gpu_events <= 0:
         return "unsupported_by_gpu_kernel"
     if qnn_events > 0 and gpu_events > 0:
         return "ok"
@@ -534,9 +583,9 @@ def detect_support_status(
         return "unsupported_by_qnn_graph"
     if re.search(r"unsupported.*opencl|opencl.*unsupported|GPUOpenCL backend not available", text, re.IGNORECASE):
         return "unsupported_by_gpu_kernel"
-    if qnn_events == 0:
+    if requires_qnn and qnn_events == 0:
         return "unsupported_by_qnn_graph"
-    if gpu_events == 0:
+    if requires_opencl and gpu_events == 0:
         return "unsupported_by_gpu_kernel"
     return "failed"
 
@@ -776,6 +825,7 @@ def main():
         qnn_events,
         gpu_events,
         args.backend_policy,
+        args.fg_route,
         qnn_proj_events,
         qnn_ffn_events,
         gpu_attn_core_events)

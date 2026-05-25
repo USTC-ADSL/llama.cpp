@@ -866,6 +866,7 @@ summarize() {
         --remote-output-dir "${REMOTE_OUTPUT_DIR}" \
         --mode "${MODE}" \
         --backend-policy "${BACKEND_POLICY}" \
+        --fg-route "${FG_ROUTE}" \
         --state-id "${state_id}" \
         --workload-type "decode_like" \
         --context-len "${CONTEXT_LEN}" \
@@ -898,6 +899,7 @@ summarize() {
         --remote-output-dir "${REMOTE_OUTPUT_DIR}" \
         --mode "${MODE}" \
         --backend-policy "${BACKEND_POLICY}" \
+        --fg-route "${FG_ROUTE}" \
         --state-id "${state_id}" \
         --workload-type "decode_like" \
         --context-len "${CONTEXT_LEN}" \
