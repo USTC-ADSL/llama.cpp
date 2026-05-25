@@ -18,6 +18,7 @@
 #include "models/models.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
@@ -33,12 +34,44 @@ const ggml_tensor * llama_model_resolve_weight_for_cpu_copy(
         const ggml_tensor * original,
         const ggml_tensor * cpu_copy,
         llama_hetero_route_stage stage,
+        const llama_hetero_route_spec & route);
+
+bool llama_model_should_use_opencl_only_gguf_weight_devices(
+        const llama_hetero_route_spec & route);
+
+const ggml_tensor * llama_model_resolve_weight_for_cpu_copy(
+        const ggml_tensor * original,
+        const ggml_tensor * cpu_copy,
+        llama_hetero_route_stage stage,
         const llama_hetero_route_spec & route) {
     if (original == nullptr || cpu_copy == nullptr) {
         return original;
     }
 
     return llama_hetero_is_cpu_backend(route.backend_for(stage)) ? cpu_copy : original;
+}
+
+bool llama_model_should_use_opencl_only_gguf_weight_devices(
+        const llama_hetero_route_spec & route) {
+    if (!route.has_any_route()) {
+        return false;
+    }
+
+    static constexpr std::array<llama_hetero_route_stage, 5> stages = {{
+        llama_hetero_route_stage::ATTN_PROJ,
+        llama_hetero_route_stage::ATTN_CORE,
+        llama_hetero_route_stage::ATTN_OUT,
+        llama_hetero_route_stage::FFN,
+        llama_hetero_route_stage::OUTPUT,
+    }};
+
+    for (const auto stage : stages) {
+        if (!llama_hetero_is_opencl_backend(route.backend_for(stage))) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 const char * llm_type_name(llm_type type) {
@@ -2618,9 +2651,28 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s)\n",
         __func__, ml.use_mmap ? "true" : "false", ml.use_direct_io ? "true" : "false");
 
-    // build a list of buffer types for the CPU and GPU devices
-    pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
-    for (auto * dev : devices) {
+    std::vector<ggml_backend_dev_t> gguf_weight_devices = devices;
+    if (llama_model_should_use_opencl_only_gguf_weight_devices(hetero_plan.route)) {
+        gguf_weight_devices.erase(
+                std::remove_if(gguf_weight_devices.begin(), gguf_weight_devices.end(), [](ggml_backend_dev_t dev) {
+                    return dev == nullptr || !llama_hetero_is_opencl_backend(ggml_backend_dev_name(dev));
+                }),
+                gguf_weight_devices.end());
+
+        if (!gguf_weight_devices.empty() && gguf_weight_devices.size() != devices.size()) {
+            LLAMA_LOG_INFO("%s: all-OpenCL hetero route keeps QNN AOT devices initialized but restricts GGUF weight placement to OpenCL devices\n",
+                    __func__);
+        }
+        if (gguf_weight_devices.empty()) {
+            gguf_weight_devices = devices;
+        }
+    }
+
+    const size_t n_weight_devices = gguf_weight_devices.size();
+
+    // build a list of buffer types for the CPU and GPU devices used by GGUF tensors
+    pimpl->cpu_buft_list = make_cpu_buft_list(gguf_weight_devices, params.use_extra_bufts, params.no_host);
+    for (auto * dev : gguf_weight_devices) {
         buft_list_t buft_list = make_gpu_buft_list(dev, split_mode, tensor_split);
         // add CPU buffer types as a fallback
         buft_list.insert(buft_list.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
@@ -2632,13 +2684,32 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         throw std::runtime_error(format("%s: no CPU backend found", __func__));
     }
 
+    const auto original_device_index = [&](ggml_backend_dev_t dev, size_t fallback_index) {
+        const auto original_it = std::find(devices.begin(), devices.end(), dev);
+        return original_it != devices.end()
+            ? size_t(original_it - devices.begin())
+            : fallback_index;
+    };
+
+    const auto selected_tensor_split_is_all_zero = [&]() {
+        if (tensor_split == nullptr) {
+            return true;
+        }
+        for (size_t i = 0; i < n_weight_devices; ++i) {
+            if (tensor_split[original_device_index(gguf_weight_devices[i], i)] != 0.0f) {
+                return false;
+            }
+        }
+        return true;
+    };
+
     // calculate the split points
-    bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + n_devices(), [](float x) { return x == 0.0f; });
-    std::vector<float> splits(n_devices());
+    bool all_zero = selected_tensor_split_is_all_zero();
+    std::vector<float> splits(n_weight_devices);
     if (all_zero) {
         // default split, by free memory
-        for (size_t i = 0; i < n_devices(); ++i) {
-            ggml_backend_dev_t dev = devices[i];
+        for (size_t i = 0; i < n_weight_devices; ++i) {
+            ggml_backend_dev_t dev = gguf_weight_devices[i];
             size_t total;
             size_t free;
             ggml_backend_dev_memory(dev, &free, &total);
@@ -2652,29 +2723,34 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             splits[i] = free;
         }
     } else {
-        std::copy(tensor_split, tensor_split + n_devices(), splits.begin());
+        for (size_t i = 0; i < n_weight_devices; ++i) {
+            splits[i] = tensor_split[original_device_index(gguf_weight_devices[i], i)];
+        }
+        if (std::all_of(splits.begin(), splits.end(), [](float value) { return value == 0.0f; })) {
+            std::fill(splits.begin(), splits.end(), 1.0f);
+        }
     }
 
     // sum and normalize the splits to get the split points
     float split_sum = 0.0f;
-    for (size_t i = 0; i < n_devices(); ++i) {
+    for (size_t i = 0; i < n_weight_devices; ++i) {
         split_sum += splits[i];
         splits[i] = split_sum;
     }
-    for (size_t i = 0; i < n_devices(); ++i) {
+    for (size_t i = 0; i < n_weight_devices; ++i) {
         splits[i] /= split_sum;
     }
 
     const int i_gpu_start = std::max(int(hparams.n_layer) + 1 - n_gpu_layers, 0);
-    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, int(n_layer) + 1);
+    const int act_gpu_layers = gguf_weight_devices.empty() ? 0 : std::min(n_gpu_layers, int(n_layer) + 1);
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < int(hparams.n_layer) && hparams.is_swa(il);
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
         }
-        const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
-        auto * dev = devices.at(layer_gpu);
+        const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_weight_devices, float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
+        auto * dev = gguf_weight_devices.at(layer_gpu);
         LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
