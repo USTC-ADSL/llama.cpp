@@ -1,0 +1,2 @@
+from_state_id,to_state_id,context_len,total_blocking_us,first_token_gap_us,post_switch_tbt_us,transition_energy_mj,transition_energy_source,success_rate,fallback_count,support_status,kv_handoff_us,graph_rebuild_us,decision_us
+npu_burst,gpu_734,512,2500.0,43000.0,41000.0,,unavailable,1.0,0,ok,0.0,0.0,3.0

@@ -1,5 +1,8 @@
 *
 !*.*
+!fixtures/
+!fixtures/ecofrontier/
+!fixtures/ecofrontier/**
 *.o
 ggml-common.h
 **/*.swp

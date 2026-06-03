@@ -1,0 +1,23 @@
+{
+  "graphs": [
+    {
+      "graph_id": "decode_ctx2048",
+      "phase": "decode",
+      "chunk_size": 1,
+      "usable_kv_slots": 1920,
+      "safety_margin": 32,
+      "supported_workpoints": ["burst", "low_balanced"],
+      "profiled_exec_us": 1000,
+      "profiled_energy_mj": 5.0,
+      "data_quality": "paper_ready"
+    },
+    {
+      "graph_id": "bad_context_only",
+      "phase": "decode",
+      "chunk_size": 1,
+      "qnn_aot_context_size": 4096,
+      "supported_workpoints": ["burst"],
+      "data_quality": "paper_ready"
+    }
+  ]
+}

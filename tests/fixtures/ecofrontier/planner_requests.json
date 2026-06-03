@@ -1,0 +1,26 @@
+[
+  {
+    "request_id": "fixture-feasible",
+    "prompt_tokens": 512,
+    "context_len": 512,
+    "predicted_output_mean": 32,
+    "predicted_output_hi": 64,
+    "slo_ttft_ms": 800.0,
+    "slo_tbt_us": 45000.0,
+    "current_state_id": "",
+    "current_graph_id": "",
+    "current_temp_c": 30.0
+  },
+  {
+    "request_id": "fixture-best-effort",
+    "prompt_tokens": 512,
+    "context_len": 512,
+    "predicted_output_mean": 32,
+    "predicted_output_hi": 64,
+    "slo_ttft_ms": 200.0,
+    "slo_tbt_us": 20000.0,
+    "current_state_id": "",
+    "current_graph_id": "",
+    "current_temp_c": 30.0
+  }
+]

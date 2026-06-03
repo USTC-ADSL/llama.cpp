@@ -1,0 +1,234 @@
+{
+  "version": "ecofrontier.offline_frontier.v1",
+  "generated_at": "2026-05-27T00:00:00+00:00",
+  "compiler_config": {
+    "allow_length_interpolation": true,
+    "allow_extrapolation": false,
+    "filter_unstable": true,
+    "filter_fallback_used": true,
+    "filter_unsupported": true,
+    "filter_thermal_unsafe": true
+  },
+  "normalized_states": [
+    {
+      "state_id": "cpu_prefill_fast",
+      "backend": "CPU",
+      "phase": "prefill",
+      "prompt_tokens": 512,
+      "ttft_ms_p95": 420.0,
+      "active_power_mw": 1800.0,
+      "energy_mj_per_request": 40.0,
+      "energy_source": "measured",
+      "energy_complete": true,
+      "support_status": "ok",
+      "fallback_used": false,
+      "stable": true,
+      "thermal_safe": true,
+      "data_quality": []
+    },
+    {
+      "state_id": "gpu_prefill_slow",
+      "backend": "GPU",
+      "phase": "prefill",
+      "prompt_tokens": 512,
+      "ttft_ms_p95": 900.0,
+      "active_power_mw": 1200.0,
+      "energy_mj_per_request": 20.0,
+      "energy_source": "measured",
+      "energy_complete": true,
+      "support_status": "ok",
+      "fallback_used": false,
+      "stable": true,
+      "thermal_safe": true,
+      "data_quality": []
+    },
+    {
+      "state_id": "cpu_decode_missing_energy",
+      "backend": "CPU",
+      "phase": "decode",
+      "context_len": 512,
+      "tbt_us": 42000.0,
+      "active_power_mw": 1100.0,
+      "energy_source": "unavailable",
+      "energy_complete": false,
+      "support_status": "ok",
+      "fallback_used": false,
+      "stable": true,
+      "thermal_safe": true,
+      "data_quality": []
+    },
+    {
+      "state_id": "gpu_decode_fast",
+      "backend": "GPU",
+      "phase": "decode",
+      "context_len": 512,
+      "tbt_us": 30000.0,
+      "active_power_mw": 2300.0,
+      "energy_mj_per_token": 69.0,
+      "energy_source": "estimated_power_latency",
+      "energy_complete": false,
+      "support_status": "ok",
+      "fallback_used": false,
+      "stable": true,
+      "thermal_safe": true,
+      "data_quality": []
+    },
+    {
+      "state_id": "npu_decode_burst",
+      "backend": "QNN_NPU",
+      "phase": "decode",
+      "context_len": 512,
+      "npu_workpoint": "burst",
+      "graph_id": "decode_ctx1024",
+      "tbt_us": 36000.0,
+      "active_power_mw": 1500.0,
+      "energy_mj_per_token": 54.0,
+      "energy_source": "estimated_power_latency",
+      "energy_complete": false,
+      "support_status": "ok",
+      "fallback_used": false,
+      "stable": true,
+      "thermal_safe": true,
+      "data_quality": []
+    },
+    {
+      "state_id": "gpu_decode_slow",
+      "backend": "GPU",
+      "phase": "decode",
+      "context_len": 512,
+      "tbt_us": 80000.0,
+      "active_power_mw": 900.0,
+      "energy_mj_per_token": 72.0,
+      "energy_source": "estimated_power_latency",
+      "energy_complete": false,
+      "support_status": "ok",
+      "fallback_used": false,
+      "stable": true,
+      "thermal_safe": true,
+      "data_quality": []
+    },
+    {
+      "state_id": "gpu_decode_unstable",
+      "backend": "GPU",
+      "phase": "decode",
+      "context_len": 512,
+      "tbt_us": 25000.0,
+      "active_power_mw": 2500.0,
+      "energy_mj_per_token": 62.5,
+      "energy_source": "estimated_power_latency",
+      "energy_complete": false,
+      "support_status": "ok",
+      "fallback_used": false,
+      "stable": false,
+      "thermal_safe": true,
+      "data_quality": [
+        "unstable_power_window"
+      ]
+    },
+    {
+      "state_id": "measured_decode_a",
+      "backend": "CPU",
+      "phase": "decode",
+      "context_len": 1024,
+      "tbt_us": 50000.0,
+      "active_power_mw": 1200.0,
+      "energy_mj_per_token": 60.0,
+      "energy_source": "measured",
+      "energy_complete": true,
+      "support_status": "ok",
+      "fallback_used": false,
+      "stable": true,
+      "thermal_safe": true,
+      "data_quality": []
+    },
+    {
+      "state_id": "measured_decode_b",
+      "backend": "GPU",
+      "phase": "decode",
+      "context_len": 1024,
+      "tbt_us": 45000.0,
+      "active_power_mw": 2200.0,
+      "energy_mj_per_token": 80.0,
+      "energy_source": "measured",
+      "energy_complete": true,
+      "support_status": "ok",
+      "fallback_used": false,
+      "stable": true,
+      "thermal_safe": true,
+      "data_quality": []
+    }
+  ],
+  "frontiers": [],
+  "transition_edges": [
+    {
+      "from_state_id": "cpu_decode_missing_energy",
+      "to_state_id": "gpu_decode_fast",
+      "context_len": 512,
+      "total_blocking_us": 500000.0,
+      "first_token_gap_us": 530000.0,
+      "post_switch_tbt_us": 30000.0,
+      "transition_energy_source": "unavailable",
+      "transition_energy_complete": false,
+      "success_rate": 1.0,
+      "fallback_count": 0,
+      "support_status": "ok"
+    },
+    {
+      "from_state_id": "gpu_decode_slow",
+      "to_state_id": "gpu_decode_fast",
+      "context_len": 512,
+      "total_blocking_us": 1000.0,
+      "first_token_gap_us": 31000.0,
+      "post_switch_tbt_us": 30000.0,
+      "transition_energy_mj": 3.0,
+      "transition_energy_source": "measured",
+      "transition_energy_complete": true,
+      "success_rate": 1.0,
+      "fallback_count": 0,
+      "support_status": "ok"
+    }
+  ],
+  "graph_catalog_summary": {
+    "graph_count": 2,
+    "graphs": [
+      {
+        "graph_id": "decode_ctx1024",
+        "phase": "decode",
+        "chunk_size": 1,
+        "usable_kv_slots": 1024,
+        "safety_margin": 16,
+        "supported_workpoints": [
+          "burst"
+        ],
+        "profiled_load_us": 10000,
+        "profiled_warmup_us": 2000,
+        "profiled_exec_us": 1000,
+        "profiled_energy_mj": null,
+        "memory_bytes": 4096,
+        "data_quality": []
+      },
+      {
+        "graph_id": "decode_context_size_only",
+        "phase": "decode",
+        "chunk_size": 1,
+        "qnn_aot_context_size": 4096,
+        "safety_margin": 16,
+        "supported_workpoints": [
+          "burst"
+        ],
+        "profiled_load_us": 10000,
+        "profiled_warmup_us": 2000,
+        "profiled_exec_us": 1000,
+        "profiled_energy_mj": null,
+        "memory_bytes": 4096,
+        "data_quality": []
+      }
+    ],
+    "rejected_graphs": []
+  },
+  "caveats": [
+    "transition_energy_unavailable",
+    "energy_estimated_from_power_latency",
+    "qnn_context_size_not_usable_kv_slots"
+  ]
+}

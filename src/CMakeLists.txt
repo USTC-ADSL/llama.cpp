@@ -16,6 +16,8 @@ add_library(llama
             llama-context.cpp
             llama-cparams.cpp
             llama-dyn-route.cpp
+            llama-ecofrontier-qnn-graph-manager.cpp
+            llama-ecofrontier-qnn-graph-manager.h
             llama-grammar.cpp
             llama-graph.cpp
             llama-hparams.cpp
@@ -157,7 +159,7 @@ set_target_properties(llama PROPERTIES
     MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
 )
 
-target_include_directories(llama PRIVATE .)
+target_include_directories(llama PRIVATE . ../vendor)
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 

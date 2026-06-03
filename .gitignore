@@ -1,5 +1,29 @@
-# Extensions
+# Local experiment data and generated docs
+/Paper_Writing/
+/results/
+/old.md
+/ref/
+/docs/aegis/
+/docs/实验结果/
+/docs/ecofrontier_code_structure_audit.md
+/docs/ecofrontier_module_status.json
+/docs/ecofrontier_next_steps.md
+/docs/ecofrontier_online_planner_demo.md
+/docs/ecofrontier_online_planner_review.md
+/docs/superpowers/
+/docs/re.zip
 
+# Local experiment scripts
+/test.sh
+/docs/*.sh
+/scripts/bench_frontier_planner.py
+/scripts/export_qwen2.5_3b_transformer_qnn.sh
+/scripts/export_qwen2.5_7b_8elite_aot.sh
+/scripts/run_insightB_amortization.sh
+/scripts/run_stage_hetero_final_demo.sh
+/scripts/tests/
+
+# Extensions
 *.a
 *.bat
 *.bin
