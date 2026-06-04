@@ -354,8 +354,31 @@ bool env_flag_enabled(const char * name) {
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
+bool hetero_dynamic_trace_timing_detail_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled =
+            hetero_dynamic_trace_timing_enabled() &&
+            env_flag_enabled("GGML_HETERO_DYNAMIC_TRACE_TIMING_DETAIL") ? 1 : 0;
+    }
+
+    return enabled != 0;
+}
+
 const char * hetero_phase_name(uint32_t n_tokens) {
     return n_tokens > 1 ? "prefill" : "decode";
+}
+
+int64_t percentile_nearest_rank_us(std::vector<int64_t> values, double percentile) {
+    if (values.empty()) {
+        return 0;
+    }
+
+    std::sort(values.begin(), values.end());
+
+    const double rank = percentile * double(values.size() - 1);
+    const size_t index = static_cast<size_t>(std::ceil(rank));
+    return values[std::min(index, values.size() - 1)];
 }
 
 const char * canonicalize_hetero_backend_device_name(const char * value) {
@@ -680,6 +703,10 @@ llama_context::llama_context(
     hetero_plan_base   = hetero_plan;
     aot_active_route_requests_qnn = hetero_route_requests_qnn(hetero_plan.route);
     dynamic_route_config = llama_dynamic_route_config_from_env();
+
+    if (hetero_dynamic_trace_timing_enabled()) {
+        hetero_decode_token_trace_records.reserve(cparams.n_ctx);
+    }
 
     if (hetero_plan_from_params && !llama_hetero_execution_plan_equals(hetero_plan, model.get_hetero_plan())) {
         const std::string ctx_route = llama_hetero_format_route_spec(hetero_plan.route);
@@ -1624,7 +1651,7 @@ bool llama_context::apply_hetero_plan(llama_hetero_execution_plan plan, bool upd
             hetero_plan_base = plan;
         }
         aot_active_route_requests_qnn = hetero_route_requests_qnn(hetero_plan.route);
-        if (hetero_dynamic_trace_timing_enabled()) {
+        if (hetero_dynamic_trace_timing_detail_enabled()) {
             LLAMA_LOG_INFO("%s: skipped no-op hetero plan update via %s\n",
                     __func__,
                     source != nullptr ? source : "unknown");
@@ -1725,7 +1752,7 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         /*.allocated_kv_contract =*/ &hetero_kv_contract_allocated,
     };
 
-    const bool trace_timing = hetero_dynamic_trace_timing_enabled();
+    const bool trace_timing = hetero_dynamic_trace_timing_detail_enabled();
     const int64_t t_decide_start_us = trace_timing ? ggml_time_us() : 0;
     llama_dynamic_route_decision decision = llama_dynamic_route_decide(dynamic_route_config, request);
     const int64_t t_decide_end_us = trace_timing ? ggml_time_us() : 0;
@@ -1792,7 +1819,7 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
             LLAMA_LOG_ERROR("%s: failed to apply qnn HTP workpoint switch to %s\n", __func__, decode_qnn_workpoint);
         }
 
-        if (trace_timing) {
+        if (trace_timing && hetero_dynamic_trace_timing_detail_enabled()) {
             LLAMA_LOG_INFO("%s: timing phase=%s n_tokens=%u qnn_workpoint_apply=%s target_workpoint=%s "
                     "decide_us=%" PRId64 " qnn_workpoint_apply_us=%" PRId64 " target=%s\n",
                     __func__,
@@ -1814,7 +1841,7 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                     n_tokens > 1 ? "prefill" : "decode",
                     decision.reason.empty() ? "<none>" : decision.reason.c_str());
         }
-        if (trace_timing) {
+        if (trace_timing && hetero_dynamic_trace_timing_detail_enabled()) {
             LLAMA_LOG_INFO("%s: timing phase=%s n_tokens=%u route_apply=false reason=%s decide_us=%" PRId64 "\n",
                     __func__,
                     hetero_phase_name(n_tokens),
@@ -2047,7 +2074,7 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         dynamic_route_state.route_switches++;
     }
 
-    if (trace_timing) {
+    if (trace_timing && hetero_dynamic_trace_timing_detail_enabled()) {
         LLAMA_LOG_INFO("%s: timing phase=%s n_tokens=%u route_apply=%s label=%s reason=%s decide_us=%" PRId64 " apply_us=%" PRId64 " target=%s\n",
                 __func__,
                 hetero_phase_name(n_tokens),
@@ -2062,6 +2089,8 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
 }
 
 llama_context::~llama_context() {
+    hetero_decode_token_trace_dump();
+
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -2079,6 +2108,47 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+}
+
+void llama_context::hetero_decode_token_trace_record(int64_t done_us) {
+    hetero_decode_token_trace_records.push_back(done_us);
+}
+
+void llama_context::hetero_decode_token_trace_dump() {
+    if (hetero_decode_token_trace_records.empty()) {
+        return;
+    }
+
+    std::vector<int64_t> tbt_us;
+    tbt_us.reserve(hetero_decode_token_trace_records.size() > 1 ? hetero_decode_token_trace_records.size() - 1 : 0);
+
+    int64_t prev_done_us = 0;
+    int64_t tbt_sum_us = 0;
+    for (size_t i = 0; i < hetero_decode_token_trace_records.size(); ++i) {
+        const int64_t done_us = hetero_decode_token_trace_records[i];
+        LLAMA_LOG_INFO("DECODE_TOKEN_TRACE phase=decode token_index=%zu done_us=%" PRId64 "\n",
+                i + 1,
+                done_us);
+
+        if (prev_done_us > 0 && done_us >= prev_done_us) {
+            const int64_t delta_us = done_us - prev_done_us;
+            tbt_us.push_back(delta_us);
+            tbt_sum_us += delta_us;
+        }
+        prev_done_us = done_us;
+    }
+
+    if (!tbt_us.empty()) {
+        const double mean_us = double(tbt_sum_us) / double(tbt_us.size());
+        LLAMA_LOG_INFO("DECODE_TOKEN_TBT_SUMMARY count=%zu mean_us=%.2f p50_us=%" PRId64 " p95_us=%" PRId64 " p99_us=%" PRId64 "\n",
+                tbt_us.size(),
+                mean_us,
+                percentile_nearest_rank_us(tbt_us, 0.50),
+                percentile_nearest_rank_us(tbt_us, 0.95),
+                percentile_nearest_rank_us(tbt_us, 0.99));
+    }
+
+    hetero_decode_token_trace_records.clear();
 }
 
 void llama_context::sched_reserve() {
@@ -2447,7 +2517,7 @@ void llama_context::sched_reserve() {
     const int64_t t_end_us = ggml_time_us();
     const int64_t reserve_us = t_end_us - t_start_us;
 
-    if (hetero_dynamic_trace_timing_enabled() && hetero_phase_trace.active) {
+    if (hetero_dynamic_trace_timing_detail_enabled() && hetero_phase_trace.active) {
         hetero_phase_trace.reserve_us += reserve_us;
         hetero_phase_trace.reserve_sched_new_us += reserve_timing.sched_new_us;
         hetero_phase_trace.reserve_memory_init_us += reserve_timing.memory_init_us;
@@ -2467,12 +2537,26 @@ void llama_context::synchronize() {
 
     ggml_backend_sched_synchronize(sched.get());
 
+    int64_t sync_done_us = 0;
+    const auto get_sync_done_us = [&]() {
+        if (sync_done_us == 0) {
+            sync_done_us = ggml_time_us();
+        }
+        return sync_done_us;
+    };
+
     if (!hetero_phase_trace_suppress_sync_log &&
         hetero_dynamic_trace_timing_enabled() &&
+        n_queued_tokens == 1) {
+        hetero_decode_token_trace_record(get_sync_done_us());
+    }
+
+    if (!hetero_phase_trace_suppress_sync_log &&
+        hetero_dynamic_trace_timing_detail_enabled() &&
         hetero_phase_trace.active &&
         hetero_phase_trace.batch_start_us > 0) {
-        const int64_t sync_done_us = ggml_time_us();
-        const int64_t total_us = sync_done_us - hetero_phase_trace.batch_start_us;
+        const int64_t detail_sync_done_us = get_sync_done_us();
+        const int64_t total_us = detail_sync_done_us - hetero_phase_trace.batch_start_us;
         const int64_t reserve_accounted_us =
             hetero_phase_trace.reserve_sched_new_us +
             hetero_phase_trace.reserve_memory_init_us +
@@ -2528,7 +2612,7 @@ void llama_context::synchronize() {
             const int64_t transition_blocking_us =
                 llama_context_transition_blocking_us(total_us, hetero_phase_trace.process_ubatch_us);
             const int64_t first_token_gap_us =
-                llama_context_decode_token_gap_us(hetero_last_decode_token_done_us, sync_done_us);
+                llama_context_decode_token_gap_us(hetero_last_decode_token_done_us, detail_sync_done_us);
             const std::string first_token_gap =
                 first_token_gap_us >= 0 ? std::to_string(first_token_gap_us) : "";
             LLAMA_LOG_INFO("TRANSITION_TRACE phase=prefill_to_decode "
@@ -2556,14 +2640,7 @@ void llama_context::synchronize() {
                     hetero_phase_trace.graph_runs_rebuilt);
         }
         if (hetero_phase_trace.n_tokens == 1) {
-            hetero_decode_trace_index++;
-            LLAMA_LOG_INFO("DECODE_TOKEN_TRACE phase=decode token_index=%" PRId64 " done_us=%" PRId64 " route_applied=%d total_wall_us=%" PRId64 " process_ubatch_us=%" PRId64 "\n",
-                    hetero_decode_trace_index,
-                    sync_done_us,
-                    hetero_phase_trace.route_applied ? 1 : 0,
-                    total_us,
-                    hetero_phase_trace.process_ubatch_us);
-            hetero_last_decode_token_done_us = sync_done_us;
+            hetero_last_decode_token_done_us = detail_sync_done_us;
         } else {
             hetero_last_decode_token_done_us = 0;
         }
@@ -2577,12 +2654,12 @@ void llama_context::synchronize() {
     // add the evaluation to the stats
     if (n_queued_tokens == 1) {
         if (!cparams.no_perf) {
-            t_eval_us += ggml_time_us() - t_compute_start_us;
+            t_eval_us += get_sync_done_us() - t_compute_start_us;
         }
         n_eval++;
     } else if (n_queued_tokens > 1) {
         if (!cparams.no_perf) {
-            t_p_eval_us += ggml_time_us() - t_compute_start_us;
+            t_p_eval_us += get_sync_done_us() - t_compute_start_us;
         }
         n_p_eval += n_queued_tokens;
     }
@@ -3120,7 +3197,7 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-    const bool trace_timing = hetero_dynamic_trace_timing_enabled() && hetero_phase_trace.active;
+    const bool trace_timing = hetero_dynamic_trace_timing_detail_enabled() && hetero_phase_trace.active;
     const int64_t t_process_start_us = trace_timing ? ggml_time_us() : 0;
 
     if (aot_bootstrap_cpu_sched_active) {
@@ -3678,7 +3755,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         t_compute_start_us = ggml_time_us();
     }
 
-    if (hetero_dynamic_trace_timing_enabled()) {
+    if (hetero_dynamic_trace_timing_detail_enabled()) {
         if (hetero_phase_trace.active) {
             LLAMA_LOG_WARN("%s: overwriting pending hetero phase trace for phase=%s n_tokens=%u before synchronize() completed\n",
                     __func__,
@@ -3700,11 +3777,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (qnn_prefix_replay_pending) {
         const bool trace_was_active = hetero_phase_trace.active;
         const int64_t t_replay_start_us =
-            (hetero_dynamic_trace_timing_enabled() && trace_was_active) ? ggml_time_us() : 0;
+            (hetero_dynamic_trace_timing_detail_enabled() && trace_was_active) ? ggml_time_us() : 0;
         hetero_phase_trace.active = false;
         const bool replay_ok = replay_dynamic_qnn_prefix();
         hetero_phase_trace.active = trace_was_active;
-        if (hetero_dynamic_trace_timing_enabled() && trace_was_active) {
+        if (hetero_dynamic_trace_timing_detail_enabled() && trace_was_active) {
             hetero_phase_trace.kv_migration_us += ggml_time_us() - t_replay_start_us;
         }
         if (!replay_ok) {
@@ -3717,9 +3794,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
     bool did_optimize = false;
 
     // handle any pending shifts/copies
-    const int64_t t_memory_update_start_us = (hetero_dynamic_trace_timing_enabled() && hetero_phase_trace.active) ? ggml_time_us() : 0;
+    const int64_t t_memory_update_start_us =
+        (hetero_dynamic_trace_timing_detail_enabled() && hetero_phase_trace.active) ? ggml_time_us() : 0;
     memory_update(false);
-    if (hetero_dynamic_trace_timing_enabled() && hetero_phase_trace.active) {
+    if (hetero_dynamic_trace_timing_detail_enabled() && hetero_phase_trace.active) {
         hetero_phase_trace.memory_update_us += ggml_time_us() - t_memory_update_start_us;
     }
 
@@ -5469,6 +5547,9 @@ llama_perf_context_data llama_context::perf_get_data() const {
 }
 
 void llama_context::perf_reset() {
+    hetero_decode_token_trace_dump();
+    hetero_last_decode_token_done_us = 0;
+
     t_start_us  = ggml_time_us();
     t_eval_us   = n_eval = 0;
     t_p_eval_us = n_p_eval = 0;
