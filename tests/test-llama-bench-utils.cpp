@@ -121,5 +121,48 @@ int main() {
                       llama_bench_should_run_qnn_decode_prewarm(qnn_entries, 64, true));
     });
 
+    t.test("qnn depth prewarm env flag is opt-in", [](testing & t) {
+        unsetenv("LLAMA_BENCH_QNN_PREWARM_DEPTH");
+        t.assert_true("depth prewarm flag should default to disabled",
+                      !llama_bench_qnn_depth_prewarm_enabled());
+
+        setenv("LLAMA_BENCH_QNN_PREWARM_DEPTH", "0", 1);
+        t.assert_true("0 should disable depth prewarm",
+                      !llama_bench_qnn_depth_prewarm_enabled());
+
+        setenv("LLAMA_BENCH_QNN_PREWARM_DEPTH", "false", 1);
+        t.assert_true("false should disable depth prewarm",
+                      !llama_bench_qnn_depth_prewarm_enabled());
+
+        setenv("LLAMA_BENCH_QNN_PREWARM_DEPTH", "off", 1);
+        t.assert_true("off should disable depth prewarm",
+                      !llama_bench_qnn_depth_prewarm_enabled());
+
+        setenv("LLAMA_BENCH_QNN_PREWARM_DEPTH", "1", 1);
+        t.assert_true("1 should enable depth prewarm",
+                      llama_bench_qnn_depth_prewarm_enabled());
+
+        unsetenv("LLAMA_BENCH_QNN_PREWARM_DEPTH");
+    });
+
+    t.test("qnn depth prewarm only applies to qnn depth tests", [](testing & t) {
+        const std::vector<llama_bench_round_reset_entry> qnn_entries = {
+            { "qnn-npu", true, []() { return true; } },
+        };
+        const std::vector<llama_bench_round_reset_entry> non_qnn_entries = {
+            { "GPUOpenCL", false, {} },
+            { "CPU", false, {} },
+        };
+
+        t.assert_true("disabled env should skip qnn depth prewarm",
+                      !llama_bench_should_run_qnn_depth_prewarm(qnn_entries, 512, false));
+        t.assert_true("zero-depth tests should skip qnn depth prewarm",
+                      !llama_bench_should_run_qnn_depth_prewarm(qnn_entries, 0, true));
+        t.assert_true("non-qnn tests should skip qnn depth prewarm",
+                      !llama_bench_should_run_qnn_depth_prewarm(non_qnn_entries, 512, true));
+        t.assert_true("qnn depth tests should run qnn depth prewarm when enabled",
+                      llama_bench_should_run_qnn_depth_prewarm(qnn_entries, 512, true));
+    });
+
     return t.summary();
 }

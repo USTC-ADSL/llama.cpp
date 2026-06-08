@@ -6,6 +6,36 @@
 int main() {
     testing t;
 
+    t.test("AF simulation route keeps attention on OpenCL and FFN on QNN", [](testing & t) {
+        const auto route = llama_hetero_parse_route_spec(
+                "attn_proj=opencl,attn_core=opencl,attn_out=opencl,ffn=qnn-npu,output=opencl");
+
+        t.assert_equal("attention projection should run on OpenCL",
+                       std::string("opencl"),
+                       route.backend_for(llama_hetero_route_stage::ATTN_PROJ));
+        t.assert_equal("attention core should run on OpenCL",
+                       std::string("opencl"),
+                       route.backend_for(llama_hetero_route_stage::ATTN_CORE));
+        t.assert_equal("attention output should stay on OpenCL",
+                       std::string("opencl"),
+                       route.backend_for(llama_hetero_route_stage::ATTN_OUT));
+        t.assert_equal("FFN should run on QNN",
+                       std::string("qnn-npu"),
+                       route.backend_for(llama_hetero_route_stage::FFN));
+        t.assert_equal("output tail should stay on OpenCL",
+                       std::string("opencl"),
+                       route.backend_for(llama_hetero_route_stage::OUTPUT));
+    });
+
+    t.test("AF simulation route has no QNN projection to OpenCL attention KV boundary", [](testing & t) {
+        const auto plan = llama_hetero_build_execution_plan(
+                "attn_proj=opencl,attn_core=opencl,attn_out=opencl,ffn=qnn-npu,output=opencl",
+                nullptr);
+
+        t.assert_true("all attention stages on OpenCL should not activate the QNN/OpenCL KV boundary",
+                      !plan.attn_kv.stage_boundary_active());
+    });
+
     t.test("mixed stage route is preserved for qnn-opencl-qnn simulation", [](testing & t) {
         const auto route = llama_hetero_parse_route_spec(
                 "attn_proj=qnn-npu,attn_core=opencl,attn_out=opencl,ffn=qnn-npu,output=opencl");

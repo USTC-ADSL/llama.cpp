@@ -174,11 +174,11 @@ def parse_gpu_busy_value(value):
 def parse_fg_route(route_text):
     text = (route_text or "").strip().lower()
     default_route = {
-        "attn_proj": "qnn-npu",
+        "attn_proj": "opencl",
         "attn_core": "opencl",
-        "attn_out": "cpu",
+        "attn_out": "opencl",
         "ffn": "qnn-npu",
-        "output": "cpu",
+        "output": "opencl",
     }
     if not text:
         return default_route
@@ -339,6 +339,7 @@ def parse_traces(text):
     qnn_proj_events = 0
     qnn_ffn_events = 0
     gpu_attn_core_events = 0
+    ffn_input_handoff_events = 0
     observed_layers = set()
 
     for line in text.splitlines():
@@ -376,10 +377,14 @@ def parse_traces(text):
                 continue
             src = kv.get("from", "")
             dst = kv.get("to", "")
+            tensor = kv.get("tensor", "")
+            reason = kv.get("reason", "")
             if src == "qnn" and dst == "gpu":
                 sync_qnn_to_gpu.append(duration)
             if src == "gpu" and dst == "qnn":
                 sync_gpu_to_qnn.append(duration)
+                if tensor.startswith("ffn_inp-") or reason.startswith("ffn_input"):
+                    ffn_input_handoff_events += 1
 
         aot_execute = re.search(r"\[aot\].*execute (attn_proj|ffn) graph", line)
         if aot_execute:
@@ -410,9 +415,14 @@ def parse_traces(text):
         "qnn_proj_events": qnn_proj_events,
         "qnn_ffn_events": qnn_ffn_events,
         "gpu_attn_core_events": gpu_attn_core_events,
+        "ffn_input_handoff_events": ffn_input_handoff_events,
         "observed_layers": len(observed_layers) if observed_layers else None,
         "observed_layer_ids": sorted(observed_layers),
     }
+
+
+def route_requires_hidden_handoff(route):
+    return backend_is_opencl(route.get("attn_out")) and backend_is_qnn(route.get("ffn"))
 
 
 def parse_opencl_stage_profile(path):
@@ -541,7 +551,8 @@ def detect_support_status(
         fg_route="",
         qnn_proj_events=0,
         qnn_ffn_events=0,
-        gpu_attn_core_events=0):
+        gpu_attn_core_events=0,
+        ffn_input_handoff_events=0):
     exit_codes = [safe_int(code) for code in re.findall(r"FG_RUN_EXIT_CODE=([0-9]+)", text)]
     if any(code not in (None, 0) for code in exit_codes):
         return "failed"
@@ -570,6 +581,8 @@ def detect_support_status(
         return "unsupported_by_qnn_graph"
     if backend_is_opencl(route.get("attn_core")) and gpu_attn_core_events <= 0:
         return "unsupported_by_gpu_kernel"
+    if route_requires_hidden_handoff(route) and ffn_input_handoff_events <= 0:
+        return "missing_hidden_handoff"
 
     requires_qnn = any(backend_is_qnn(backend) for backend in route.values())
     requires_opencl = any(backend_is_opencl(backend) for backend in route.values())
@@ -828,7 +841,8 @@ def main():
         args.fg_route,
         qnn_proj_events,
         qnn_ffn_events,
-        gpu_attn_core_events)
+        gpu_attn_core_events,
+        int(trace.get("ffn_input_handoff_events") or 0))
     if (support_status == "ok" and args.backend_policy == "fine_grained_qnn_gpu" and
             requested_layers and observed_layers and requested_layers != observed_layers):
         support_status = "unsupported_by_shape"
@@ -903,6 +917,7 @@ def main():
         "qnn_proj_events": qnn_proj_events,
         "qnn_ffn_events": qnn_ffn_events,
         "gpu_attn_core_events": gpu_attn_core_events,
+        "ffn_input_handoff_events": int(trace.get("ffn_input_handoff_events") or 0),
         "observed_layers": observed_layers,
         "sample_count": samples.get("sample_count") or 0,
         "measured_quality_status": measured_quality_status,

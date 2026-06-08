@@ -37,6 +37,7 @@ QNN_AOT_EVICT_STATELESS_STAGE_GRAPHS="${QNN_AOT_EVICT_STATELESS_STAGE_GRAPHS:-0}
 QNN_AOT_TRACE_LOAD_TIMING="${QNN_AOT_TRACE_LOAD_TIMING:-1}"
 LLAMA_BENCH_WARMUP="${LLAMA_BENCH_WARMUP:-1}"
 LLAMA_BENCH_QNN_PREWARM_DECODE="${LLAMA_BENCH_QNN_PREWARM_DECODE:-1}"
+LLAMA_BENCH_QNN_PREWARM_DEPTH="${LLAMA_BENCH_QNN_PREWARM_DEPTH:-1}"
 GPU_FREQ_MHZ="${GPU_FREQ_MHZ:-967}"
 GPU_PIN_GOVERNOR="${GPU_PIN_GOVERNOR:-}"
 OPENCL_SIM_BUSY="${OPENCL_SIM_BUSY:-0}"
@@ -61,7 +62,7 @@ KEEP_SCREEN_ON_TIMEOUT_MS="${KEEP_SCREEN_ON_TIMEOUT_MS:-1800000}"
 
 case "${BACKEND_POLICY}" in
     fine_grained_qnn_gpu)
-        DEFAULT_FG_ROUTE="attn_proj=qnn-npu,attn_core=opencl,attn_out=cpu,ffn=qnn-npu,output=cpu"
+        DEFAULT_FG_ROUTE="attn_proj=opencl,attn_core=opencl,attn_out=opencl,ffn=qnn-npu,output=opencl"
         DEFAULT_FG_DEVICES="qnn-npu/GPUOpenCL"
         ;;
     single_gpu_opencl)
@@ -608,6 +609,7 @@ ${opencl_env_block}
 ${route_env_block}
 export LLAMA_BENCH_FAST_EXIT=1 &&
 export LLAMA_BENCH_QNN_PREWARM_DECODE=$(remote_quote "${LLAMA_BENCH_QNN_PREWARM_DECODE}") &&
+export LLAMA_BENCH_QNN_PREWARM_DEPTH=$(remote_quote "${LLAMA_BENCH_QNN_PREWARM_DEPTH}") &&
 taskset ${TASKSET_MASK} ./llama-bench -v -o jsonl \\
   -m ${model_q} \\
   -ngl 99 -dev ${devices_q} -t ${LLAMA_THREADS} \\
@@ -777,6 +779,7 @@ write_metadata() {
         printf 'QNN_AOT_TRACE_LOAD_TIMING=%s\n' "${QNN_AOT_TRACE_LOAD_TIMING}"
         printf 'LLAMA_BENCH_WARMUP=%s\n' "${LLAMA_BENCH_WARMUP}"
         printf 'LLAMA_BENCH_QNN_PREWARM_DECODE=%s\n' "${LLAMA_BENCH_QNN_PREWARM_DECODE}"
+        printf 'LLAMA_BENCH_QNN_PREWARM_DEPTH=%s\n' "${LLAMA_BENCH_QNN_PREWARM_DEPTH}"
         printf 'FGSPLIT_REQUIRE_SUPPORT_OK=%s\n' "${FGSPLIT_REQUIRE_SUPPORT_OK}"
         printf 'CURRENT_SCALE_TO_UA=%s\n' "${CURRENT_SCALE_TO_UA}"
         printf 'GPU_FREQ_MHZ=%s\n' "${GPU_FREQ_MHZ}"
@@ -817,6 +820,7 @@ write_metadata() {
         printf 'QNN_AOT_TRACE_LOAD_TIMING=%s \\\n' "$(shell_quote "${QNN_AOT_TRACE_LOAD_TIMING}")"
         printf 'LLAMA_BENCH_WARMUP=%s \\\n' "$(shell_quote "${LLAMA_BENCH_WARMUP}")"
         printf 'LLAMA_BENCH_QNN_PREWARM_DECODE=%s \\\n' "$(shell_quote "${LLAMA_BENCH_QNN_PREWARM_DECODE}")"
+        printf 'LLAMA_BENCH_QNN_PREWARM_DEPTH=%s \\\n' "$(shell_quote "${LLAMA_BENCH_QNN_PREWARM_DEPTH}")"
         printf 'FGSPLIT_REQUIRE_SUPPORT_OK=%s \\\n' "$(shell_quote "${FGSPLIT_REQUIRE_SUPPORT_OK}")"
         printf 'GPU_FREQ_MHZ=%s \\\n' "$(shell_quote "${GPU_FREQ_MHZ}")"
         printf 'OPENCL_SIM_BUSY=%s \\\n' "$(shell_quote "${OPENCL_SIM_BUSY}")"

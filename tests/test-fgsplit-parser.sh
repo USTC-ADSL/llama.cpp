@@ -14,13 +14,13 @@ FG_TRACE backend=qnn-npu layer=0 subgraph=qnn_proj begin_us=100 end_us=180 durat
 FG_SYNC_TRACE from=qnn to=gpu us=11
 AOT_LOAD_TRACE kind=ensure_graph_loaded graph_name=ffn_layer_0_batch_16 model_path=ffn/ffn_layer_0/ffn_layer_0.bin batch_size=16 cache_size=1920 context_size=2048 graph_cache_hit=1 context_cache_hit=1 lock_wait_us=0 context_resolve_us=0 graph_create_us=0 seed_kv_us=0 total_us=0 success=1
 FG_TRACE backend=qnn-npu layer=0 subgraph=qnn_ffn begin_us=300 end_us=520 duration_us=220 tokens=16 step_tokens=16 offset=0 graph=ffn_layer_0 ok=1
-FG_SYNC_TRACE from=gpu to=qnn us=13
+FG_SYNC_TRACE from=gpu to=qnn us=13 wait_us=0 bytes=4096 tensor=ffn_inp-0 split=-1 src_backend=OpenCL dst_backend=qnn-npu reason=ffn_input_materialize
 AOT_LOAD_TRACE kind=ensure_graph_loaded graph_name=attn_proj_layer_1_batch_16 model_path=attn_proj/attn_proj_layer_1/attn_proj_layer_1.bin batch_size=16 cache_size=1920 context_size=2048 graph_cache_hit=1 context_cache_hit=1 lock_wait_us=0 context_resolve_us=0 graph_create_us=0 seed_kv_us=0 total_us=0 success=1
 FG_TRACE backend=qnn-npu layer=1 subgraph=qnn_proj begin_us=600 end_us=680 duration_us=80 tokens=16 step_tokens=16 offset=0 graph=attn_proj_layer_1 ok=1
 FG_SYNC_TRACE from=qnn to=gpu us=11
 AOT_LOAD_TRACE kind=ensure_graph_loaded graph_name=ffn_layer_1_batch_16 model_path=ffn/ffn_layer_1/ffn_layer_1.bin batch_size=16 cache_size=1920 context_size=2048 graph_cache_hit=1 context_cache_hit=1 lock_wait_us=0 context_resolve_us=0 graph_create_us=0 seed_kv_us=0 total_us=0 success=1
 FG_TRACE backend=qnn-npu layer=1 subgraph=qnn_ffn begin_us=800 end_us=1020 duration_us=220 tokens=16 step_tokens=16 offset=0 graph=ffn_layer_1 ok=1
-FG_SYNC_TRACE from=gpu to=qnn us=13
+FG_SYNC_TRACE from=gpu to=qnn us=13 wait_us=0 bytes=4096 tensor=ffn_inp-1 split=-1 src_backend=OpenCL dst_backend=qnn-npu reason=ffn_input_materialize
 OPENCL_KERNEL_TRACE total=7
 llama-bench: benchmark 1/1: round 1/1: finished (1000.00 ms)
 {"model_filename":"fixture.gguf","n_prompt":0,"n_gen":16,"n_depth":512,"test_time":"2026-05-24T00:00:00Z","avg_ns":1000000000,"stddev_ns":0,"avg_ts":20.0,"stddev_ts":0.0}
@@ -135,11 +135,20 @@ python3 "${ROOT_DIR}/tools/parse_fgsplit_trace.py" \
 
 cat > "${TMP_DIR}/ffn_only_qnn_route.log" <<'EOF_FFN_ONLY'
 FG_TRACE backend=qnn-npu layer=0 subgraph=qnn_ffn begin_us=300 end_us=520 duration_us=220 tokens=16 step_tokens=16 offset=0 graph=ffn_layer_0 ok=1
+FG_SYNC_TRACE from=gpu to=qnn us=13 wait_us=0 bytes=4096 tensor=ffn_inp-0 split=-1 src_backend=OpenCL dst_backend=qnn-npu reason=ffn_input_materialize
 OPENCL_KERNEL_TRACE total=7
 OPENCL_KERNEL_TRACE stage=ATTN_CORE count=2
 {"model_filename":"fixture.gguf","n_prompt":0,"n_gen":16,"n_depth":512,"test_time":"2026-05-24T00:00:00Z","avg_ns":1000000000,"stddev_ns":0,"avg_ts":20.0,"stddev_ts":0.0}
 FG_RUN_EXIT_CODE=0
 EOF_FFN_ONLY
+
+cat > "${TMP_DIR}/missing_ffn_handoff.log" <<'EOF_MISSING_FFN_HANDOFF'
+FG_TRACE backend=qnn-npu layer=0 subgraph=qnn_ffn begin_us=300 end_us=520 duration_us=220 tokens=16 step_tokens=16 offset=0 graph=ffn_layer_0 ok=1
+OPENCL_KERNEL_TRACE total=7
+OPENCL_KERNEL_TRACE stage=ATTN_CORE count=2
+{"model_filename":"fixture.gguf","n_prompt":0,"n_gen":16,"n_depth":512,"test_time":"2026-05-24T00:00:00Z","avg_ns":1000000000,"stddev_ns":0,"avg_ts":20.0,"stddev_ts":0.0}
+FG_RUN_EXIT_CODE=0
+EOF_MISSING_FFN_HANDOFF
 
 python3 "${ROOT_DIR}/tools/parse_fgsplit_trace.py" \
     --bench-log "${TMP_DIR}/ffn_only_qnn_route.log" \
@@ -149,6 +158,22 @@ python3 "${ROOT_DIR}/tools/parse_fgsplit_trace.py" \
     --backend-policy fine_grained_qnn_gpu \
     --fg-route "attn_proj=opencl,attn_core=opencl,attn_out=opencl,ffn=qnn-npu,output=opencl" \
     --state-id fg_qnn_burst_gpu_967 \
+    --context-len 512 \
+    --prompt-tokens 512 \
+    --decode-tokens 16 \
+    --layers 1 \
+    --rounds 1 \
+    --gpu-freq-mhz 967 \
+    --qnn-workpoint burst
+
+python3 "${ROOT_DIR}/tools/parse_fgsplit_trace.py" \
+    --bench-log "${TMP_DIR}/missing_ffn_handoff.log" \
+    --sample-log "${TMP_DIR}/power_samples.csv" \
+    --output-csv "${TMP_DIR}/out_missing_ffn_handoff.csv" \
+    --mode synthetic \
+    --backend-policy fine_grained_qnn_gpu \
+    --fg-route "attn_proj=opencl,attn_core=opencl,attn_out=opencl,ffn=qnn-npu,output=opencl" \
+    --state-id missing_ffn_handoff \
     --context-len 512 \
     --prompt-tokens 512 \
     --decode-tokens 16 \
@@ -247,10 +272,25 @@ if ffn_only_qnn["qnn_proj_us"] != "":
     raise SystemExit(f"ffn-only QNN route should not report qnn_proj_us, got {ffn_only_qnn['qnn_proj_us']!r}")
 if ffn_only_qnn["qnn_ffn_us"] != "220.000":
     raise SystemExit(f"ffn-only QNN route should report qnn_ffn_us, got {ffn_only_qnn['qnn_ffn_us']!r}")
+if ffn_only_qnn["sync_gpu_to_qnn_us"] != "13.000":
+    raise SystemExit(f"ffn-only QNN route should report hidden-state GPU->QNN handoff, got {ffn_only_qnn['sync_gpu_to_qnn_us']!r}")
+PY
+
+python3 - "${TMP_DIR}/out_missing_ffn_handoff.csv" <<'PY'
+import csv
+import sys
+
+with open(sys.argv[1], newline="") as handle:
+    row = next(csv.DictReader(handle))
+
+if row["support_status"] != "missing_hidden_handoff":
+    raise SystemExit(
+        f"default AF route should require ffn_inp GPU->QNN handoff evidence, got {row['support_status']!r}")
 PY
 
 cat > "${TMP_DIR}/missing_qnn_proj.log" <<'EOF_MISSING_PROJ'
 FG_TRACE backend=qnn-npu layer=0 subgraph=qnn_ffn begin_us=300 end_us=520 duration_us=220 tokens=16 step_tokens=16 offset=0 graph=ffn_layer_0 ok=1
+FG_SYNC_TRACE from=gpu to=qnn us=13 wait_us=0 bytes=4096 tensor=ffn_inp-0 split=-1 src_backend=OpenCL dst_backend=qnn-npu reason=ffn_input_materialize
 OPENCL_KERNEL_TRACE total=7
 OPENCL_KERNEL_TRACE stage=ATTN_CORE count=2
 {"model_filename":"fixture.gguf","n_prompt":0,"n_gen":16,"n_depth":512,"test_time":"2026-05-24T00:00:00Z","avg_ns":1000000000,"stddev_ns":0,"avg_ts":20.0,"stddev_ts":0.0}
@@ -303,8 +343,8 @@ missing_proj = read(sys.argv[1])
 missing_ffn = read(sys.argv[2])
 missing_attn = read(sys.argv[3])
 
-if missing_proj["support_status"] != "unsupported_by_qnn_graph":
-    raise SystemExit(f"missing qnn_proj should be unsupported_by_qnn_graph, got {missing_proj['support_status']!r}")
+if missing_proj["support_status"] != "ok":
+    raise SystemExit(f"default AF route should not require qnn_proj, got {missing_proj['support_status']!r}")
 if missing_ffn["support_status"] != "unsupported_by_qnn_graph":
     raise SystemExit(f"missing qnn_ffn should be unsupported_by_qnn_graph, got {missing_ffn['support_status']!r}")
 if missing_attn["support_status"] != "unsupported_by_gpu_kernel":
@@ -317,6 +357,7 @@ AOT_LOAD_TRACE kind=context model_path=/data/local/tmp/stage/ffn/ffn_layer_0.bin
 AOT_LOAD_TRACE kind=ensure_graph_loaded graph_name=attn_proj_layer_0_batch_16 model_path=attn_proj/attn_proj_layer_0/attn_proj_layer_0.bin batch_size=16 cache_size=1920 context_size=2048 graph_cache_hit=1 context_cache_hit=1 lock_wait_us=0 context_resolve_us=0 graph_create_us=0 seed_kv_us=0 total_us=0 success=1
 FG_TRACE backend=qnn-npu layer=0 subgraph=qnn_proj begin_us=100 end_us=180 duration_us=80 tokens=16 step_tokens=16 offset=0 graph=attn_proj_layer_0 ok=1
 FG_TRACE backend=qnn-npu layer=0 subgraph=qnn_ffn begin_us=300 end_us=520 duration_us=220 tokens=16 step_tokens=16 offset=0 graph=ffn_layer_0 ok=1
+FG_SYNC_TRACE from=gpu to=qnn us=13 wait_us=0 bytes=4096 tensor=ffn_inp-0 split=-1 src_backend=OpenCL dst_backend=qnn-npu reason=ffn_input_materialize
 OPENCL_KERNEL_TRACE total=7
 OPENCL_KERNEL_TRACE stage=ATTN_CORE count=2
 llama-bench: benchmark 1/1: round 1/1: finished (1000.00 ms)
@@ -329,6 +370,7 @@ llama-bench: benchmark 1/1: round 1/1: starting
 AOT_LOAD_TRACE kind=ensure_graph_loaded graph_name=attn_proj_layer_0_batch_16 model_path=attn_proj/attn_proj_layer_0/attn_proj_layer_0.bin batch_size=16 cache_size=1920 context_size=2048 graph_cache_hit=0 context_cache_hit=1 lock_wait_us=0 context_resolve_us=0 graph_create_us=123 seed_kv_us=0 total_us=123 success=1
 FG_TRACE backend=qnn-npu layer=0 subgraph=qnn_proj begin_us=100 end_us=180 duration_us=80 tokens=16 step_tokens=16 offset=0 graph=attn_proj_layer_0 ok=1
 FG_TRACE backend=qnn-npu layer=0 subgraph=qnn_ffn begin_us=300 end_us=520 duration_us=220 tokens=16 step_tokens=16 offset=0 graph=ffn_layer_0 ok=1
+FG_SYNC_TRACE from=gpu to=qnn us=13 wait_us=0 bytes=4096 tensor=ffn_inp-0 split=-1 src_backend=OpenCL dst_backend=qnn-npu reason=ffn_input_materialize
 OPENCL_KERNEL_TRACE total=7
 OPENCL_KERNEL_TRACE stage=ATTN_CORE count=2
 llama-bench: benchmark 1/1: round 1/1: finished (1000.00 ms)
@@ -342,6 +384,7 @@ AOT_LOAD_TRACE kind=ensure_graph_loaded graph_name=attn_proj_layer_0_batch_16 mo
 FG_TRACE backend=qnn-npu layer=0 subgraph=qnn_proj begin_us=100 end_us=180 duration_us=80 tokens=16 step_tokens=16 offset=0 graph=attn_proj_layer_0 ok=1
 FG_SYNC_TRACE from=qnn to=gpu us=17 wait_us=0 bytes=7340032 tensor=blk.2.attn_q.weight split=1 src_backend=qnn-npu dst_backend=OpenCL
 FG_TRACE backend=qnn-npu layer=0 subgraph=qnn_ffn begin_us=300 end_us=520 duration_us=220 tokens=16 step_tokens=16 offset=0 graph=ffn_layer_0 ok=1
+FG_SYNC_TRACE from=gpu to=qnn us=13 wait_us=0 bytes=4096 tensor=ffn_inp-0 split=-1 src_backend=OpenCL dst_backend=qnn-npu reason=ffn_input_materialize
 OPENCL_KERNEL_TRACE total=7
 OPENCL_KERNEL_TRACE stage=ATTN_CORE count=2
 llama-bench: benchmark 1/1: round 1/1: finished (1000.00 ms)
@@ -452,7 +495,7 @@ grep -F "rm -f cl_profiling.csv cl_stage_profiling.csv cl_trace.json" \
     "${ROOT_DIR}/scripts/run_fgsplit_synthetic.sh" >/dev/null
 grep -F 'BACKEND_POLICY="${BACKEND_POLICY:-fine_grained_qnn_gpu}"' \
     "${ROOT_DIR}/scripts/run_fgsplit_synthetic.sh" >/dev/null
-grep -F 'DEFAULT_FG_ROUTE="attn_proj=qnn-npu,attn_core=opencl,attn_out=cpu,ffn=qnn-npu,output=cpu"' \
+grep -F 'DEFAULT_FG_ROUTE="attn_proj=opencl,attn_core=opencl,attn_out=opencl,ffn=qnn-npu,output=opencl"' \
     "${ROOT_DIR}/scripts/run_fgsplit_synthetic.sh" >/dev/null
 grep -F -- "--fg-route \"\${FG_ROUTE}\"" \
     "${ROOT_DIR}/scripts/run_fgsplit_synthetic.sh" >/dev/null

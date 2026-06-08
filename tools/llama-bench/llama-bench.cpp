@@ -2361,6 +2361,35 @@ int main(int argc, char ** argv) {
                 ctx->clear_dynamic_seq0_token_history();
             }
 
+            if (llama_bench_should_run_qnn_depth_prewarm(
+                        qnn_reset_entries,
+                        t.n_depth,
+                        llama_bench_qnn_depth_prewarm_enabled())) {
+                if (print_round_events) {
+                    fprintf(stderr, "llama-bench: benchmark %d/%zu: qnn depth prewarm run %d/%d\n", params_idx,
+                            params_count, i + 1, params.reps);
+                }
+                bool res = test_prompt(ctx, t.n_depth, t.n_batch, t.n_threads);
+                if (!res) {
+                    fprintf(stderr, "%s: error: failed to run qnn depth prewarm\n", __func__);
+                    llama_free(ctx);
+                    llama_model_free(lmodel);
+                    exit(1);
+                }
+                const auto qnn_post_depth_prewarm_reset_result = llama_bench_reset_qnn_aot_backends(qnn_reset_entries);
+                if (!qnn_post_depth_prewarm_reset_result.ok()) {
+                    fprintf(stderr,
+                            "%s: error: failed to reset qnn AoT state after qnn depth prewarm (failed backends: %s)\n",
+                            __func__,
+                            join(qnn_post_depth_prewarm_reset_result.failed_backends, ", ").c_str());
+                    llama_free(ctx);
+                    llama_model_free(lmodel);
+                    exit(1);
+                }
+                llama_memory_clear(llama_get_memory(ctx), false);
+                ctx->clear_dynamic_seq0_token_history();
+            }
+
             if (print_round_events) {
                 fprintf(stderr,
                         "%s\n",

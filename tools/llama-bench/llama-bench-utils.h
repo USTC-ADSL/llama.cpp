@@ -59,11 +59,32 @@ inline bool llama_bench_qnn_decode_prewarm_enabled() {
     return llama_bench_env_flag_enabled("LLAMA_BENCH_QNN_PREWARM_DECODE");
 }
 
+inline bool llama_bench_qnn_depth_prewarm_enabled() {
+    return llama_bench_env_flag_enabled("LLAMA_BENCH_QNN_PREWARM_DEPTH");
+}
+
 inline bool llama_bench_should_run_qnn_decode_prewarm(
         const std::vector<llama_bench_round_reset_entry> & entries,
         int                                                n_gen,
         bool                                               enabled) {
     if (!enabled || n_gen <= 0) {
+        return false;
+    }
+
+    for (const auto & entry : entries) {
+        if (entry.has_qnn_aot_reset) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+inline bool llama_bench_should_run_qnn_depth_prewarm(
+        const std::vector<llama_bench_round_reset_entry> & entries,
+        int                                                n_depth,
+        bool                                               enabled) {
+    if (!enabled || n_depth <= 0) {
         return false;
     }
 

@@ -949,6 +949,64 @@ void aot_fg_trace(
             ok ? 1 : 0);
 }
 
+std::string lowercase_copy(const char * value) {
+    std::string out = value != nullptr ? value : "";
+    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char ch) {
+        return (char) std::tolower(ch);
+    });
+    return out;
+}
+
+const char * qnn_aot_sync_endpoint_for_backend_name(const char * backend_name) {
+    const std::string name = lowercase_copy(backend_name);
+    if (name.find("qnn") != std::string::npos || name.find("rpcmem") != std::string::npos) {
+        return "qnn";
+    }
+    if (name.find("opencl") != std::string::npos || name.find("gpu") != std::string::npos || name.find("cl_") != std::string::npos) {
+        return "gpu";
+    }
+    if (name.find("cpu") != std::string::npos || name.find("host") != std::string::npos) {
+        return "cpu";
+    }
+    return "unknown";
+}
+
+const char * qnn_aot_tensor_backend_name(const ggml_tensor * tensor) {
+    ggml_backend_buffer_t buffer = tensor_access_buffer(tensor);
+    if (buffer == nullptr) {
+        return "<none>";
+    }
+
+    const char * name = ggml_backend_buffer_name(buffer);
+    return name != nullptr ? name : "<unnamed>";
+}
+
+void qnn_aot_trace_ffn_input_handoff(
+        const ggml_tensor * tensor,
+        size_t              bytes,
+        int64_t             latency_us,
+        const char *        reason) {
+    if (!aot_fg_trace_enabled() || tensor == nullptr) {
+        return;
+    }
+
+    const char * src_backend = qnn_aot_tensor_backend_name(tensor);
+    const char * src         = qnn_aot_sync_endpoint_for_backend_name(src_backend);
+    if (std::strcmp(src, "qnn") == 0 || std::strcmp(src, "unknown") == 0) {
+        return;
+    }
+
+    const char * tensor_name = ggml_get_name(tensor);
+    QNN_LOG_INFO(
+            "FG_SYNC_TRACE from=%s to=qnn us=%lld wait_us=0 bytes=%zu tensor=%s split=-1 src_backend=%s dst_backend=qnn-npu reason=%s\n",
+            src,
+            (long long) std::max<int64_t>(latency_us, 0),
+            bytes,
+            tensor_name != nullptr ? tensor_name : "<unnamed>",
+            src_backend,
+            reason != nullptr ? reason : "ffn_input_materialize");
+}
+
 const char * aot_debug_dump_dir() {
     const char * value = std::getenv("GGML_QNN_AOT_DEBUG_DUMP_DIR");
     return value != nullptr && value[0] != '\0' ? value : nullptr;
@@ -6790,6 +6848,11 @@ bool qnn_aot_runtime::execute_ffn(ggml_cgraph * cgraph, const aot_match_result &
                          bound_out ? 1 : 0);
         }
         if (bound_x && bound_out) {
+            qnn_aot_trace_ffn_input_handoff(
+                    match.embd,
+                    ggml_nbytes(match.embd),
+                    0,
+                    "ffn_input_direct_bind");
             if (aot_trace_bind_enabled()) {
                 QNN_LOG_INFO("[aot] ffn layer=%zu graph=%s direct-bind x=%s out=%s tokens=%zu\n",
                              match.layer_id,
@@ -6854,7 +6917,14 @@ bool qnn_aot_runtime::execute_ffn(ggml_cgraph * cgraph, const aot_match_result &
             std::memset(x_buffer, 0, graph->buffer_size(graph->config().x_name));
         }
 
+        const int64_t t_handoff_begin_us = aot_fg_trace_enabled() ? ggml_time_us() : 0;
         copy_ggml_rows_to_contiguous(match.embd, offset, step, embed_dim, x_buffer);
+        const int64_t t_handoff_end_us = aot_fg_trace_enabled() ? ggml_time_us() : 0;
+        qnn_aot_trace_ffn_input_handoff(
+                match.embd,
+                step * embed_dim * sizeof(float),
+                t_handoff_end_us - t_handoff_begin_us,
+                "ffn_input_materialize");
 
         const int64_t t_fg_begin_us = aot_fg_trace_enabled() ? ggml_time_us() : 0;
         const bool graph_ok = graph->execute();
