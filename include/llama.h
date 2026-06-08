@@ -374,6 +374,38 @@ extern "C" {
         // reserves a clean interface for future dynamic QNN stage scheduling
         // without forcing it on current CPU/OpenCL-only experiments.
         bool allow_qnn;
+
+        // [EXPERIMENTAL]
+        // For decode batches, keep the context's base/static route until this
+        // many single-token decode calls have completed. A value of 0 keeps
+        // the historical phase-based behavior.
+        uint64_t decode_switch_after;
+
+        // [EXPERIMENTAL]
+        // Optional same-backend GPU frequency target applied at the decode
+        // switch boundary. This is a control hook only; callers must provide
+        // writable sysfs paths or run with sufficient privileges.
+        uint64_t decode_gpu_freq_hz;
+        const char * gpu_min_freq_path;
+        const char * gpu_max_freq_path;
+        const char * gpu_cur_freq_path;
+
+        // [EXPERIMENTAL]
+        // Optional same-backend CPU frequency target applied at the decode
+        // switch boundary. Frequency is in kHz, matching Android cpufreq sysfs.
+        // Callers must provide writable policy paths or run with sufficient
+        // privileges.
+        uint64_t decode_cpu_freq_khz;
+        const char * cpu_min_freq_path;
+        const char * cpu_max_freq_path;
+        const char * cpu_cur_freq_path;
+
+        // [EXPERIMENTAL]
+        // Optional same-backend CPU state target applied at the decode switch
+        // boundary. The affinity mask is a Linux CPU mask, for example "C0" or
+        // "0xCF". Thread count changes only affect decode/single-token work.
+        const char * decode_cpu_affinity_mask;
+        int32_t decode_cpu_threads;
     };
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations

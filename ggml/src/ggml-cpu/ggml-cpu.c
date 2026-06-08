@@ -38,7 +38,7 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <signal.h>
-#if defined(__gnu_linux__)
+#if defined(__gnu_linux__) || defined(__linux__) || defined(__ANDROID__)
 #include <syscall.h>
 #endif
 
@@ -2558,7 +2558,7 @@ static bool ggml_thread_apply_priority(int32_t prio) {
     return true;
 }
 
-#elif defined(__gnu_linux__)
+#elif defined(__gnu_linux__) || defined(__linux__) || defined(__ANDROID__)
 // TODO: this may not work on BSD, to be verified
 
 static bool ggml_thread_apply_affinity(const bool * mask) {
@@ -2634,6 +2634,41 @@ static bool ggml_thread_cpumask_is_valid(const bool * mask) {
         if (mask[i]) { return true; }
     }
     return false;
+}
+
+static uint64_t ggml_thread_cpumask_to_u64(const bool * mask) {
+    uint64_t bitmask = 0;
+    for (int i = 0; i < GGML_MAX_N_THREADS && i < 64; i++) {
+        if (mask[i]) {
+            bitmask |= 1ULL << i;
+        }
+    }
+    return bitmask;
+}
+
+static int ggml_thread_current_cpu(void) {
+#if defined(__gnu_linux__) || defined(__linux__) || defined(__ANDROID__)
+    uint current_cpu = 0;
+    uint current_node = 0;
+#if (defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ > 33))) || defined(__COSMOPOLITAN__)
+    if (getcpu(&current_cpu, &current_node) == 0) {
+        return (int) current_cpu;
+    }
+#else
+#if !defined(SYS_getcpu) && defined(SYS_get_cpu)
+#define SYS_getcpu SYS_get_cpu
+#endif
+#if !defined(SYS_getcpu) && defined(__NR_getcpu)
+#define SYS_getcpu __NR_getcpu
+#endif
+#if defined(SYS_getcpu)
+    if (syscall(SYS_getcpu, &current_cpu, &current_node) == 0) {
+        return (int) current_cpu;
+    }
+#endif
+#endif
+#endif
+    return -1;
 }
 
 static void ggml_thread_cpumask_next(const bool * global_mask, bool * local_mask, bool strict, int32_t* iter) {
@@ -3435,6 +3470,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     }
 
 #ifdef GGML_USE_OPENMP
+    const int requested_n_threads = n_threads;
+    const bool trace_openmp_worker_cpu = getenv("GGML_CPU_TRACE_OPENMP_WORKER_CPU") != NULL;
     if (n_threads > 1) {
         #pragma omp parallel num_threads(n_threads)
         {
@@ -3443,6 +3480,12 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                 // update the number of threads from the actual number of threads that we got from OpenMP
                 n_threads = omp_get_num_threads();
                 atomic_store_explicit(&threadpool->n_graph, n_threads, memory_order_relaxed);
+                if (getenv("GGML_CPU_TRACE_OPENMP_TEAM")) {
+                    GGML_LOG_INFO("ggml_graph_compute: openmp_team requested=%d actual=%d threadpool=%p\n",
+                            requested_n_threads,
+                            n_threads,
+                            (void *) threadpool);
+                }
             }
 
             // Apply thread CPU mask and priority
@@ -3452,7 +3495,31 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
             if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
                 ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
             }
+            const int cpu_before = trace_openmp_worker_cpu ? ggml_thread_current_cpu() : -1;
+            const int64_t worker_start_us = trace_openmp_worker_cpu ? ggml_time_us() : 0;
             ggml_graph_compute_thread(&threadpool->workers[ith]);
+            if (trace_openmp_worker_cpu) {
+                const int64_t worker_compute_us = ggml_time_us() - worker_start_us;
+                const int cpu_after = ggml_thread_current_cpu();
+                const uint64_t worker_cpumask =
+                    ggml_thread_cpumask_to_u64(threadpool->workers[ith].cpumask);
+                #pragma omp critical(ggml_trace_openmp_worker_cpu)
+                {
+                    GGML_LOG_INFO("ggml_graph_compute: openmp_worker_cpu requested=%d actual=%d "
+                            "ith=%d cpu_before=%d cpu_after=%d worker_compute_us=%" PRId64
+                            " worker_cpumask=0x%" PRIx64
+                            " threadpool=%p pthread=%lx\n",
+                            requested_n_threads,
+                            n_threads,
+                            ith,
+                            cpu_before,
+                            cpu_after,
+                            worker_compute_us,
+                            worker_cpumask,
+                            (void *) threadpool,
+                            (unsigned long) pthread_self());
+                }
+            }
         }
     } else {
         atomic_store_explicit(&threadpool->n_graph, 1, memory_order_relaxed);

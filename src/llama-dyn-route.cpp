@@ -32,6 +32,24 @@ int64_t env_i64_value(const char * name, int64_t default_value) {
     return std::strtoll(value, nullptr, 10);
 }
 
+std::string env_string_value(const char * name, const char * default_value = nullptr) {
+    const char * value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_value != nullptr ? default_value : "";
+    }
+
+    return value;
+}
+
+std::string env_string_alias_value(const char * primary, const char * fallback) {
+    std::string value = env_string_value(primary);
+    if (!value.empty()) {
+        return value;
+    }
+
+    return env_string_value(fallback);
+}
+
 bool candidate_uses_backend(
         const llama_hetero_execution_plan & plan,
         bool (*predicate)(const std::string &)) {
@@ -334,6 +352,19 @@ bool llama_dynamic_route_build_runtime_config(
     out_config.slo_us        = public_config.slo_us;
     out_config.allow_qnn     = public_config.allow_qnn;
     out_config.trace_enabled = false;
+    out_config.decode_switch_after = public_config.decode_switch_after;
+    out_config.decode_gpu_freq_hz  = public_config.decode_gpu_freq_hz;
+    out_config.gpu_min_freq_path   = public_config.gpu_min_freq_path != nullptr ? public_config.gpu_min_freq_path : "";
+    out_config.gpu_max_freq_path   = public_config.gpu_max_freq_path != nullptr ? public_config.gpu_max_freq_path : "";
+    out_config.gpu_cur_freq_path   = public_config.gpu_cur_freq_path != nullptr ? public_config.gpu_cur_freq_path : "";
+    out_config.decode_cpu_freq_khz = public_config.decode_cpu_freq_khz;
+    out_config.cpu_min_freq_path   = public_config.cpu_min_freq_path != nullptr ? public_config.cpu_min_freq_path : "";
+    out_config.cpu_max_freq_path   = public_config.cpu_max_freq_path != nullptr ? public_config.cpu_max_freq_path : "";
+    out_config.cpu_cur_freq_path   = public_config.cpu_cur_freq_path != nullptr ? public_config.cpu_cur_freq_path : "";
+    out_config.decode_cpu_affinity_mask =
+        public_config.decode_cpu_affinity_mask != nullptr ? public_config.decode_cpu_affinity_mask : "";
+    out_config.decode_cpu_threads =
+        public_config.decode_cpu_threads > 0 ? public_config.decode_cpu_threads : 0;
 
     return true;
 }
@@ -372,6 +403,51 @@ llama_dynamic_route_runtime_config llama_dynamic_route_config_from_env() {
     config.slo_us        = env_i64_value("GGML_HETERO_DYNAMIC_SLO_US", 0);
     config.allow_qnn     = env_flag_enabled("GGML_HETERO_DYNAMIC_ALLOW_QNN", true);
     config.trace_enabled = env_flag_enabled("GGML_HETERO_DYNAMIC_TRACE", false);
+    config.decode_switch_after =
+        static_cast<uint64_t>(std::max<int64_t>(
+                0,
+                env_i64_value(
+                    "GGML_HETERO_DECODE_SWITCH_AFTER",
+                    env_i64_value("GGML_HETERO_DYNAMIC_DECODE_SWITCH_AFTER", 0))));
+    config.decode_gpu_freq_hz =
+        static_cast<uint64_t>(std::max<int64_t>(
+                0,
+                env_i64_value(
+                    "GGML_HETERO_DYNAMIC_DECODE_GPU_FREQ_HZ",
+                    env_i64_value("GGML_HETERO_DECODE_GPU_FREQ_HZ", 0))));
+    config.gpu_min_freq_path = env_string_alias_value(
+            "GGML_HETERO_GPU_MIN_FREQ_PATH",
+            "GGML_HETERO_DYNAMIC_GPU_MIN_FREQ_PATH");
+    config.gpu_max_freq_path = env_string_alias_value(
+            "GGML_HETERO_GPU_MAX_FREQ_PATH",
+            "GGML_HETERO_DYNAMIC_GPU_MAX_FREQ_PATH");
+    config.gpu_cur_freq_path = env_string_alias_value(
+            "GGML_HETERO_GPU_CUR_FREQ_PATH",
+            "GGML_HETERO_DYNAMIC_GPU_CUR_FREQ_PATH");
+    config.decode_cpu_freq_khz =
+        static_cast<uint64_t>(std::max<int64_t>(
+                0,
+                env_i64_value(
+                    "GGML_HETERO_DYNAMIC_DECODE_CPU_FREQ_KHZ",
+                    env_i64_value("GGML_HETERO_DECODE_CPU_FREQ_KHZ", 0))));
+    config.cpu_min_freq_path = env_string_alias_value(
+            "GGML_HETERO_CPU_MIN_FREQ_PATH",
+            "GGML_HETERO_DYNAMIC_CPU_MIN_FREQ_PATH");
+    config.cpu_max_freq_path = env_string_alias_value(
+            "GGML_HETERO_CPU_MAX_FREQ_PATH",
+            "GGML_HETERO_DYNAMIC_CPU_MAX_FREQ_PATH");
+    config.cpu_cur_freq_path = env_string_alias_value(
+            "GGML_HETERO_CPU_CUR_FREQ_PATH",
+            "GGML_HETERO_DYNAMIC_CPU_CUR_FREQ_PATH");
+    config.decode_cpu_affinity_mask = env_string_alias_value(
+            "GGML_HETERO_DECODE_CPU_AFFINITY_MASK",
+            "GGML_HETERO_DYNAMIC_DECODE_CPU_AFFINITY_MASK");
+    config.decode_cpu_threads =
+        static_cast<int32_t>(std::max<int64_t>(
+                0,
+                env_i64_value(
+                    "GGML_HETERO_DYNAMIC_DECODE_CPU_THREADS",
+                    env_i64_value("GGML_HETERO_DECODE_CPU_THREADS", 0))));
 
     return config;
 }
@@ -396,6 +472,20 @@ llama_dynamic_route_decision llama_dynamic_route_decide(
 
     const bool is_prefill = request.n_tokens > 1;
     const auto & primary = is_prefill ? config.prefill : config.decode;
+    const bool decode_switch_after_active =
+        !is_prefill &&
+        config.decode_switch_after > 0 &&
+        request.decode_token_index > 0;
+
+    if (decode_switch_after_active &&
+        request.decode_token_index <= config.decode_switch_after) {
+        if (request.base_plan != nullptr) {
+            decision.plan = *request.base_plan;
+            decision.plan_label = "base";
+        }
+        decision.reason = "decode-switch-wait";
+        return decision;
+    }
 
     if (config.mode == llama_dynamic_route_mode::COST_MODEL_RESERVED) {
         struct scored_candidate {
@@ -454,7 +544,9 @@ llama_dynamic_route_decision llama_dynamic_route_decide(
 
         maybe_add_candidate(primary.configured,
                 primary.label.c_str(),
-                is_prefill ? "cost-prefill-route" : "cost-decode-route",
+                is_prefill
+                    ? "cost-prefill-route"
+                    : (decode_switch_after_active ? "decode-switch-after" : "cost-decode-route"),
                 &primary.plan);
         maybe_add_candidate(config.fallback.configured,
                 config.fallback.label.c_str(),
@@ -518,7 +610,9 @@ llama_dynamic_route_decision llama_dynamic_route_decide(
                 request,
                 primary.plan,
                 primary.label.c_str(),
-                is_prefill ? "phase-prefill-route" : "phase-decode-route");
+                is_prefill
+                    ? "phase-prefill-route"
+                    : (decode_switch_after_active ? "decode-switch-after" : "phase-decode-route"));
         if (decision.should_apply || decision.reason == "already-active") {
             return decision;
         }

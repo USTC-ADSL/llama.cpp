@@ -194,11 +194,20 @@ struct ggml_backend_registry {
 #endif
         backends.push_back({ reg, std::move(handle) });
         for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); i++) {
-            register_device(ggml_backend_reg_dev_get(reg, i));
+            ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, i);
+            if (!dev) {
+                GGML_LOG_DEBUG("%s: backend %s skipped unavailable device %zu\n",
+                    __func__, ggml_backend_reg_name(reg), i);
+                continue;
+            }
+            register_device(dev);
         }
     }
 
     void register_device(ggml_backend_dev_t device) {
+        if (!device) {
+            return;
+        }
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: registered device %s (%s)\n", __func__, ggml_backend_dev_name(device), ggml_backend_dev_description(device));
 #endif

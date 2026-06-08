@@ -378,6 +378,37 @@ static inline bool llama_hetero_route_spec_equals(const llama_hetero_route_spec 
            lhs.output    == rhs.output;
 }
 
+static inline bool llama_hetero_route_spec_cpu_default_equivalent(const llama_hetero_route_spec & lhs, const llama_hetero_route_spec & rhs) {
+    if (llama_hetero_route_spec_equals(lhs, rhs)) {
+        return true;
+    }
+
+    const auto route_is_default_or_cpu = [](const llama_hetero_route_spec & spec) {
+        if (!spec.has_any_route()) {
+            return true;
+        }
+
+        static constexpr std::array<llama_hetero_route_stage, 5> kStages = {{
+            llama_hetero_route_stage::ATTN_PROJ,
+            llama_hetero_route_stage::ATTN_CORE,
+            llama_hetero_route_stage::ATTN_OUT,
+            llama_hetero_route_stage::FFN,
+            llama_hetero_route_stage::OUTPUT,
+        }};
+
+        for (const auto stage : kStages) {
+            const std::string backend = llama_hetero_canonical_backend(spec.backend_for(stage));
+            if (!backend.empty() && backend != "cpu") {
+                return false;
+            }
+        }
+
+        return true;
+    };
+
+    return route_is_default_or_cpu(lhs) && route_is_default_or_cpu(rhs);
+}
+
 static inline const char * llama_hetero_route_env_value() {
     const char * value = std::getenv("GGML_HETERO_PHASE_ROUTE");
     if (value != nullptr && value[0] != '\0') {

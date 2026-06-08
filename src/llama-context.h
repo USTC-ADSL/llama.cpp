@@ -392,6 +392,7 @@ private:
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;
+    ggml_threadpool_t owned_dynamic_decode_threadpool = nullptr;
 
     ggml_abort_callback abort_callback      = nullptr;
     void *              abort_callback_data = nullptr;
@@ -436,19 +437,37 @@ private:
     llama_dynamic_route_runtime_config dynamic_route_config;
     llama_dynamic_route_runtime_state  dynamic_route_state;
     std::string qnn_htp_current_workpoint;
+    uint64_t gpu_current_freq_hz = 0;
+    uint64_t cpu_current_freq_khz = 0;
+    std::string cpu_current_affinity_mask;
 
     struct hetero_phase_timing_trace {
         bool active = false;
         bool route_applied = false;
         bool route_noop = false;
         bool bootstrap_ran = false;
+        bool transition_trace_emitted = false;
 
         uint32_t n_tokens = 0;
+        uint64_t decode_token_index = 0;
+        uint64_t switch_after_tokens = 0;
 
         int64_t batch_start_us = 0;
         int64_t route_decide_us = 0;
         int64_t route_apply_us = 0;
         int64_t qnn_workpoint_apply_us = 0;
+        int64_t gpu_freq_apply_us = 0;
+        int64_t cpu_freq_apply_us = 0;
+        int64_t cpu_affinity_apply_us = 0;
+        int64_t cpu_threads_apply_us = 0;
+        uint64_t requested_gpu_freq_hz = 0;
+        uint64_t actual_gpu_freq_hz = 0;
+        uint64_t requested_cpu_freq_khz = 0;
+        uint64_t actual_cpu_freq_khz = 0;
+        std::string requested_cpu_affinity_mask;
+        std::string actual_cpu_affinity_mask;
+        int32_t requested_cpu_threads = 0;
+        int32_t actual_cpu_threads = 0;
         int64_t reserve_us = 0;
         int64_t reserve_sched_new_us = 0;
         int64_t reserve_memory_init_us = 0;
@@ -471,6 +490,7 @@ private:
         std::string route_label;
         std::string route_reason;
         std::string target_route;
+        std::string transition_phase;
 
         void reset() {
             *this = {};
@@ -479,6 +499,11 @@ private:
 
     void hetero_decode_token_trace_record(int64_t done_us);
     void hetero_decode_token_trace_dump();
+    void hetero_transition_trace_log(
+            int64_t total_us,
+            int64_t process_ubatch_us,
+            int64_t sync_done_us,
+            bool    include_first_token_gap);
 
     hetero_phase_timing_trace hetero_phase_trace;
     bool hetero_phase_trace_suppress_sync_log = false;

@@ -622,7 +622,7 @@ struct llm_graph_params {
             arch  == other.arch  &&
             gtype == other.gtype &&
             model == other.model &&
-            llama_hetero_route_spec_equals(hetero_route, other.hetero_route) &&
+            llama_hetero_route_spec_cpu_default_equivalent(hetero_route, other.hetero_route) &&
             cvec  == other.cvec  &&
             loras == other.loras &&
             cross == other.cross;
