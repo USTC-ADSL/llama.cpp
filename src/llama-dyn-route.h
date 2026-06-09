@@ -30,6 +30,7 @@ struct llama_dynamic_route_runtime_config {
     bool    trace_enabled = false;
     uint64_t decode_switch_after = 0;
     uint64_t decode_gpu_freq_hz = 0;
+    bool decode_gpu_freq_sync_before_apply = false;
     std::string gpu_min_freq_path;
     std::string gpu_max_freq_path;
     std::string gpu_cur_freq_path;

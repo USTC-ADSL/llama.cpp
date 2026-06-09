@@ -1,6 +1,7 @@
 #include "../src/llama-dyn-route.h"
 #include "testing.h"
 
+#include <cstdlib>
 #include <string>
 
 namespace {
@@ -51,6 +52,18 @@ int main() {
         t.assert_equal("GPU cur path", std::string("/sys/test_gpu/cur_freq"), config.gpu_cur_freq_path);
         t.assert_equal("CPU affinity target", std::string("CF"), config.decode_cpu_affinity_mask);
         t.assert_equal("CPU thread target", int32_t(6), config.decode_cpu_threads);
+    });
+
+    t.test("env config can request GPU freq sync before apply", [](testing & t) {
+        setenv("GGML_HETERO_DYNAMIC_MODE", "phase", 1);
+        setenv("GGML_HETERO_DECODE_GPU_FREQ_SYNC_BEFORE_APPLY", "1", 1);
+
+        const llama_dynamic_route_runtime_config config = llama_dynamic_route_config_from_env();
+
+        t.assert_true("GPU freq pre-apply sync enabled", config.decode_gpu_freq_sync_before_apply);
+
+        unsetenv("GGML_HETERO_DECODE_GPU_FREQ_SYNC_BEFORE_APPLY");
+        unsetenv("GGML_HETERO_DYNAMIC_MODE");
     });
 
     t.test("decode switch-after keeps base route until completed-token boundary", [](testing & t) {

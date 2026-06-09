@@ -312,6 +312,7 @@ private:
     void validate_dynamic_seq0_token_history();
     void record_dynamic_seq0_token_history(const llama_batch & batch_inp, size_t prefix_tokens_before_decode);
     bool replay_dynamic_qnn_prefix();
+    bool should_sync_before_dynamic_gpu_freq_switch(uint32_t n_tokens) const;
     void maybe_apply_dynamic_route(uint32_t n_tokens);
 
     //
@@ -456,6 +457,7 @@ private:
         int64_t route_decide_us = 0;
         int64_t route_apply_us = 0;
         int64_t qnn_workpoint_apply_us = 0;
+        int64_t gpu_freq_pre_sync_us = 0;
         int64_t gpu_freq_apply_us = 0;
         int64_t cpu_freq_apply_us = 0;
         int64_t cpu_affinity_apply_us = 0;
@@ -508,6 +510,7 @@ private:
     hetero_phase_timing_trace hetero_phase_trace;
     bool hetero_phase_trace_suppress_sync_log = false;
     int64_t hetero_last_decode_token_done_us = 0;
+    int64_t pending_gpu_freq_pre_sync_us = 0;
     std::vector<int64_t> hetero_decode_token_trace_records;
 
     // perf

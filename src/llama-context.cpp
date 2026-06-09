@@ -2115,6 +2115,46 @@ std::string llama_context::get_dynamic_route_mode() const {
     return llama_dynamic_route_mode_name(dynamic_route_config.mode);
 }
 
+bool llama_context::should_sync_before_dynamic_gpu_freq_switch(uint32_t n_tokens) const {
+    if (!dynamic_route_config.enabled() ||
+        !dynamic_route_config.decode_gpu_freq_sync_before_apply ||
+        dynamic_route_config.decode_gpu_freq_hz == 0 ||
+        n_tokens != 1) {
+        return false;
+    }
+
+    const uint64_t decode_token_index = dynamic_route_state.decode_calls + 1;
+    if (dynamic_route_config.decode_switch_after > 0 &&
+        decode_token_index <= dynamic_route_config.decode_switch_after) {
+        return false;
+    }
+
+    const bool qnn_available =
+        backend_available_for_route("qnn-npu") ||
+        backend_available_for_route("qnn-gpu") ||
+        backend_available_for_route("qnn-cpu");
+    const llama_dynamic_route_request request = {
+        /*.n_tokens =*/ n_tokens,
+        /*.decode_token_index =*/ decode_token_index,
+        /*.opencl_backend_available =*/ backend_available_for_route("opencl"),
+        /*.qnn_backend_available =*/ qnn_available,
+        /*.current_plan =*/ &hetero_plan,
+        /*.base_plan =*/ &hetero_plan_base,
+        /*.allocated_kv_contract =*/ &hetero_kv_contract_allocated,
+    };
+    const llama_dynamic_route_decision decision = llama_dynamic_route_decide(dynamic_route_config, request);
+    if (decision.should_apply || decision.reason == "decode-switch-wait") {
+        return false;
+    }
+
+    return llama_context_should_apply_gpu_freq_switch(
+            hetero_plan.route,
+            decision.plan.route,
+            n_tokens,
+            gpu_current_freq_hz,
+            dynamic_route_config.decode_gpu_freq_hz);
+}
+
 void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
     if (n_tokens > 1) {
         dynamic_route_state.prefill_calls++;
@@ -2311,7 +2351,7 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         if (trace_timing && hetero_dynamic_trace_timing_detail_enabled()) {
             LLAMA_LOG_INFO("%s: timing phase=%s n_tokens=%u gpu_freq_apply=%s requested_gpu_freq_hz=%" PRIu64
                     " actual_gpu_freq_hz=%" PRIu64 " decide_us=%" PRId64
-                    " gpu_freq_apply_us=%" PRId64 " target=%s\n",
+                    " gpu_freq_pre_sync_us=%" PRId64 " gpu_freq_apply_us=%" PRId64 " target=%s\n",
                     __func__,
                     hetero_phase_name(n_tokens),
                     n_tokens,
@@ -2319,12 +2359,15 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                     target_freq_hz,
                     actual_freq_hz,
                     t_decide_end_us - t_decide_start_us,
+                    hetero_phase_trace.active ? hetero_phase_trace.gpu_freq_pre_sync_us : int64_t(0),
                     gpu_freq_apply_us,
                     target_route.empty() ? "<default>" : target_route.c_str());
         }
         if (trace_timing && hetero_phase_trace.active) {
             hetero_transition_trace_log(
-                    (t_decide_end_us - t_decide_start_us) + gpu_freq_apply_us,
+                    (t_decide_end_us - t_decide_start_us) +
+                        hetero_phase_trace.gpu_freq_pre_sync_us +
+                        gpu_freq_apply_us,
                     0,
                     0,
                     false);
@@ -3060,7 +3103,7 @@ void llama_context::hetero_transition_trace_log(
 
     LLAMA_LOG_INFO("TRANSITION_TRACE phase=%s "
             "decision_us=%" PRId64 " route_apply_us=%" PRId64 " "
-            "policy_apply_us= qnn_workpoint_apply_us=%" PRId64 " gpu_freq_apply_us=%" PRId64 " "
+            "policy_apply_us= qnn_workpoint_apply_us=%" PRId64 " gpu_freq_pre_sync_us=%" PRId64 " gpu_freq_apply_us=%" PRId64 " "
             "cpu_freq_apply_us=%" PRId64 " cpu_affinity_apply_us=%" PRId64 " cpu_threads_apply_us=%" PRId64 " "
             "sched_reserve_us=%" PRId64 " kv_handoff_us=%" PRId64 " "
             "graph_rebuild_us=%" PRId64 " decode_entry_us=%" PRId64 " "
@@ -3078,6 +3121,7 @@ void llama_context::hetero_transition_trace_log(
             hetero_phase_trace.route_decide_us,
             hetero_phase_trace.route_apply_us,
             hetero_phase_trace.qnn_workpoint_apply_us,
+            hetero_phase_trace.gpu_freq_pre_sync_us,
             hetero_phase_trace.gpu_freq_apply_us,
             hetero_phase_trace.cpu_freq_apply_us,
             hetero_phase_trace.cpu_affinity_apply_us,
@@ -3526,7 +3570,7 @@ void llama_context::synchronize() {
             hetero_phase_trace.kv_transfer_us;
         const int64_t kv_unattributed_us =
             std::max<int64_t>(int64_t(0), hetero_phase_trace.kv_migration_us - kv_accounted_us);
-        LLAMA_LOG_INFO("%s: timing phase=%s n_tokens=%u total_wall_us=%" PRId64 " decide_us=%" PRId64 " apply_us=%" PRId64 " qnn_workpoint_apply_us=%" PRId64 " gpu_freq_apply_us=%" PRId64 " cpu_freq_apply_us=%" PRId64 " cpu_affinity_apply_us=%" PRId64 " cpu_threads_apply_us=%" PRId64 " reserve_us=%" PRId64 " memory_update_us=%" PRId64 " kv_migration_us=%" PRId64 " process_ubatch_us=%" PRId64 " bootstrap_sync_us=%" PRId64 " bootstrap_sched_rebuild_us=%" PRId64 " ubatches=%d graph_runs_reused=%d graph_runs_rebuilt=%d route_applied=%s route_noop=%s bootstrap_ran=%s label=%s reason=%s target=%s\n",
+        LLAMA_LOG_INFO("%s: timing phase=%s n_tokens=%u total_wall_us=%" PRId64 " decide_us=%" PRId64 " apply_us=%" PRId64 " qnn_workpoint_apply_us=%" PRId64 " gpu_freq_pre_sync_us=%" PRId64 " gpu_freq_apply_us=%" PRId64 " cpu_freq_apply_us=%" PRId64 " cpu_affinity_apply_us=%" PRId64 " cpu_threads_apply_us=%" PRId64 " reserve_us=%" PRId64 " memory_update_us=%" PRId64 " kv_migration_us=%" PRId64 " process_ubatch_us=%" PRId64 " bootstrap_sync_us=%" PRId64 " bootstrap_sched_rebuild_us=%" PRId64 " ubatches=%d graph_runs_reused=%d graph_runs_rebuilt=%d route_applied=%s route_noop=%s bootstrap_ran=%s label=%s reason=%s target=%s\n",
                 __func__,
                 hetero_phase_name(hetero_phase_trace.n_tokens),
                 hetero_phase_trace.n_tokens,
@@ -3534,6 +3578,7 @@ void llama_context::synchronize() {
                 hetero_phase_trace.route_decide_us,
                 hetero_phase_trace.route_apply_us,
                 hetero_phase_trace.qnn_workpoint_apply_us,
+                hetero_phase_trace.gpu_freq_pre_sync_us,
                 hetero_phase_trace.gpu_freq_apply_us,
                 hetero_phase_trace.cpu_freq_apply_us,
                 hetero_phase_trace.cpu_affinity_apply_us,
@@ -4684,6 +4729,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
 
+    if (should_sync_before_dynamic_gpu_freq_switch(n_tokens_all)) {
+        const bool trace_timing = hetero_dynamic_trace_timing_detail_enabled();
+        const int64_t t_gpu_freq_pre_sync_start_us = trace_timing ? ggml_time_us() : 0;
+        synchronize();
+        pending_gpu_freq_pre_sync_us =
+            trace_timing ? ggml_time_us() - t_gpu_freq_pre_sync_start_us : 0;
+        if (trace_timing) {
+            LLAMA_LOG_INFO("%s: synchronized before GPU frequency switch pre_sync_us=%" PRId64 "\n",
+                    __func__,
+                    pending_gpu_freq_pre_sync_us);
+        }
+    }
+
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
     }
@@ -4699,6 +4757,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         hetero_phase_trace.active = true;
         hetero_phase_trace.n_tokens = n_tokens_all;
         hetero_phase_trace.batch_start_us = t_compute_start_us;
+        hetero_phase_trace.gpu_freq_pre_sync_us = pending_gpu_freq_pre_sync_us;
+        pending_gpu_freq_pre_sync_us = 0;
     }
 
     // TODO: this clear of the buffer can easily be forgotten - need something better

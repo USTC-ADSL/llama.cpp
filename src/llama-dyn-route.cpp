@@ -354,6 +354,7 @@ bool llama_dynamic_route_build_runtime_config(
     out_config.trace_enabled = false;
     out_config.decode_switch_after = public_config.decode_switch_after;
     out_config.decode_gpu_freq_hz  = public_config.decode_gpu_freq_hz;
+    out_config.decode_gpu_freq_sync_before_apply = false;
     out_config.gpu_min_freq_path   = public_config.gpu_min_freq_path != nullptr ? public_config.gpu_min_freq_path : "";
     out_config.gpu_max_freq_path   = public_config.gpu_max_freq_path != nullptr ? public_config.gpu_max_freq_path : "";
     out_config.gpu_cur_freq_path   = public_config.gpu_cur_freq_path != nullptr ? public_config.gpu_cur_freq_path : "";
@@ -415,6 +416,10 @@ llama_dynamic_route_runtime_config llama_dynamic_route_config_from_env() {
                 env_i64_value(
                     "GGML_HETERO_DYNAMIC_DECODE_GPU_FREQ_HZ",
                     env_i64_value("GGML_HETERO_DECODE_GPU_FREQ_HZ", 0))));
+    config.decode_gpu_freq_sync_before_apply =
+        env_flag_enabled(
+                "GGML_HETERO_DYNAMIC_DECODE_GPU_FREQ_SYNC_BEFORE_APPLY",
+                env_flag_enabled("GGML_HETERO_DECODE_GPU_FREQ_SYNC_BEFORE_APPLY", false));
     config.gpu_min_freq_path = env_string_alias_value(
             "GGML_HETERO_GPU_MIN_FREQ_PATH",
             "GGML_HETERO_DYNAMIC_GPU_MIN_FREQ_PATH");
