@@ -41,6 +41,12 @@ const ggml_tensor * llama_model_resolve_weight_for_cpu_copy(
     return llama_hetero_is_cpu_backend(route.backend_for(stage)) ? cpu_copy : original;
 }
 
+bool llama_model_should_publish_tensor_by_name(
+        const ggml_tensor * tensor,
+        const std::unordered_set<const ggml_tensor *> & private_tensors) {
+    return tensor != nullptr && private_tensors.find(tensor) == private_tensors.end();
+}
+
 const char * llm_type_name(llm_type type) {
     switch (type) {
         case LLM_TYPE_14M:           return "14M";
@@ -7752,6 +7758,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     // populate tensors_by_name
     for (auto & [ctx, _] : pimpl->ctxs_bufs) {
         for (auto * cur = ggml_get_first_tensor(ctx.get()); cur != NULL; cur = ggml_get_next_tensor(ctx.get(), cur)) {
+            if (!llama_model_should_publish_tensor_by_name(cur, opencl_cpu_extra_cpu_copy_tensors)) {
+                continue;
+            }
             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
         }
     }
@@ -8119,6 +8128,7 @@ void llama_model::register_opencl_cpu_extra_cpu_copy(
 
     opencl_cpu_extra_cpu_copies[original] = cpu_copy;
     opencl_cpu_extra_cpu_copy_stages[original] = stage;
+    opencl_cpu_extra_cpu_copy_tensors.insert(cpu_copy);
 }
 
 ggml_tensor * llama_model::resolve_weight_for_route(

@@ -2,6 +2,8 @@
 #include "ggml.h"
 #include "testing.h"
 
+#include <unordered_set>
+
 bool llama_model_loader_should_enable_opencl_cpu_extra_cpu_copy(
         const llama_hetero_route_spec & dynamic_prefill_route,
         const llama_hetero_route_spec & dynamic_decode_route,
@@ -12,6 +14,10 @@ const ggml_tensor * llama_model_resolve_weight_for_cpu_copy(
         const ggml_tensor * cpu_copy,
         llama_hetero_route_stage stage,
         const llama_hetero_route_spec & route);
+
+bool llama_model_should_publish_tensor_by_name(
+        const ggml_tensor * tensor,
+        const std::unordered_set<const ggml_tensor *> & private_tensors);
 
 int main() {
     testing t;
@@ -112,6 +118,22 @@ int main() {
                         nullptr,
                         llama_hetero_route_stage::FFN,
                         llama_hetero_parse_route_spec("cpu")) == &original);
+    });
+
+    t.test("extra cpu-friendly copies stay private to route resolution", [](testing & t) {
+        ggml_tensor original = {};
+        ggml_tensor cpu_copy = {};
+        ggml_set_name(&original, "blk.0.ffn_up.weight");
+        ggml_set_name(&cpu_copy, "blk.0.ffn_up.weight");
+
+        const std::unordered_set<const ggml_tensor *> private_tensors = { &cpu_copy };
+
+        t.assert_true(
+                "the original OpenCL-friendly weight remains published for canonical name lookup",
+                llama_model_should_publish_tensor_by_name(&original, private_tensors));
+        t.assert_true(
+                "the same-name CPU-friendly duplicate must not become the canonical public tensor",
+                !llama_model_should_publish_tensor_by_name(&cpu_copy, private_tensors));
     });
 
     return t.summary();

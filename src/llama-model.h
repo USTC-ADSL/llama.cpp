@@ -539,6 +539,7 @@ struct llama_model {
     std::unordered_set<llama_adapter_lora *> loras;
     std::unordered_map<const ggml_tensor *, ggml_tensor *> opencl_cpu_extra_cpu_copies;
     std::unordered_map<const ggml_tensor *, llama_hetero_route_stage> opencl_cpu_extra_cpu_copy_stages;
+    std::unordered_set<const ggml_tensor *> opencl_cpu_extra_cpu_copy_tensors;
 
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;
@@ -611,3 +612,11 @@ const char * llm_type_name(llm_type type);
 // For internal test use
 // TODO: remove
 const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model);
+const ggml_tensor * llama_model_resolve_weight_for_cpu_copy(
+        const ggml_tensor * original,
+        const ggml_tensor * cpu_copy,
+        llama_hetero_route_stage stage,
+        const llama_hetero_route_spec & route);
+bool llama_model_should_publish_tensor_by_name(
+        const ggml_tensor * tensor,
+        const std::unordered_set<const ggml_tensor *> & private_tensors);
