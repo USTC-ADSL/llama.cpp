@@ -49,6 +49,12 @@ bool llama_context_should_prewarm_dynamic_qnn_opencl_kv_aliases(
         const llama_hetero_kv_contract & allocated_kv_contract,
         bool                experimental_enabled);
 
+bool llama_context_should_try_cpu_opencl_uma_kv_handoff(
+        const std::string & current_attn_backend,
+        const std::string & target_attn_backend,
+        uint32_t            n_tokens,
+        bool                disabled);
+
 bool llama_context_should_apply_qnn_workpoint_switch(
         const llama_hetero_route_spec & current_route,
         const llama_hetero_route_spec & target_route,
@@ -67,10 +73,14 @@ int main() {
         part_a.alias_us = 11;
         part_a.backend_sync_us = 22;
         part_a.transfer_us = 33;
+        part_a.synced_buffers = 1;
+        part_a.synced_bytes = 1024;
 
         part_b.alias_us = 5;
         part_b.backend_sync_us = 7;
         part_b.transfer_us = 9;
+        part_b.synced_buffers = 2;
+        part_b.synced_bytes = 2048;
 
         total.accumulate(part_a);
         total.accumulate(part_b);
@@ -79,6 +89,8 @@ int main() {
         t.assert_equal("backend sync timing should accumulate across buffers", total.backend_sync_us, (int64_t) 29);
         t.assert_equal("transfer timing should accumulate across buffers", total.transfer_us, (int64_t) 42);
         t.assert_equal("accounted timing should sum all sub-phases", total.accounted_us(), (int64_t) 87);
+        t.assert_equal("synced buffer count should accumulate", total.synced_buffers, (size_t) 3);
+        t.assert_equal("synced byte count should accumulate", total.synced_bytes, (size_t) 3072);
 
         total.clear();
 
@@ -86,6 +98,8 @@ int main() {
         t.assert_equal("clear should reset backend sync timing", total.backend_sync_us, (int64_t) 0);
         t.assert_equal("clear should reset transfer timing", total.transfer_us, (int64_t) 0);
         t.assert_equal("clear should reset accounted timing", total.accounted_us(), (int64_t) 0);
+        t.assert_equal("clear should reset synced buffer count", total.synced_buffers, (size_t) 0);
+        t.assert_equal("clear should reset synced byte count", total.synced_bytes, (size_t) 0);
     });
 
     t.test("sched reserve timing accumulates and clears sub-phases", [](testing & t) {
@@ -415,6 +429,40 @@ int main() {
                         /* generic_kv_enabled = */ true,
                         allocated,
                         /* experimental_enabled = */ false));
+    });
+
+    t.test("single-token cpu to opencl decode can try UMA KV handoff", [](testing & t) {
+        t.assert_true(
+                "CPU -> OpenCL decode switch can try shared host KV handoff",
+                llama_context_should_try_cpu_opencl_uma_kv_handoff(
+                        "cpu",
+                        "opencl",
+                        1,
+                        /* disabled = */ false));
+
+        t.assert_true(
+                "OpenCL -> CPU still keeps the existing state migration path",
+                !llama_context_should_try_cpu_opencl_uma_kv_handoff(
+                        "opencl",
+                        "cpu",
+                        1,
+                        /* disabled = */ false));
+
+        t.assert_true(
+                "prefill-sized batches must not try CPU/OpenCL UMA handoff",
+                !llama_context_should_try_cpu_opencl_uma_kv_handoff(
+                        "cpu",
+                        "opencl",
+                        16,
+                        /* disabled = */ false));
+
+        t.assert_true(
+                "the disable env gate must force the state rebuild path",
+                !llama_context_should_try_cpu_opencl_uma_kv_handoff(
+                        "cpu",
+                        "opencl",
+                        1,
+                        /* disabled = */ true));
     });
 
     return t.summary();

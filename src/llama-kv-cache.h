@@ -20,6 +20,8 @@ struct llama_opencl_external_host_sync_timing {
     int64_t alias_us = 0;
     int64_t backend_sync_us = 0;
     int64_t transfer_us = 0;
+    size_t synced_buffers = 0;
+    size_t synced_bytes = 0;
 
     void clear() {
         *this = {};
@@ -29,6 +31,8 @@ struct llama_opencl_external_host_sync_timing {
         alias_us += other.alias_us;
         backend_sync_us += other.backend_sync_us;
         transfer_us += other.transfer_us;
+        synced_buffers += other.synced_buffers;
+        synced_bytes += other.synced_bytes;
     }
 
     int64_t accounted_us() const {

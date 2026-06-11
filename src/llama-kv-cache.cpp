@@ -1087,6 +1087,9 @@ bool llama_kv_cache::sync_external_opencl_host_aliases(
         }
     }
 
+    total_timing.synced_buffers = synced_buffers;
+    total_timing.synced_bytes = synced_bytes;
+
     if (timing != nullptr) {
         timing->accumulate(total_timing);
     }

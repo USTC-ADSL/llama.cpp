@@ -92,6 +92,12 @@ bool llama_context_should_prewarm_dynamic_qnn_opencl_kv_aliases(
         const llama_hetero_kv_contract & allocated_kv_contract,
         bool                experimental_enabled);
 
+bool llama_context_should_try_cpu_opencl_uma_kv_handoff(
+        const std::string & current_attn_backend,
+        const std::string & target_attn_backend,
+        uint32_t            n_tokens,
+        bool                disabled);
+
 int64_t llama_context_transition_blocking_us(
         int64_t total_wall_us,
         int64_t process_ubatch_us);
@@ -285,6 +291,20 @@ bool llama_context_should_prewarm_dynamic_qnn_opencl_kv_aliases(
     // QNN has not written the prefill KV yet, so a correct prewarm needs a
     // separate alias-only path.
     return false;
+}
+
+bool llama_context_should_try_cpu_opencl_uma_kv_handoff(
+        const std::string & current_attn_backend,
+        const std::string & target_attn_backend,
+        uint32_t            n_tokens,
+        bool                disabled) {
+    if (disabled || n_tokens != 1) {
+        return false;
+    }
+
+    const std::string current = llama_hetero_canonical_backend(current_attn_backend);
+    const std::string target  = llama_hetero_canonical_backend(target_attn_backend);
+    return current == "cpu" && target == "opencl";
 }
 
 int64_t llama_context_transition_blocking_us(
@@ -2861,20 +2881,63 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
     }
 
     if (should_migrate_cpu_opencl_kv) {
-        LLAMA_LOG_INFO("%s: starting CPU/OpenCL KV migration before decode route switch (%s -> %s)\n",
-                __func__,
-                current_attn_backend.c_str(),
-                target_attn_backend.c_str());
-        const int64_t t_kv_sync_start_us = trace_timing ? ggml_time_us() : 0;
-        const bool migrated = migrate_dynamic_cpu_opencl_kv(current_attn_backend, target_attn_backend);
-        const int64_t t_kv_sync_end_us = trace_timing ? ggml_time_us() : 0;
-        if (trace_timing && hetero_phase_trace.active) {
-            hetero_phase_trace.kv_migration_us += t_kv_sync_end_us - t_kv_sync_start_us;
+        bool migrated = false;
+        const bool try_cpu_opencl_uma_kv =
+            llama_context_should_try_cpu_opencl_uma_kv_handoff(
+                    current_attn_backend,
+                    target_attn_backend,
+                    n_tokens,
+                    env_flag_enabled("GGML_HETERO_DISABLE_CPU_OPENCL_UMA_KV_HANDOFF"));
+
+        if (try_cpu_opencl_uma_kv) {
+            LLAMA_LOG_INFO("%s: trying CPU/OpenCL UMA KV handoff before decode route switch (%s -> %s)\n",
+                    __func__,
+                    current_attn_backend.c_str(),
+                    target_attn_backend.c_str());
+            const int64_t t_kv_sync_start_us = trace_timing ? ggml_time_us() : 0;
+            llama_opencl_external_host_sync_timing opencl_sync_timing;
+            const bool synced = sync_dynamic_cpu_opencl_kv(/* host_to_device = */ true, &opencl_sync_timing);
+            const int64_t t_kv_sync_end_us = trace_timing ? ggml_time_us() : 0;
+            migrated = synced && opencl_sync_timing.synced_buffers > 0;
+            if (trace_timing && hetero_phase_trace.active) {
+                hetero_phase_trace.kv_migration_us += t_kv_sync_end_us - t_kv_sync_start_us;
+                hetero_phase_trace.kv_alias_us += opencl_sync_timing.alias_us;
+                hetero_phase_trace.kv_backend_sync_us += opencl_sync_timing.backend_sync_us;
+                hetero_phase_trace.kv_transfer_us += opencl_sync_timing.transfer_us;
+            }
+            if (migrated) {
+                LLAMA_LOG_INFO("%s: completed CPU/OpenCL UMA KV handoff using %zu host-visible KV buffer(s), total %.2f MiB alias_us=%" PRId64 " backend_sync_us=%" PRId64 " transfer_us=%" PRId64 "\n",
+                        __func__,
+                        opencl_sync_timing.synced_buffers,
+                        opencl_sync_timing.synced_bytes / 1024.0 / 1024.0,
+                        opencl_sync_timing.alias_us,
+                        opencl_sync_timing.backend_sync_us,
+                        opencl_sync_timing.transfer_us);
+            } else if (synced) {
+                LLAMA_LOG_WARN("%s: CPU/OpenCL UMA KV handoff found no host-visible KV buffers; falling back to state rebuild\n",
+                        __func__);
+            } else {
+                LLAMA_LOG_WARN("%s: CPU/OpenCL UMA KV handoff sync failed; falling back to state rebuild\n",
+                        __func__);
+            }
         }
+
         if (!migrated) {
-            LLAMA_LOG_ERROR("%s: CPU/OpenCL KV migration failed; keeping existing route and skipping backend switch\n",
-                    __func__);
-            return;
+            LLAMA_LOG_INFO("%s: starting CPU/OpenCL KV migration before decode route switch (%s -> %s)\n",
+                    __func__,
+                    current_attn_backend.c_str(),
+                    target_attn_backend.c_str());
+            const int64_t t_kv_sync_start_us = trace_timing ? ggml_time_us() : 0;
+            migrated = migrate_dynamic_cpu_opencl_kv(current_attn_backend, target_attn_backend);
+            const int64_t t_kv_sync_end_us = trace_timing ? ggml_time_us() : 0;
+            if (trace_timing && hetero_phase_trace.active) {
+                hetero_phase_trace.kv_migration_us += t_kv_sync_end_us - t_kv_sync_start_us;
+            }
+            if (!migrated) {
+                LLAMA_LOG_ERROR("%s: CPU/OpenCL KV migration failed; keeping existing route and skipping backend switch\n",
+                        __func__);
+                return;
+            }
         }
     }
 
