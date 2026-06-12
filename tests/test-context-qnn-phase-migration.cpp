@@ -16,6 +16,14 @@ bool llama_context_should_attempt_qnn_phase_kv_migration(
         uint32_t            n_tokens,
         bool                generic_kv_enabled);
 
+bool llama_context_should_use_qnn_written_generic_kv_for_cpu(
+        const std::string & current_attn_backend,
+        const std::string & target_attn_backend,
+        uint32_t            n_tokens,
+        bool                generic_kv_enabled,
+        bool                qnn_writeback_ready,
+        bool                live_kv_cpu_backed);
+
 llama_hetero_kv_contract llama_dynamic_phase_shared_qnn_kv_contract(
         const std::string & prefill_attn_backend,
         const std::string & decode_attn_backend,
@@ -275,6 +283,48 @@ int main() {
         t.assert_true(
                 "prefill-sized qnn batches should not trigger phase migration directly",
                 !llama_context_should_attempt_qnn_phase_kv_migration("qnn-npu", "opencl", 14, true));
+    });
+
+    t.test("qnn to cpu can reuse flushed live generic kv without state rebuild", [](testing & t) {
+        t.assert_true(
+                "qnn->cpu can skip state rebuild when QNN generic KV writeback is ready and live KV is CPU-backed",
+                llama_context_should_use_qnn_written_generic_kv_for_cpu(
+                        "qnn-npu",
+                        "cpu",
+                        1,
+                        /* generic_kv_enabled = */ true,
+                        /* qnn_writeback_ready = */ true,
+                        /* live_kv_cpu_backed = */ true));
+
+        t.assert_true(
+                "qnn->cpu must not skip state rebuild before QNN generic KV writeback is ready",
+                !llama_context_should_use_qnn_written_generic_kv_for_cpu(
+                        "qnn-npu",
+                        "cpu",
+                        1,
+                        /* generic_kv_enabled = */ true,
+                        /* qnn_writeback_ready = */ false,
+                        /* live_kv_cpu_backed = */ true));
+
+        t.assert_true(
+                "qnn->cpu must not skip state rebuild when the live KV is not CPU-backed",
+                !llama_context_should_use_qnn_written_generic_kv_for_cpu(
+                        "qnn-npu",
+                        "cpu",
+                        1,
+                        /* generic_kv_enabled = */ true,
+                        /* qnn_writeback_ready = */ true,
+                        /* live_kv_cpu_backed = */ false));
+
+        t.assert_true(
+                "qnn->opencl keeps the existing shared-qnn/opencl path",
+                !llama_context_should_use_qnn_written_generic_kv_for_cpu(
+                        "qnn-npu",
+                        "opencl",
+                        1,
+                        /* generic_kv_enabled = */ true,
+                        /* qnn_writeback_ready = */ true,
+                        /* live_kv_cpu_backed = */ true));
     });
 
     t.test("non-qnn producers still use their existing migration logic", [](testing & t) {
