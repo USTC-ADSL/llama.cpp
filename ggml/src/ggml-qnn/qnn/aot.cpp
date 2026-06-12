@@ -1151,7 +1151,15 @@ bool aot_generic_kv_writeback_needed_for_phase_switch() {
 
     const aot_phase_route_spec decode_route =
         parse_phase_route_spec(std::getenv("GGML_HETERO_DYNAMIC_DECODE_ROUTE"));
-    if (!decode_route.has_any_route() || !route_attention_uses_non_qnn_backend(decode_route)) {
+    const char * decode_schedule_env = std::getenv("GGML_HETERO_DYNAMIC_DECODE_SCHEDULE");
+    if (decode_schedule_env == nullptr || decode_schedule_env[0] == '\0') {
+        decode_schedule_env = std::getenv("GGML_HETERO_DECODE_ROUTE_SCHEDULE");
+    }
+    const bool decode_route_needs_generic_kv =
+        decode_route.has_any_route() && route_attention_uses_non_qnn_backend(decode_route);
+    const bool decode_schedule_needs_generic_kv =
+        qnn::qnn_aot_decode_schedule_attention_uses_non_qnn_backend(decode_schedule_env);
+    if (!decode_route_needs_generic_kv && !decode_schedule_needs_generic_kv) {
         return false;
     }
 
@@ -1167,7 +1175,8 @@ bool aot_generic_kv_writeback_needed_for_phase_switch() {
     // the runtime wants to migrate the prefill KV state into a non-QNN decode
     // consumer without replaying the whole prefix. Keep static homogeneous QNN
     // runs on the old fast path; only explicit mixed phase routes reach here.
-    if (prefill_route.has_any_route() &&
+    if (!decode_schedule_needs_generic_kv &&
+        prefill_route.has_any_route() &&
         route_is_phase_homogeneous(prefill_route) &&
         route_is_phase_homogeneous(decode_route)) {
         const std::string prefill_backend = route_phase_backend(prefill_route);

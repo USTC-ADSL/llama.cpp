@@ -112,5 +112,20 @@ int main(void) {
             /* has_cache_v_layers = */ true),
         "single-token decode must not write generic KV when no later generic consumer needs it");
 
+    ok &= expect_true(
+        qnn::qnn_aot_decode_schedule_attention_uses_non_qnn_backend(
+            "1:cpu;9:opencl;17:qnn-npu;25:cpu"),
+        "decode schedules with CPU/OpenCL attention consumers must request generic KV writeback");
+
+    ok &= expect_true(
+        qnn::qnn_aot_decode_schedule_attention_uses_non_qnn_backend(
+            "1:qnn-npu;9:attn=opencl,ffn=opencl,output=opencl;17:qnn-npu"),
+        "decode schedules with staged OpenCL attention consumers must request generic KV writeback");
+
+    ok &= expect_false(
+        qnn::qnn_aot_decode_schedule_attention_uses_non_qnn_backend(
+            "1:qnn-npu;33:qnn-npu;65:qnn-npu"),
+        "pure QNN decode schedules must not force generic KV writeback");
+
     return ok ? 0 : 1;
 }
