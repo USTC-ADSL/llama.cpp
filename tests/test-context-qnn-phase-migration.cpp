@@ -321,8 +321,8 @@ int main() {
                         /* qnn_writeback_flushed = */ false));
 
         t.assert_true(
-                "qnn->cpu can skip state rebuild after QNN generic KV flush even when memory breakdown is not CPU-backed",
-                llama_context_should_use_qnn_written_generic_kv_for_cpu(
+                "qnn->cpu must not skip state rebuild after QNN generic KV flush when live KV is not CPU-backed",
+                !llama_context_should_use_qnn_written_generic_kv_for_cpu(
                         "qnn-npu",
                         "cpu",
                         1,

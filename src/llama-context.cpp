@@ -204,15 +204,15 @@ bool llama_context_should_use_qnn_written_generic_kv_for_cpu(
         bool                qnn_writeback_ready,
         bool                live_kv_cpu_backed,
         bool                qnn_writeback_flushed) {
-    if (!generic_kv_enabled || !qnn_writeback_ready || n_tokens != 1) {
+    GGML_UNUSED(qnn_writeback_flushed);
+
+    if (!generic_kv_enabled || !qnn_writeback_ready || !live_kv_cpu_backed || n_tokens != 1) {
         return false;
     }
 
     const std::string current = llama_hetero_canonical_backend(current_attn_backend);
     const std::string target  = llama_hetero_canonical_backend(target_attn_backend);
-    return llama_hetero_is_qnn_backend(current) &&
-           target == "cpu" &&
-           (live_kv_cpu_backed || qnn_writeback_flushed);
+    return llama_hetero_is_qnn_backend(current) && target == "cpu";
 }
 
 static bool llama_context_live_kv_is_cpu_backed(const llama_memory_i * memory) {
