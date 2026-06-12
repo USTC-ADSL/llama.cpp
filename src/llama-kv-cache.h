@@ -8,6 +8,7 @@
 
 #include <string>
 #include <cstdint>
+#include <utility>
 #include <unordered_map>
 #include <vector>
 
@@ -16,11 +17,24 @@ struct llama_hparams;
 struct llama_model;
 struct llama_context;
 
+enum class llama_opencl_external_host_sync_scope {
+    FULL_BUFFER,
+    ACTIVE_KV_PREFIX,
+};
+
+std::vector<std::pair<size_t, size_t>> llama_kv_cache_plan_token_prefix_sync_ranges(
+        size_t   tensor_offset,
+        size_t   token_bytes,
+        uint32_t kv_size,
+        uint32_t n_kv_sync,
+        uint32_t token_stripes);
+
 struct llama_opencl_external_host_sync_timing {
     int64_t alias_us = 0;
     int64_t backend_sync_us = 0;
     int64_t transfer_us = 0;
     size_t synced_buffers = 0;
+    size_t synced_ranges = 0;
     size_t synced_bytes = 0;
 
     void clear() {
@@ -32,6 +46,7 @@ struct llama_opencl_external_host_sync_timing {
         backend_sync_us += other.backend_sync_us;
         transfer_us += other.transfer_us;
         synced_buffers += other.synced_buffers;
+        synced_ranges += other.synced_ranges;
         synced_bytes += other.synced_bytes;
     }
 
@@ -233,7 +248,8 @@ public:
     bool sync_external_opencl_host_aliases(
             ggml_backend_t opencl_backend,
             bool host_to_device,
-            llama_opencl_external_host_sync_timing * timing = nullptr) const;
+            llama_opencl_external_host_sync_timing * timing = nullptr,
+            llama_opencl_external_host_sync_scope sync_scope = llama_opencl_external_host_sync_scope::FULL_BUFFER) const;
 
 private:
     const llama_model & model;

@@ -4,6 +4,8 @@
 #include "testing.h"
 
 #include <string>
+#include <utility>
+#include <vector>
 
 llama_hetero_kv_contract llama_dynamic_phase_migration_kv_contract(
         const std::string & producer_backend,
@@ -78,6 +80,13 @@ bool llama_context_should_apply_qnn_workpoint_switch(
         const std::string &             current_workpoint,
         const char *                    target_workpoint);
 
+std::vector<std::pair<size_t, size_t>> llama_kv_cache_plan_token_prefix_sync_ranges(
+        size_t   tensor_offset,
+        size_t   token_bytes,
+        uint32_t kv_size,
+        uint32_t n_kv_sync,
+        uint32_t token_stripes);
+
 int main() {
     testing t;
 
@@ -90,12 +99,14 @@ int main() {
         part_a.backend_sync_us = 22;
         part_a.transfer_us = 33;
         part_a.synced_buffers = 1;
+        part_a.synced_ranges = 4;
         part_a.synced_bytes = 1024;
 
         part_b.alias_us = 5;
         part_b.backend_sync_us = 7;
         part_b.transfer_us = 9;
         part_b.synced_buffers = 2;
+        part_b.synced_ranges = 6;
         part_b.synced_bytes = 2048;
 
         total.accumulate(part_a);
@@ -106,6 +117,7 @@ int main() {
         t.assert_equal("transfer timing should accumulate across buffers", total.transfer_us, (int64_t) 42);
         t.assert_equal("accounted timing should sum all sub-phases", total.accounted_us(), (int64_t) 87);
         t.assert_equal("synced buffer count should accumulate", total.synced_buffers, (size_t) 3);
+        t.assert_equal("synced range count should accumulate", total.synced_ranges, (size_t) 10);
         t.assert_equal("synced byte count should accumulate", total.synced_bytes, (size_t) 3072);
 
         total.clear();
@@ -115,6 +127,7 @@ int main() {
         t.assert_equal("clear should reset transfer timing", total.transfer_us, (int64_t) 0);
         t.assert_equal("clear should reset accounted timing", total.accounted_us(), (int64_t) 0);
         t.assert_equal("clear should reset synced buffer count", total.synced_buffers, (size_t) 0);
+        t.assert_equal("clear should reset synced range count", total.synced_ranges, (size_t) 0);
         t.assert_equal("clear should reset synced byte count", total.synced_bytes, (size_t) 0);
     });
 
@@ -153,6 +166,55 @@ int main() {
         t.assert_equal("clear should reset plan_reserve timing", total.plan_reserve_us, (int64_t) 0);
         t.assert_equal("clear should reset finalize timing", total.finalize_us, (int64_t) 0);
         t.assert_equal("clear should reset accounted timing", total.accounted_us(), (int64_t) 0);
+    });
+
+    t.test("opencl KV prefix range planner covers K rows and transposed V stripes", [](testing & t) {
+        const auto k_ranges = llama_kv_cache_plan_token_prefix_sync_ranges(
+                /* tensor_offset = */ 1024,
+                /* token_bytes = */ 64,
+                /* kv_size = */ 2048,
+                /* n_kv_sync = */ 256,
+                /* token_stripes = */ 1);
+
+        t.assert_equal("K prefix should use one contiguous range", k_ranges.size(), (size_t) 1);
+        t.assert_equal("K prefix range should start at the tensor offset", k_ranges[0].first, (size_t) 1024);
+        t.assert_equal("K prefix range should cover n_kv_sync rows", k_ranges[0].second, (size_t) 256 * 64);
+
+        const auto v_ranges = llama_kv_cache_plan_token_prefix_sync_ranges(
+                /* tensor_offset = */ 4096,
+                /* token_bytes = */ 2,
+                /* kv_size = */ 2048,
+                /* n_kv_sync = */ 256,
+                /* token_stripes = */ 4);
+
+        t.assert_equal("transposed V prefix should sync one range per embedding stripe", v_ranges.size(), (size_t) 4);
+        for (size_t i = 0; i < v_ranges.size(); ++i) {
+            t.assert_equal("transposed V stripe offset should advance by one full KV row",
+                           v_ranges[i].first,
+                           (size_t) 4096 + i * 2048 * 2);
+            t.assert_equal("transposed V stripe range should cover n_kv_sync cells",
+                           v_ranges[i].second,
+                           (size_t) 256 * 2);
+        }
+
+        const auto full_v_ranges = llama_kv_cache_plan_token_prefix_sync_ranges(
+                /* tensor_offset = */ 4096,
+                /* token_bytes = */ 2,
+                /* kv_size = */ 2048,
+                /* n_kv_sync = */ 4096,
+                /* token_stripes = */ 4);
+
+        t.assert_equal("full transposed V ranges should merge into one contiguous tensor range", full_v_ranges.size(), (size_t) 1);
+        t.assert_equal("full transposed V merged range should start at the tensor offset", full_v_ranges[0].first, (size_t) 4096);
+        t.assert_equal("full transposed V merged range should clamp to kv_size", full_v_ranges[0].second, (size_t) 2048 * 2 * 4);
+
+        const auto empty_ranges = llama_kv_cache_plan_token_prefix_sync_ranges(
+                /* tensor_offset = */ 0,
+                /* token_bytes = */ 2,
+                /* kv_size = */ 2048,
+                /* n_kv_sync = */ 0,
+                /* token_stripes = */ 4);
+        t.assert_equal("empty prefix should produce no sync ranges", empty_ranges.size(), (size_t) 0);
     });
 
     t.test("qnn same-backend decode can switch HTP workpoints without a route change", [](testing & t) {

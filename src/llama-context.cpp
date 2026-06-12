@@ -2048,7 +2048,8 @@ void llama_context::record_dynamic_seq0_token_history(const llama_batch & batch_
 
 bool llama_context::sync_dynamic_cpu_opencl_kv(
         bool host_to_device,
-        llama_opencl_external_host_sync_timing * timing) {
+        llama_opencl_external_host_sync_timing * timing,
+        llama_opencl_external_host_sync_scope sync_scope) {
     if (memory == nullptr) {
         return true;
     }
@@ -2093,7 +2094,7 @@ bool llama_context::sync_dynamic_cpu_opencl_kv(
 
     for (llama_kv_cache * kv_cache : kv_caches) {
         llama_opencl_external_host_sync_timing cache_timing;
-        if (!kv_cache->sync_external_opencl_host_aliases(opencl_backend, host_to_device, &cache_timing)) {
+        if (!kv_cache->sync_external_opencl_host_aliases(opencl_backend, host_to_device, &cache_timing, sync_scope)) {
             return false;
         }
         if (timing != nullptr) {
@@ -3084,7 +3085,10 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
             const int64_t t_kv_sync_start_us = trace_timing ? ggml_time_us() : 0;
             llama_opencl_external_host_sync_timing opencl_sync_timing;
             const bool host_to_device = current_attn_backend == "cpu" && target_attn_backend == "opencl";
-            const bool synced = sync_dynamic_cpu_opencl_kv(host_to_device, &opencl_sync_timing);
+            const bool synced = sync_dynamic_cpu_opencl_kv(
+                    host_to_device,
+                    &opencl_sync_timing,
+                    llama_opencl_external_host_sync_scope::ACTIVE_KV_PREFIX);
             const int64_t t_kv_sync_end_us = trace_timing ? ggml_time_us() : 0;
             migrated = synced && opencl_sync_timing.synced_buffers > 0;
             if (trace_timing && hetero_phase_trace.active) {
@@ -3094,9 +3098,10 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                 hetero_phase_trace.kv_transfer_us += opencl_sync_timing.transfer_us;
             }
             if (migrated) {
-                LLAMA_LOG_INFO("%s: completed CPU/OpenCL UMA KV handoff using %zu host-visible KV buffer(s), total %.2f MiB alias_us=%" PRId64 " backend_sync_us=%" PRId64 " transfer_us=%" PRId64 "\n",
+                LLAMA_LOG_INFO("%s: completed CPU/OpenCL UMA KV handoff using %zu host-visible KV buffer(s), %zu range(s), total %.2f MiB alias_us=%" PRId64 " backend_sync_us=%" PRId64 " transfer_us=%" PRId64 "\n",
                         __func__,
                         opencl_sync_timing.synced_buffers,
+                        opencl_sync_timing.synced_ranges,
                         opencl_sync_timing.synced_bytes / 1024.0 / 1024.0,
                         opencl_sync_timing.alias_us,
                         opencl_sync_timing.backend_sync_us,

@@ -17,10 +17,68 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <utility>
 
 //
 // llama_kv_cache
 //
+
+std::vector<std::pair<size_t, size_t>> llama_kv_cache_plan_token_prefix_sync_ranges(
+        size_t   tensor_offset,
+        size_t   token_bytes,
+        uint32_t kv_size,
+        uint32_t n_kv_sync,
+        uint32_t token_stripes) {
+    std::vector<std::pair<size_t, size_t>> ranges;
+    if (token_bytes == 0 || kv_size == 0 || n_kv_sync == 0 || token_stripes == 0) {
+        return ranges;
+    }
+
+    const uint32_t n_sync = std::min(kv_size, n_kv_sync);
+    if (n_sync == 0 ||
+        token_bytes > std::numeric_limits<size_t>::max() / n_sync ||
+        token_bytes > std::numeric_limits<size_t>::max() / kv_size) {
+        return ranges;
+    }
+
+    const size_t range_size = token_bytes * n_sync;
+    const size_t stripe_stride = token_bytes * kv_size;
+    ranges.reserve(token_stripes);
+
+    for (uint32_t stripe = 0; stripe < token_stripes; ++stripe) {
+        if (stripe_stride != 0 && stripe > (std::numeric_limits<size_t>::max() - tensor_offset) / stripe_stride) {
+            ranges.clear();
+            return ranges;
+        }
+        ranges.emplace_back(tensor_offset + stripe * stripe_stride, range_size);
+    }
+
+    std::sort(ranges.begin(), ranges.end());
+    std::vector<std::pair<size_t, size_t>> merged;
+    merged.reserve(ranges.size());
+    for (const auto & range : ranges) {
+        if (range.second == 0) {
+            continue;
+        }
+        if (merged.empty()) {
+            merged.push_back(range);
+            continue;
+        }
+
+        auto & last = merged.back();
+        const size_t last_end = last.first + last.second;
+        if (last_end >= range.first) {
+            const size_t range_end = range.first + range.second;
+            if (range_end > last_end) {
+                last.second = range_end - last.first;
+            }
+        } else {
+            merged.push_back(range);
+        }
+    }
+
+    return merged;
+}
 
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
@@ -1001,13 +1059,23 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 bool llama_kv_cache::sync_external_opencl_host_aliases(
         ggml_backend_t opencl_backend,
         bool host_to_device,
-        llama_opencl_external_host_sync_timing * timing) const {
+        llama_opencl_external_host_sync_timing * timing,
+        llama_opencl_external_host_sync_scope sync_scope) const {
     using ggml_backend_opencl_sync_external_host_buffer_t =
         bool (*)(ggml_backend_t backend, ggml_backend_buffer_t buffer, bool host_to_device);
     using ggml_backend_opencl_sync_external_host_buffer_timed_t =
         bool (*)(ggml_backend_t backend,
                  ggml_backend_buffer_t buffer,
                  bool host_to_device,
+                 int64_t * alias_us,
+                 int64_t * backend_sync_us,
+                 int64_t * transfer_us);
+    using ggml_backend_opencl_sync_external_host_buffer_range_timed_t =
+        bool (*)(ggml_backend_t backend,
+                 ggml_backend_buffer_t buffer,
+                 bool host_to_device,
+                 size_t offset,
+                 size_t size,
                  int64_t * alias_us,
                  int64_t * backend_sync_us,
                  int64_t * transfer_us);
@@ -1028,6 +1096,11 @@ bool llama_kv_cache::sync_external_opencl_host_aliases(
             ? (ggml_backend_opencl_sync_external_host_buffer_timed_t)
                   ggml_backend_reg_get_proc_address(opencl_reg, "ggml_backend_opencl_sync_external_host_buffer_timed")
             : nullptr;
+    auto * sync_buffer_range_timed_fn =
+        opencl_reg != nullptr
+            ? (ggml_backend_opencl_sync_external_host_buffer_range_timed_t)
+                  ggml_backend_reg_get_proc_address(opencl_reg, "ggml_backend_opencl_sync_external_host_buffer_range_timed")
+            : nullptr;
     if (sync_buffer_fn == nullptr && sync_buffer_timed_fn == nullptr) {
         LLAMA_LOG_ERROR("%s: OpenCL backend does not expose external host-buffer sync support\n", __func__);
         return false;
@@ -1039,7 +1112,124 @@ bool llama_kv_cache::sync_external_opencl_host_aliases(
     }
 
     size_t synced_buffers = 0;
+    size_t synced_ranges = 0;
     size_t synced_bytes = 0;
+    const bool use_active_prefix_ranges =
+        sync_scope == llama_opencl_external_host_sync_scope::ACTIVE_KV_PREFIX &&
+        sync_buffer_range_timed_fn != nullptr;
+    if (sync_scope == llama_opencl_external_host_sync_scope::ACTIVE_KV_PREFIX &&
+        sync_buffer_range_timed_fn == nullptr) {
+        LLAMA_LOG_WARN("%s: OpenCL backend does not expose range sync; falling back to full-buffer KV sync\n",
+                __func__);
+    }
+
+    const auto merged_ranges = [](std::vector<std::pair<size_t, size_t>> ranges) {
+        std::sort(ranges.begin(), ranges.end());
+        std::vector<std::pair<size_t, size_t>> merged;
+        merged.reserve(ranges.size());
+        for (const auto & range : ranges) {
+            if (range.second == 0) {
+                continue;
+            }
+            if (merged.empty()) {
+                merged.push_back(range);
+                continue;
+            }
+            auto & last = merged.back();
+            const size_t last_end = last.first + last.second;
+            if (last_end >= range.first) {
+                const size_t range_end = range.first + range.second;
+                if (range_end > last_end) {
+                    last.second = range_end - last.first;
+                }
+            } else {
+                merged.push_back(range);
+            }
+        }
+        return merged;
+    };
+
+    auto plan_active_prefix_ranges_for_buffer = [&](ggml_backend_buffer_t owner_buffer) {
+        std::vector<std::pair<size_t, size_t>> ranges;
+        const auto * buffer_base = static_cast<const uint8_t *>(ggml_backend_buffer_get_base(owner_buffer));
+        const size_t buffer_size = ggml_backend_buffer_get_size(owner_buffer);
+        if (buffer_base == nullptr || buffer_size == 0) {
+            return ranges;
+        }
+
+        const uint32_t n_pad_cur = std::max(n_pad, 256u);
+
+        auto append_tensor_prefix = [&](const ggml_tensor * tensor, size_t token_bytes, uint32_t n_kv_sync, uint32_t token_stripes) {
+            if (tensor == nullptr || tensor->buffer != owner_buffer || tensor->data == nullptr) {
+                return;
+            }
+            const auto * tensor_data = static_cast<const uint8_t *>(tensor->data);
+            if (tensor_data < buffer_base) {
+                return;
+            }
+            const size_t tensor_offset = static_cast<size_t>(tensor_data - buffer_base);
+            if (tensor_offset > buffer_size) {
+                return;
+            }
+
+            std::vector<std::pair<size_t, size_t>> tensor_ranges =
+                llama_kv_cache_plan_token_prefix_sync_ranges(
+                        tensor_offset,
+                        token_bytes,
+                        get_size(),
+                        n_kv_sync,
+                        token_stripes);
+            for (const auto & range : tensor_ranges) {
+                if (range.first <= buffer_size && range.second <= buffer_size - range.first) {
+                    ranges.push_back(range);
+                }
+            }
+        };
+
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            const auto & cells = v_cells[s];
+            const uint32_t used_max_p1 = cells.used_max_p1();
+            if (used_max_p1 == 0) {
+                continue;
+            }
+            const uint32_t n_kv_sync =
+                std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(used_max_p1, n_pad_cur)));
+
+            for (const auto & layer : layers) {
+                const uint32_t il = layer.il;
+
+                const ggml_tensor * k = layer.k_stream[s];
+                if (k != nullptr) {
+                    append_tensor_prefix(
+                            k,
+                            ggml_row_size(k->type, hparams.n_embd_k_gqa(il)),
+                            n_kv_sync,
+                            /* token_stripes = */ 1);
+                }
+
+                const ggml_tensor * v = layer.v_stream[s];
+                if (v == nullptr) {
+                    continue;
+                }
+
+                if (!v_trans) {
+                    append_tensor_prefix(
+                            v,
+                            ggml_row_size(v->type, hparams.n_embd_v_gqa(il)),
+                            n_kv_sync,
+                            /* token_stripes = */ 1);
+                } else {
+                    append_tensor_prefix(
+                            v,
+                            ggml_type_size(v->type),
+                            n_kv_sync,
+                            hparams.n_embd_v_gqa(il));
+                }
+            }
+        }
+
+        return merged_ranges(std::move(ranges));
+    };
 
     for (const auto & [ctx, buf] : ctxs_bufs) {
         GGML_UNUSED(ctx);
@@ -1049,34 +1239,71 @@ bool llama_kv_cache::sync_external_opencl_host_aliases(
         }
         const char * buffer_name = ggml_backend_buffer_name(buf.get());
 
-        llama_opencl_external_host_sync_timing buffer_timing;
-        const bool ok = sync_buffer_timed_fn != nullptr
-            ? sync_buffer_timed_fn(
-                    opencl_backend,
-                    buf.get(),
-                    host_to_device,
-                    &buffer_timing.alias_us,
-                    &buffer_timing.backend_sync_us,
-                    &buffer_timing.transfer_us)
-            : sync_buffer_fn(opencl_backend, buf.get(), host_to_device);
-        if (!ok) {
-            LLAMA_LOG_ERROR("%s: failed to synchronize KV buffer %s for CPU/OpenCL phase switch (%s)\n",
-                    __func__,
-                    buffer_name != nullptr ? buffer_name : "<unnamed>",
-                    host_to_device ? "host->device" : "device->host");
-            return false;
-        }
+        if (use_active_prefix_ranges) {
+            const std::vector<std::pair<size_t, size_t>> ranges =
+                plan_active_prefix_ranges_for_buffer(buf.get());
+            if (ranges.empty()) {
+                continue;
+            }
 
-        synced_buffers++;
-        synced_bytes += ggml_backend_buffer_get_size(buf.get());
-        total_timing.accumulate(buffer_timing);
+            for (const auto & range : ranges) {
+                llama_opencl_external_host_sync_timing range_timing;
+                const bool ok = sync_buffer_range_timed_fn(
+                        opencl_backend,
+                        buf.get(),
+                        host_to_device,
+                        range.first,
+                        range.second,
+                        &range_timing.alias_us,
+                        &range_timing.backend_sync_us,
+                        &range_timing.transfer_us);
+                if (!ok) {
+                    LLAMA_LOG_ERROR("%s: failed to synchronize KV buffer %s range offset=%zu size=%zu for CPU/OpenCL phase switch (%s)\n",
+                            __func__,
+                            buffer_name != nullptr ? buffer_name : "<unnamed>",
+                            range.first,
+                            range.second,
+                            host_to_device ? "host->device" : "device->host");
+                    return false;
+                }
+                synced_ranges++;
+                synced_bytes += range.second;
+                total_timing.accumulate(range_timing);
+            }
+            synced_buffers++;
+        } else {
+            llama_opencl_external_host_sync_timing buffer_timing;
+            const bool ok = sync_buffer_timed_fn != nullptr
+                ? sync_buffer_timed_fn(
+                        opencl_backend,
+                        buf.get(),
+                        host_to_device,
+                        &buffer_timing.alias_us,
+                        &buffer_timing.backend_sync_us,
+                        &buffer_timing.transfer_us)
+                : sync_buffer_fn(opencl_backend, buf.get(), host_to_device);
+            if (!ok) {
+                LLAMA_LOG_ERROR("%s: failed to synchronize KV buffer %s for CPU/OpenCL phase switch (%s)\n",
+                        __func__,
+                        buffer_name != nullptr ? buffer_name : "<unnamed>",
+                        host_to_device ? "host->device" : "device->host");
+                return false;
+            }
+
+            synced_buffers++;
+            synced_ranges++;
+            synced_bytes += ggml_backend_buffer_get_size(buf.get());
+            total_timing.accumulate(buffer_timing);
+        }
     }
 
     if (synced_buffers > 0) {
-        LLAMA_LOG_INFO("%s: synchronized %zu KV buffer(s) for CPU/OpenCL phase switch (%s), total %.2f MiB\n",
+        LLAMA_LOG_INFO("%s: synchronized %zu KV buffer(s), %zu range(s) for CPU/OpenCL phase switch (%s, scope=%s), total %.2f MiB\n",
                 __func__,
                 synced_buffers,
+                synced_ranges,
                 host_to_device ? "host->device" : "device->host",
+                sync_scope == llama_opencl_external_host_sync_scope::ACTIVE_KV_PREFIX ? "active-kv-prefix" : "full-buffer",
                 synced_bytes / 1024.0 / 1024.0);
         if (sync_buffer_timed_fn != nullptr) {
             LLAMA_LOG_INFO("%s: timing alias_us=%" PRId64 " backend_sync_us=%" PRId64 " transfer_us=%" PRId64 "\n",
@@ -1088,6 +1315,7 @@ bool llama_kv_cache::sync_external_opencl_host_aliases(
     }
 
     total_timing.synced_buffers = synced_buffers;
+    total_timing.synced_ranges = synced_ranges;
     total_timing.synced_bytes = synced_bytes;
 
     if (timing != nullptr) {

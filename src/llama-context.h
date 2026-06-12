@@ -5,6 +5,7 @@
 #include "llama-dyn-route.h"
 #include "llama-hetero-route.h"
 #include "llama-graph.h"
+#include "llama-kv-cache.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
 
@@ -20,7 +21,6 @@ class llama_batch_allocr;
 
 class llama_io_read_i;
 class llama_io_write_i;
-struct llama_opencl_external_host_sync_timing;
 
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
@@ -302,7 +302,8 @@ private:
     void maybe_prewarm_dynamic_qnn_opencl_kv_aliases();
     bool sync_dynamic_cpu_opencl_kv(
             bool host_to_device,
-            llama_opencl_external_host_sync_timing * timing = nullptr);
+            llama_opencl_external_host_sync_timing * timing = nullptr,
+            llama_opencl_external_host_sync_scope sync_scope = llama_opencl_external_host_sync_scope::FULL_BUFFER);
     bool rebuild_dynamic_consumer_kv_from_state(
             const std::string & producer_backend,
             const std::string & consumer_backend,

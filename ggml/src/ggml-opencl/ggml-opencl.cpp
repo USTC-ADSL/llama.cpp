@@ -78,6 +78,15 @@ static bool ggml_backend_opencl_flush_external_host_alias_owner_buffer(ggml_back
 static bool ggml_backend_opencl_flush_external_host_alias_for_tensor(ggml_backend_t backend, const ggml_tensor * tensor);
 static bool ggml_backend_opencl_flush_dirty_external_host_aliases(ggml_backend_t backend);
 static bool ggml_backend_opencl_mark_external_host_aliases_dirty(ggml_backend_t backend);
+static bool ggml_backend_opencl_sync_external_host_buffer_range_timed(
+        ggml_backend_t backend,
+        ggml_backend_buffer_t buffer,
+        bool host_to_device,
+        size_t offset,
+        size_t size,
+        int64_t * alias_us,
+        int64_t * backend_sync_us,
+        int64_t * transfer_us);
 static bool ggml_backend_opencl_is_opencl_buffer(ggml_backend_buffer_t buffer);
 static bool ggml_backend_opencl_buffer_is_opencl_owned(const ggml_tensor * tensor);
 static ggml_tensor_extra_cl * ggml_backend_opencl_ensure_tensor_extra_from_host_buffer(ggml_backend_t backend, ggml_tensor * tensor);
@@ -3422,10 +3431,11 @@ static bool ggml_backend_opencl_can_create_aligned_sub_buffer_at_offset(const gg
     return extra != nullptr && extra->data_device != nullptr && alignment != 0 && (offset % alignment) == 0;
 }
 
-static cl_mem ggml_backend_opencl_get_or_create_external_host_buffer_alias_timed(
+static cl_mem ggml_backend_opencl_get_or_create_external_host_buffer_alias_timed_ex(
         ggml_backend_t backend,
         ggml_backend_buffer_t buffer,
-        ggml_backend_opencl_external_host_alias_timing * timing) {
+        ggml_backend_opencl_external_host_alias_timing * timing,
+        bool initial_upload) {
     if (backend == nullptr || buffer == nullptr || !ggml_backend_opencl_needs_external_host_alias(buffer)) {
         return nullptr;
     }
@@ -3468,7 +3478,7 @@ static cl_mem ggml_backend_opencl_get_or_create_external_host_buffer_alias_timed
         return nullptr;
     }
 
-    if (!is_weight_buffer && !use_direct_qnn_host_ptr) {
+    if (initial_upload && !is_weight_buffer && !use_direct_qnn_host_ptr) {
         const int64_t t_upload_start_us = timing != nullptr ? ggml_time_us() : 0;
         CL_CHECK(clEnqueueWriteBuffer(
                 backend_ctx->queue,
@@ -3486,8 +3496,21 @@ static cl_mem ggml_backend_opencl_get_or_create_external_host_buffer_alias_timed
     }
 
     backend_ctx->external_host_buffer_aliases.emplace(buffer, data_device);
-    backend_ctx->external_host_aliases_pending_device_upload.erase(buffer);
+    if (initial_upload) {
+        backend_ctx->external_host_aliases_pending_device_upload.erase(buffer);
+    }
     return data_device;
+}
+
+static cl_mem ggml_backend_opencl_get_or_create_external_host_buffer_alias_timed(
+        ggml_backend_t backend,
+        ggml_backend_buffer_t buffer,
+        ggml_backend_opencl_external_host_alias_timing * timing) {
+    return ggml_backend_opencl_get_or_create_external_host_buffer_alias_timed_ex(
+            backend,
+            buffer,
+            timing,
+            /* initial_upload = */ true);
 }
 
 static cl_mem ggml_backend_opencl_get_or_create_external_host_buffer_alias(
@@ -4128,6 +4151,99 @@ static bool ggml_backend_opencl_sync_external_host_buffer_timed(
             *transfer_us += ggml_time_us() - t_transfer_start_us;
         }
         backend_ctx->external_host_aliases_with_stale_host_mirror.erase(buffer);
+        backend_ctx->external_host_aliases_pending_device_upload.erase(buffer);
+    }
+
+    return true;
+}
+
+static bool ggml_backend_opencl_sync_external_host_buffer_range_timed(
+        ggml_backend_t backend,
+        ggml_backend_buffer_t buffer,
+        bool host_to_device,
+        size_t offset,
+        size_t size,
+        int64_t * alias_us,
+        int64_t * backend_sync_us,
+        int64_t * transfer_us) {
+    if (alias_us != nullptr) {
+        *alias_us = 0;
+    }
+    if (backend_sync_us != nullptr) {
+        *backend_sync_us = 0;
+    }
+    if (transfer_us != nullptr) {
+        *transfer_us = 0;
+    }
+
+    if (backend == nullptr || buffer == nullptr || !ggml_backend_buffer_is_host(buffer) || size == 0) {
+        return true;
+    }
+
+    void * base = ggml_backend_buffer_get_base(buffer);
+    const size_t total_size = ggml_backend_buffer_get_size(buffer);
+    if (base == nullptr || total_size == 0 || offset > total_size || size > total_size - offset) {
+        return false;
+    }
+
+    ggml_backend_opencl_external_host_alias_timing alias_timing;
+    const int64_t t_alias_start_us = (alias_us != nullptr) ? ggml_time_us() : 0;
+    cl_mem data_device = nullptr;
+    if (ggml_backend_opencl_is_opencl_buffer(buffer)) {
+        data_device = ggml_backend_opencl_get_syncable_host_buffer_mem(backend, buffer);
+        if (alias_us != nullptr) {
+            *alias_us += ggml_time_us() - t_alias_start_us;
+        }
+    } else {
+        data_device = ggml_backend_opencl_get_or_create_external_host_buffer_alias_timed_ex(
+                backend,
+                buffer,
+                &alias_timing,
+                /* initial_upload = */ !host_to_device);
+        if (alias_us != nullptr) {
+            *alias_us += alias_timing.create_us;
+        }
+    }
+    if (transfer_us != nullptr) {
+        *transfer_us += alias_timing.initial_upload_us;
+    }
+    if (data_device == nullptr) {
+        return false;
+    }
+
+    auto * backend_ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
+    const int64_t t_backend_sync_start_us = (backend_sync_us != nullptr) ? ggml_time_us() : 0;
+    sync_with_other_backends(backend_ctx);
+    if (backend_sync_us != nullptr) {
+        *backend_sync_us += ggml_time_us() - t_backend_sync_start_us;
+    }
+
+    uint8_t * range_base = static_cast<uint8_t *>(base) + offset;
+    if (host_to_device) {
+        if (ggml_backend_opencl_skip_qnn_host_ptr_upload(buffer)) {
+            backend_ctx->external_host_aliases_with_stale_host_mirror.erase(buffer);
+            backend_ctx->external_host_aliases_pending_device_upload.erase(buffer);
+            GGML_LOG_WARN("%s: using unsafe experimental direct qnn-npu-host visibility without host->device range upload\n", __func__);
+            return true;
+        }
+        if (ggml_backend_opencl_use_direct_qnn_host_ptr_visibility(buffer)) {
+            GGML_LOG_INFO("%s: direct qnn-npu-host alias still requires explicit host->device range upload for correctness\n", __func__);
+        }
+        const int64_t t_transfer_start_us = (transfer_us != nullptr) ? ggml_time_us() : 0;
+        CL_CHECK(clEnqueueWriteBuffer(backend_ctx->queue, data_device, CL_TRUE, offset, size, range_base, 0, nullptr, nullptr));
+        if (transfer_us != nullptr) {
+            *transfer_us += ggml_time_us() - t_transfer_start_us;
+        }
+        backend_ctx->external_host_aliases_pending_device_upload.erase(buffer);
+    } else {
+        const int64_t t_transfer_start_us = (transfer_us != nullptr) ? ggml_time_us() : 0;
+        CL_CHECK(clEnqueueReadBuffer(backend_ctx->queue, data_device, CL_TRUE, offset, size, range_base, 0, nullptr, nullptr));
+        if (transfer_us != nullptr) {
+            *transfer_us += ggml_time_us() - t_transfer_start_us;
+        }
+        if (offset == 0 && size == total_size) {
+            backend_ctx->external_host_aliases_with_stale_host_mirror.erase(buffer);
+        }
         backend_ctx->external_host_aliases_pending_device_upload.erase(buffer);
     }
 
@@ -6886,6 +7002,10 @@ static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, c
 
     if (std::strcmp(name, "ggml_backend_opencl_sync_external_host_buffer_timed") == 0) {
         return reinterpret_cast<void *>(ggml_backend_opencl_sync_external_host_buffer_timed);
+    }
+
+    if (std::strcmp(name, "ggml_backend_opencl_sync_external_host_buffer_range_timed") == 0) {
+        return reinterpret_cast<void *>(ggml_backend_opencl_sync_external_host_buffer_range_timed);
     }
 
     return nullptr;
