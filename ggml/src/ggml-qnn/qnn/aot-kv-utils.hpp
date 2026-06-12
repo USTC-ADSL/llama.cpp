@@ -80,6 +80,18 @@ inline bool qnn_aot_should_reset_staged_generic_kv_writeback(size_t token_offset
     return pending_layers == 0;
 }
 
+inline bool qnn_aot_should_write_generic_kv(bool   generic_kv_writeback_needed,
+                                            size_t n_tokens,
+                                            bool   has_kq_mask,
+                                            bool   has_cache_k_layers,
+                                            bool   has_cache_v_layers) {
+    return generic_kv_writeback_needed &&
+           n_tokens > 0 &&
+           has_kq_mask &&
+           has_cache_k_layers &&
+           has_cache_v_layers;
+}
+
 inline bool qnn_aot_kv_prefix_import_required(size_t graph_kv_position,
                                               size_t required_prefix_tokens) {
     return graph_kv_position < required_prefix_tokens;

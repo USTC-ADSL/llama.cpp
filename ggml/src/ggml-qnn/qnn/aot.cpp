@@ -4877,11 +4877,12 @@ bool qnn_aot_runtime::generic_kv_writeback_needed(const aot_match_result & match
 }
 
 bool qnn_aot_runtime::should_write_generic_kv(const aot_match_result & match) const {
-    return generic_kv_writeback_needed(match) &&
-           match.n_tokens > 1 &&
-           match.kq_mask != nullptr &&
-           !match.cache_k_layers.empty() &&
-           !match.cache_v_layers.empty();
+    return qnn::qnn_aot_should_write_generic_kv(
+            generic_kv_writeback_needed(match),
+            match.n_tokens,
+            match.kq_mask != nullptr,
+            !match.cache_k_layers.empty(),
+            !match.cache_v_layers.empty());
 }
 
 bool qnn_aot_runtime::should_defer_generic_kv_writeback(const aot_match_result & match) const {

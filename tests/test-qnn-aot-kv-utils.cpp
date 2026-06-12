@@ -94,5 +94,23 @@ int main(void) {
             /* pending_layers = */ 18),
         "a new prefill should reset staged payloads when the first graph shard starts over at layer 0");
 
+    ok &= expect_true(
+        qnn::qnn_aot_should_write_generic_kv(
+            /* generic_kv_writeback_needed = */ true,
+            /* n_tokens = */ 1,
+            /* has_kq_mask = */ true,
+            /* has_cache_k_layers = */ true,
+            /* has_cache_v_layers = */ true),
+        "single-token decode must write generic KV when a non-QNN consumer may switch in later");
+
+    ok &= expect_false(
+        qnn::qnn_aot_should_write_generic_kv(
+            /* generic_kv_writeback_needed = */ false,
+            /* n_tokens = */ 1,
+            /* has_kq_mask = */ true,
+            /* has_cache_k_layers = */ true,
+            /* has_cache_v_layers = */ true),
+        "single-token decode must not write generic KV when no later generic consumer needs it");
+
     return ok ? 0 : 1;
 }
