@@ -65,7 +65,8 @@ bool llama_context_should_use_qnn_written_generic_kv_for_cpu(
         uint32_t            n_tokens,
         bool                generic_kv_enabled,
         bool                qnn_writeback_ready,
-        bool                live_kv_cpu_backed);
+        bool                live_kv_cpu_backed,
+        bool                qnn_writeback_flushed);
 
 llama_hetero_kv_contract llama_dynamic_phase_shared_qnn_kv_contract(
         const std::string & prefill_attn_backend,
@@ -201,14 +202,17 @@ bool llama_context_should_use_qnn_written_generic_kv_for_cpu(
         uint32_t            n_tokens,
         bool                generic_kv_enabled,
         bool                qnn_writeback_ready,
-        bool                live_kv_cpu_backed) {
-    if (!generic_kv_enabled || !qnn_writeback_ready || !live_kv_cpu_backed || n_tokens != 1) {
+        bool                live_kv_cpu_backed,
+        bool                qnn_writeback_flushed) {
+    if (!generic_kv_enabled || !qnn_writeback_ready || n_tokens != 1) {
         return false;
     }
 
     const std::string current = llama_hetero_canonical_backend(current_attn_backend);
     const std::string target  = llama_hetero_canonical_backend(target_attn_backend);
-    return llama_hetero_is_qnn_backend(current) && target == "cpu";
+    return llama_hetero_is_qnn_backend(current) &&
+           target == "cpu" &&
+           (live_kv_cpu_backed || qnn_writeback_flushed);
 }
 
 static bool llama_context_live_kv_is_cpu_backed(const llama_memory_i * memory) {
@@ -2893,6 +2897,7 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
     const llama_hetero_execution_plan previous_plan = hetero_plan;
     bool migrated_qnn_kv = false;
     bool qnn_generic_kv_writeback_ready = !switching_out_of_qnn_decode;
+    bool qnn_generic_kv_writeback_flushed = false;
 
     if (switching_into_qnn_decode) {
         const size_t prefix_tokens = seq0_prefix_tokens_from_memory(memory.get());
@@ -2943,6 +2948,7 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                     return;
                 }
                 qnn_generic_kv_writeback_ready = true;
+                qnn_generic_kv_writeback_flushed = true;
             } else if (has_pending_fn != nullptr && flush_pending_fn != nullptr) {
                 qnn_generic_kv_writeback_ready = true;
             } else if (generic_qnn_kv_enabled) {
@@ -3028,7 +3034,8 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                 n_tokens,
                 generic_qnn_kv_enabled,
                 qnn_generic_kv_writeback_ready,
-                llama_context_live_kv_is_cpu_backed(memory.get()))) {
+                llama_context_live_kv_is_cpu_backed(memory.get()),
+                qnn_generic_kv_writeback_flushed)) {
         migrated_qnn_kv = true;
         LLAMA_LOG_INFO("%s: reusing QNN-written live generic KV directly for decode route switch (%s -> %s); state rebuild skipped\n",
                 __func__,
