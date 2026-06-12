@@ -59,6 +59,12 @@ bool llama_context_should_attempt_qnn_phase_kv_migration(
         uint32_t            n_tokens,
         bool                generic_kv_enabled);
 
+bool llama_context_should_sync_opencl_before_qnn_direct_import(
+        const std::string & current_attn_backend,
+        const std::string & target_attn_backend,
+        uint32_t            n_tokens,
+        bool                generic_kv_enabled);
+
 bool llama_context_should_use_qnn_written_generic_kv_for_cpu(
         const std::string & current_attn_backend,
         const std::string & target_attn_backend,
@@ -189,11 +195,32 @@ bool llama_context_should_attempt_qnn_phase_kv_migration(
 
     const std::string current = llama_hetero_canonical_backend(current_attn_backend);
     const std::string target  = llama_hetero_canonical_backend(target_attn_backend);
-    if (!llama_hetero_is_qnn_backend(current)) {
+    const bool current_is_qnn = llama_hetero_is_qnn_backend(current);
+    const bool target_is_qnn  = llama_hetero_is_qnn_backend(target);
+
+    if (current_is_qnn) {
+        return target == "cpu" || target == "opencl";
+    }
+
+    return target_is_qnn && (current == "cpu" || current == "opencl");
+}
+
+bool llama_context_should_sync_opencl_before_qnn_direct_import(
+        const std::string & current_attn_backend,
+        const std::string & target_attn_backend,
+        uint32_t            n_tokens,
+        bool                generic_kv_enabled) {
+    if (!llama_context_should_attempt_qnn_phase_kv_migration(
+                current_attn_backend,
+                target_attn_backend,
+                n_tokens,
+                generic_kv_enabled)) {
         return false;
     }
 
-    return target == "cpu" || target == "opencl";
+    const std::string current = llama_hetero_canonical_backend(current_attn_backend);
+    const std::string target  = llama_hetero_canonical_backend(target_attn_backend);
+    return current == "opencl" && llama_hetero_is_qnn_backend(target);
 }
 
 bool llama_context_should_use_qnn_written_generic_kv_for_cpu(
@@ -1192,6 +1219,31 @@ llama_context::llama_context(
     }
 
     const auto & hetero_route = hetero_plan.route;
+    const auto dynamic_schedule_uses_qnn = [&]() {
+        for (const auto & entry : dynamic_route_config.decode_schedule) {
+            if (llama_dynamic_route_uses_qnn(entry.route.plan)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const auto dynamic_schedule_uses_opencl = [&]() {
+        for (const auto & entry : dynamic_route_config.decode_schedule) {
+            if (llama_dynamic_route_uses_opencl(entry.route.plan)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const auto dynamic_schedule_uses_cpu = [&]() {
+        for (const auto & entry : dynamic_route_config.decode_schedule) {
+            if (entry.route.plan.has_any_route() &&
+                llama_hetero_is_cpu_backend(llama_hetero_phase_backend_for_route(entry.route.plan.route))) {
+                return true;
+            }
+        }
+        return false;
+    };
     const bool dynamic_cpu_opencl_zero_copy =
         llama_hetero_route_has_cpu_opencl_adjacent_boundary(dynamic_route_config.prefill.plan.route) ||
         llama_hetero_route_has_cpu_opencl_adjacent_boundary(dynamic_route_config.decode.plan.route) ||
@@ -1236,7 +1288,8 @@ llama_context::llama_context(
         hetero_route,
         dynamic_route_config.prefill.plan.route,
         dynamic_route_config.decode.plan.route,
-        dynamic_route_config.fallback.plan.route);
+        dynamic_route_config.fallback.plan.route) ||
+        dynamic_schedule_uses_qnn();
 
     if (!hparams.vocab_only) {
         // GPU backends
@@ -1469,13 +1522,26 @@ llama_context::llama_context(
                 const std::string route = llama_hetero_format_route_spec(candidate.plan.route);
                 return route.empty() ? std::string("<unset>") : route;
             };
+            const auto schedule_string = [&]() {
+                std::string result;
+                for (const auto & entry : dynamic_route_config.decode_schedule) {
+                    if (!result.empty()) {
+                        result += ";";
+                    }
+                    const std::string route = llama_hetero_format_route_spec(entry.route.plan.route);
+                    result += std::to_string(entry.start_token) + ":" +
+                        (route.empty() ? std::string("<unset>") : route);
+                }
+                return result.empty() ? std::string("<unset>") : result;
+            };
 
-            LLAMA_LOG_INFO("%s: dynamic route mode=%s prefill=%s decode=%s fallback=%s slo_us=%" PRId64 " allow_qnn=%s decode_switch_after=%" PRIu64 "\n",
+            LLAMA_LOG_INFO("%s: dynamic route mode=%s prefill=%s decode=%s fallback=%s decode_schedule=%s slo_us=%" PRId64 " allow_qnn=%s decode_switch_after=%" PRIu64 "\n",
                     __func__,
                     llama_dynamic_route_mode_name(dynamic_route_config.mode),
                     route_string_or(dynamic_route_config.prefill).c_str(),
                     route_string_or(dynamic_route_config.decode).c_str(),
                     route_string_or(dynamic_route_config.fallback).c_str(),
+                    schedule_string().c_str(),
                     dynamic_route_config.slo_us,
                     dynamic_route_config.allow_qnn ? "true" : "false",
                     dynamic_route_config.decode_switch_after);
@@ -1546,7 +1612,8 @@ llama_context::llama_context(
             llama_hetero_is_opencl_backend(llama_hetero_phase_backend_for_route(hetero_route)) ||
             llama_dynamic_route_uses_opencl(dynamic_route_config.prefill.plan) ||
             llama_dynamic_route_uses_opencl(dynamic_route_config.decode.plan) ||
-            llama_dynamic_route_uses_opencl(dynamic_route_config.fallback.plan);
+            llama_dynamic_route_uses_opencl(dynamic_route_config.fallback.plan) ||
+            dynamic_schedule_uses_opencl();
         const auto plan_uses_cpu = [](const llama_hetero_execution_plan & plan) {
             return plan.has_any_route() &&
                    llama_hetero_is_cpu_backend(llama_hetero_phase_backend_for_route(plan.route));
@@ -1555,7 +1622,8 @@ llama_context::llama_context(
             llama_hetero_is_cpu_backend(llama_hetero_phase_backend_for_route(hetero_route)) ||
             plan_uses_cpu(dynamic_route_config.prefill.plan) ||
             plan_uses_cpu(dynamic_route_config.decode.plan) ||
-            plan_uses_cpu(dynamic_route_config.fallback.plan);
+            plan_uses_cpu(dynamic_route_config.fallback.plan) ||
+            dynamic_schedule_uses_cpu();
         const bool disable_cpu_qnn_host_fallback_local =
             llama_context_should_disable_cpu_qnn_host_fallback(
                     first_device_is_qnn_local,
@@ -1816,6 +1884,10 @@ bool llama_context::ensure_dynamic_route_backends_ready(const llama_dynamic_rout
     }
     if (config.fallback.configured) {
         ok = ensure_hetero_backends_for_route(config.fallback.plan.route, "dynamic.fallback") && ok;
+    }
+    for (const auto & entry : config.decode_schedule) {
+        const std::string label = "dynamic." + entry.route.label;
+        ok = ensure_hetero_backends_for_route(entry.route.plan.route, label.c_str()) && ok;
     }
 
     return ok;
@@ -2185,13 +2257,23 @@ bool llama_context::set_dynamic_route_config(const llama_dynamic_route_config & 
     const std::string prefill_route  = llama_hetero_format_route_spec(dynamic_route_config.prefill.plan.route);
     const std::string decode_route   = llama_hetero_format_route_spec(dynamic_route_config.decode.plan.route);
     const std::string fallback_route = llama_hetero_format_route_spec(dynamic_route_config.fallback.plan.route);
+    std::string decode_schedule;
+    for (const auto & entry : dynamic_route_config.decode_schedule) {
+        if (!decode_schedule.empty()) {
+            decode_schedule += ";";
+        }
+        const std::string route = llama_hetero_format_route_spec(entry.route.plan.route);
+        decode_schedule += std::to_string(entry.start_token) + ":" +
+            (route.empty() ? std::string("<unset>") : route);
+    }
 
-    LLAMA_LOG_INFO("%s: dynamic route mode=%s prefill=%s decode=%s fallback=%s slo_us=%" PRId64 " allow_qnn=%s decode_switch_after=%" PRIu64 "\n",
+    LLAMA_LOG_INFO("%s: dynamic route mode=%s prefill=%s decode=%s fallback=%s decode_schedule=%s slo_us=%" PRId64 " allow_qnn=%s decode_switch_after=%" PRIu64 "\n",
             __func__,
             llama_dynamic_route_mode_name(dynamic_route_config.mode),
             prefill_route.empty()  ? "<unset>" : prefill_route.c_str(),
             decode_route.empty()   ? "<unset>" : decode_route.c_str(),
             fallback_route.empty() ? "<unset>" : fallback_route.c_str(),
+            decode_schedule.empty() ? "<unset>" : decode_schedule.c_str(),
             dynamic_route_config.slo_us,
             dynamic_route_config.allow_qnn ? "true" : "false",
             dynamic_route_config.decode_switch_after);
@@ -2255,8 +2337,13 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
     }
 
     const uint64_t decode_token_index = n_tokens > 1 ? 0 : dynamic_route_state.decode_calls;
+    const bool decode_schedule_active =
+        n_tokens == 1 &&
+        !dynamic_route_config.decode_schedule.empty() &&
+        decode_token_index > 0;
     const bool decode_switch_after_active =
         n_tokens == 1 &&
+        !decode_schedule_active &&
         dynamic_route_config.decode_switch_after > 0 &&
         decode_token_index > 0;
     const bool decode_switch_boundary_reached =
@@ -2282,13 +2369,21 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
     const int64_t t_decide_start_us = trace_timing ? ggml_time_us() : 0;
     llama_dynamic_route_decision decision = llama_dynamic_route_decide(dynamic_route_config, request);
     const int64_t t_decide_end_us = trace_timing ? ggml_time_us() : 0;
+    const bool decode_schedule_boundary_reached =
+        decision.decode_schedule_active &&
+        decision.decode_schedule_switch_after > 0 &&
+        decode_token_index == decision.decode_schedule_start_token;
+    const uint64_t active_switch_after_tokens =
+        decision.decode_schedule_active
+            ? decision.decode_schedule_switch_after
+            : dynamic_route_config.decode_switch_after;
 
     if (trace_timing && hetero_phase_trace.active) {
         hetero_phase_trace.route_decide_us = t_decide_end_us - t_decide_start_us;
         hetero_phase_trace.route_reason = decision.reason;
         hetero_phase_trace.decode_token_index = decode_token_index;
-        hetero_phase_trace.switch_after_tokens = dynamic_route_config.decode_switch_after;
-        if (decode_switch_boundary_reached) {
+        hetero_phase_trace.switch_after_tokens = active_switch_after_tokens;
+        if (decode_switch_boundary_reached || decode_schedule_boundary_reached) {
             hetero_phase_trace.transition_phase = "decode_midway";
         }
     }
@@ -2869,6 +2964,11 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                 target_attn_backend,
                 n_tokens,
                 generic_qnn_kv_enabled);
+    const bool should_prepare_qnn_direct_generic_kv_import =
+        switching_into_qnn_decode &&
+        should_attempt_qnn_kv_migration &&
+        !llama_hetero_is_qnn_backend(current_attn_backend) &&
+        llama_hetero_is_qnn_backend(target_attn_backend);
     const bool should_use_qnn_shared_phase_kv =
         llama_context_should_use_qnn_shared_phase_kv(
                 current_attn_backend,
@@ -2896,6 +2996,7 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
          (current_attn_backend == "opencl" && target_attn_backend == "cpu"));
     const llama_hetero_execution_plan previous_plan = hetero_plan;
     bool migrated_qnn_kv = false;
+    bool prepared_qnn_direct_generic_kv_import = false;
     bool qnn_generic_kv_writeback_ready = !switching_out_of_qnn_decode;
     bool qnn_generic_kv_writeback_flushed = false;
 
@@ -3043,6 +3144,96 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                 target_attn_backend.c_str());
     }
 
+    if (should_prepare_qnn_direct_generic_kv_import) {
+        LLAMA_LOG_INFO("%s: preparing direct generic KV import before decode route switch (%s -> %s)\n",
+                __func__,
+                current_attn_backend.c_str(),
+                target_attn_backend.c_str());
+
+        const int64_t t_kv_sync_start_us = trace_timing ? ggml_time_us() : 0;
+        bool prepared = true;
+        llama_opencl_external_host_sync_timing opencl_sync_timing;
+
+        if (llama_context_should_sync_opencl_before_qnn_direct_import(
+                    current_attn_backend,
+                    target_attn_backend,
+                    n_tokens,
+                    generic_qnn_kv_enabled)) {
+            ggml_backend_t opencl_backend = find_backend_for_route("opencl");
+            if (opencl_backend == nullptr) {
+                LLAMA_LOG_WARN("%s: OpenCL backend unavailable before QNN direct generic KV import\n",
+                        __func__);
+                prepared = false;
+            } else {
+                ggml_backend_synchronize(opencl_backend);
+                LLAMA_LOG_INFO("%s: synchronized OpenCL backend before QNN direct generic KV import\n",
+                        __func__);
+            }
+        }
+
+        if (prepared && current_attn_backend == "opencl") {
+            prepared = sync_dynamic_cpu_opencl_kv(/* host_to_device = */ false, &opencl_sync_timing);
+            if (!prepared) {
+                LLAMA_LOG_WARN("%s: failed to synchronize OpenCL KV back to host before QNN direct import\n",
+                        __func__);
+            } else {
+                LLAMA_LOG_INFO("%s: synchronized OpenCL KV back to host before QNN direct import alias_us=%" PRId64 " backend_sync_us=%" PRId64 " transfer_us=%" PRId64 "\n",
+                        __func__,
+                        opencl_sync_timing.alias_us,
+                        opencl_sync_timing.backend_sync_us,
+                        opencl_sync_timing.transfer_us);
+            }
+        }
+
+        ggml_backend_t qnn_backend = prepared ? find_backend_for_route(target_attn_backend) : nullptr;
+        if (prepared && qnn_backend == nullptr) {
+            LLAMA_LOG_WARN("%s: qnn backend unavailable for direct generic KV import preparation\n", __func__);
+            prepared = false;
+        }
+
+        ggml_backend_qnn_aot_reset_state_t reset_state_fn = nullptr;
+        if (prepared) {
+            ggml_backend_dev_t qnn_dev = ggml_backend_get_device(qnn_backend);
+            ggml_backend_reg_t qnn_reg = qnn_dev != nullptr ? ggml_backend_dev_backend_reg(qnn_dev) : nullptr;
+            reset_state_fn =
+                qnn_reg != nullptr
+                    ? (ggml_backend_qnn_aot_reset_state_t)
+                          ggml_backend_reg_get_proc_address(qnn_reg, "ggml_backend_qnn_aot_reset_state")
+                    : nullptr;
+            if (reset_state_fn == nullptr) {
+                LLAMA_LOG_WARN("%s: qnn backend does not expose AoT reset_state support for direct generic KV import\n",
+                        __func__);
+                prepared = false;
+            }
+        }
+
+        if (prepared && !reset_state_fn(qnn_backend)) {
+            LLAMA_LOG_WARN("%s: failed to reset QNN AoT state before direct generic KV import\n", __func__);
+            prepared = false;
+        }
+
+        const int64_t t_kv_sync_end_us = trace_timing ? ggml_time_us() : 0;
+        if (trace_timing && hetero_phase_trace.active) {
+            hetero_phase_trace.kv_migration_us += t_kv_sync_end_us - t_kv_sync_start_us;
+            hetero_phase_trace.kv_alias_us += opencl_sync_timing.alias_us;
+            hetero_phase_trace.kv_backend_sync_us += opencl_sync_timing.backend_sync_us;
+            hetero_phase_trace.kv_transfer_us += opencl_sync_timing.transfer_us;
+        }
+
+        if (prepared) {
+            prepared_qnn_direct_generic_kv_import = true;
+            migrated_qnn_kv = true;
+            LLAMA_LOG_INFO("%s: prepared direct generic KV import for %zu prefix token(s) before non-QNN -> qnn decode switch\n",
+                    __func__,
+                    dynamic_seq0_token_history.size());
+        } else {
+            LLAMA_LOG_WARN("%s: direct generic KV import preparation failed; falling back to QNN prefix replay for %s -> %s\n",
+                    __func__,
+                    current_attn_backend.c_str(),
+                    target_attn_backend.c_str());
+        }
+    }
+
     if (should_use_qnn_shared_phase_kv) {
         LLAMA_LOG_INFO("%s: reusing shared QNN KV directly for decode route switch (%s -> %s)%s\n",
                 __func__,
@@ -3072,7 +3263,9 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         }
     }
 
-    if (should_attempt_qnn_kv_migration && !migrated_qnn_kv) {
+    if (should_attempt_qnn_kv_migration &&
+        !should_prepare_qnn_direct_generic_kv_import &&
+        !migrated_qnn_kv) {
         LLAMA_LOG_INFO("%s: starting QNN KV migration before decode route switch (%s -> %s)\n",
                 __func__,
                 current_attn_backend.c_str(),
@@ -3103,7 +3296,10 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         qnn_prefix_replay_pending = false;
         qnn_prefix_replay_restore_plan_valid = false;
         qnn_prefix_replay_rebuild_live_memory = false;
-        if (!dynamic_seq0_token_history.empty()) {
+        if (prepared_qnn_direct_generic_kv_import) {
+            LLAMA_LOG_INFO("%s: using direct generic KV import for non-QNN -> qnn decode switch; prefix replay skipped\n",
+                    __func__);
+        } else if (!dynamic_seq0_token_history.empty()) {
             qnn_prefix_replay_restore_plan = previous_plan;
             qnn_prefix_replay_restore_plan_valid = true;
             qnn_prefix_replay_pending = true;
@@ -3631,6 +3827,9 @@ void llama_context::sched_reserve() {
         }
         if (dynamic_route_config.decode.configured) {
             append_unique_plan(dynamic_route_config.decode.plan);
+        }
+        for (const auto & entry : dynamic_route_config.decode_schedule) {
+            append_unique_plan(entry.route.plan);
         }
         if (include_fallback && dynamic_route_config.fallback.configured) {
             append_unique_plan(dynamic_route_config.fallback.plan);
@@ -5664,8 +5863,9 @@ llm_graph_cb llama_context::graph_get_cb() const {
 
     const auto & hetero_route = hetero_plan.route;
     const std::string hetero_phase_backend_name = llama_hetero_phase_backend_for_route(hetero_route);
+    const std::string hetero_output_backend_name = llama_hetero_phase_output_tail_backend_for_route(hetero_route);
     const ggml_backend_t hetero_phase_backend = parse_hetero_backend(hetero_phase_backend_name);
-    const ggml_backend_t hetero_output_backend    = hetero_phase_backend;
+    const ggml_backend_t hetero_output_backend = parse_hetero_backend(hetero_output_backend_name);
     const bool hetero_stage_enabled = hetero_route.has_any_route();
     const bool hetero_route_uses_opencl = llama_hetero_is_opencl_backend(hetero_phase_backend_name);
 
@@ -5687,6 +5887,12 @@ llm_graph_cb llama_context::graph_get_cb() const {
             LLAMA_LOG_INFO("%s: routing decode output tail (norm/result_norm/result_output) via %s\n",
                     __func__, ggml_backend_name(hetero_output_backend));
             logged_hetero_output_route = true;
+        }
+        static bool logged_hetero_output_default_route = false;
+        if (hetero_route_uses_opencl && hetero_output_backend == nullptr && !logged_hetero_output_default_route) {
+            LLAMA_LOG_INFO("%s: leaving decode output tail (norm/result_norm/result_output) to default scheduler for OpenCL route\n",
+                    __func__);
+            logged_hetero_output_default_route = true;
         }
         static bool warned_hetero_attn_kv_boundary = false;
         static bool logged_hetero_attn_kv_contract = false;
@@ -5809,9 +6015,13 @@ llm_graph_cb llama_context::graph_get_cb() const {
             std::strcmp(tensor_name, "norm") == 0 ||
             std::strcmp(tensor_name, "result_norm") == 0 ||
             std::strcmp(tensor_name, "result_output") == 0);
+        const bool defer_opencl_output_tail_to_scheduler =
+            hetero_route_uses_opencl &&
+            hetero_output_backend == nullptr &&
+            output_stage;
         const bool explicit_hetero_stage =
-            (route_output_to_backend || attn_stage || ffn_stage) &&
-            hetero_phase_backend != nullptr;
+            (route_output_to_backend && hetero_output_backend != nullptr) ||
+            ((attn_stage || ffn_stage) && hetero_phase_backend != nullptr);
         const bool preserve_stage_purity_on_cpu =
             hetero_stage_enabled &&
             !hetero_route_uses_opencl &&
@@ -5819,10 +6029,18 @@ llm_graph_cb llama_context::graph_get_cb() const {
             llama_hetero_is_stage_tensor_name(tensor_name);
 
         auto resolve_stage_backend = [&]() -> ggml_backend_t {
-            if ((route_output_to_backend || attn_stage || ffn_stage) && hetero_phase_backend != nullptr) {
+            if (route_output_to_backend && hetero_output_backend != nullptr) {
+                return hetero_output_backend;
+            }
+            if ((attn_stage || ffn_stage) && hetero_phase_backend != nullptr) {
                 return hetero_phase_backend;
             }
-            if (qnn_aot_enabled && qnn_aot_backend != nullptr && (aot_transformer_stage || aot_lm_head_stage)) {
+            if (defer_opencl_output_tail_to_scheduler) {
+                return nullptr;
+            }
+            if (qnn_aot_enabled && qnn_aot_backend != nullptr &&
+                (!hetero_stage_enabled || llama_hetero_is_qnn_backend(hetero_phase_backend_name)) &&
+                (aot_transformer_stage || aot_lm_head_stage)) {
                 return qnn_aot_backend;
             }
             return nullptr;
@@ -5862,8 +6080,8 @@ llm_graph_cb llama_context::graph_get_cb() const {
         const bool hetero_force_cpu = tensor_name != nullptr && (
             std::strcmp(tensor_name, "inp_tokens") == 0 ||
             std::strcmp(tensor_name, "embd") == 0 ||
-            std::strcmp(tensor_name, "norm") == 0 ||
-            (!route_output_to_backend && output_stage));
+            (std::strcmp(tensor_name, "norm") == 0 && !defer_opencl_output_tail_to_scheduler) ||
+            (!route_output_to_backend && output_stage && !defer_opencl_output_tail_to_scheduler));
 
         const bool qnn_force_cpu = tensor_name != nullptr && (
             std::strcmp(tensor_name, "inp_tokens") == 0 ||

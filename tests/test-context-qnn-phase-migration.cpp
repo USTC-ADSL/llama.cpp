@@ -16,6 +16,12 @@ bool llama_context_should_attempt_qnn_phase_kv_migration(
         uint32_t            n_tokens,
         bool                generic_kv_enabled);
 
+bool llama_context_should_sync_opencl_before_qnn_direct_import(
+        const std::string & current_attn_backend,
+        const std::string & target_attn_backend,
+        uint32_t            n_tokens,
+        bool                generic_kv_enabled);
+
 bool llama_context_should_use_qnn_written_generic_kv_for_cpu(
         const std::string & current_attn_backend,
         const std::string & target_attn_backend,
@@ -274,10 +280,40 @@ int main() {
                 llama_context_should_attempt_qnn_phase_kv_migration("qnn-npu", "cpu", 1, true));
     });
 
+    t.test("single-token cpu to qnn decode prefers direct generic kv import when generic kv is enabled", [](testing & t) {
+        t.assert_true(
+                "cpu->qnn decode should prepare direct generic KV import instead of prefix replay when generic KV is available",
+                llama_context_should_attempt_qnn_phase_kv_migration("cpu", "qnn-npu", 1, true));
+    });
+
+    t.test("single-token opencl to qnn decode prefers direct generic kv import when generic kv is enabled", [](testing & t) {
+        t.assert_true(
+                "opencl->qnn decode should prepare direct generic KV import instead of prefix replay when generic KV is available",
+                llama_context_should_attempt_qnn_phase_kv_migration("opencl", "qnn-npu", 1, true));
+    });
+
+    t.test("opencl to qnn direct generic kv import synchronizes opencl producer first", [](testing & t) {
+        t.assert_true(
+                "OpenCL-produced generic KV must be synchronized before QNN imports it into private cache",
+                llama_context_should_sync_opencl_before_qnn_direct_import("opencl", "qnn-npu", 1, true));
+        t.assert_true(
+                "CPU-produced generic KV is already host-readable and does not need OpenCL synchronization",
+                !llama_context_should_sync_opencl_before_qnn_direct_import("cpu", "qnn-npu", 1, true));
+        t.assert_true(
+                "OpenCL sync must stay disabled when generic KV import is disabled",
+                !llama_context_should_sync_opencl_before_qnn_direct_import("opencl", "qnn-npu", 1, false));
+        t.assert_true(
+                "prefill-sized batches should not trigger QNN direct import sync",
+                !llama_context_should_sync_opencl_before_qnn_direct_import("opencl", "qnn-npu", 8, true));
+    });
+
     t.test("qnn state migration is disabled without generic kv materialization", [](testing & t) {
         t.assert_true(
                 "qnn->opencl decode must keep replay fallback when generic KV writeback is disabled",
                 !llama_context_should_attempt_qnn_phase_kv_migration("qnn-npu", "opencl", 1, false));
+        t.assert_true(
+                "cpu->qnn decode must keep replay fallback when generic KV import is disabled",
+                !llama_context_should_attempt_qnn_phase_kv_migration("cpu", "qnn-npu", 1, false));
     });
 
     t.test("qnn state migration only applies to decode-sized batches", [](testing & t) {
@@ -494,8 +530,8 @@ int main() {
                         "qnn-npu",
                         "opencl",
                         /* generic_kv_enabled = */ true,
-                        allocated,
-                        /* experimental_enabled = */ false));
+                allocated,
+                /* experimental_enabled = */ false));
     });
 
     t.test("single-token cpu to opencl decode can try UMA KV handoff", [](testing & t) {

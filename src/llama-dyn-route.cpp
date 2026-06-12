@@ -73,6 +73,67 @@ void set_candidate(
         (kv_layout  != nullptr && kv_layout [0] != '\0');
 }
 
+std::vector<llama_dynamic_decode_schedule_entry> parse_decode_schedule(const char * value) {
+    std::vector<llama_dynamic_decode_schedule_entry> entries;
+    const std::string spec = value != nullptr ? value : "";
+    size_t pos = 0;
+
+    while (pos < spec.size()) {
+        const size_t next = spec.find(';', pos);
+        const std::string raw_entry = spec.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+        const std::string entry = llama_hetero_trim(raw_entry);
+        if (!entry.empty()) {
+            const size_t split = entry.find(':');
+            if (split == std::string::npos) {
+                std::fprintf(stderr,
+                        "llama_dynamic_route_config_from_env: ignoring invalid decode schedule entry '%s' (expected start_token:route)\n",
+                        entry.c_str());
+            } else {
+                const std::string start_text = llama_hetero_trim(entry.substr(0, split));
+                const std::string route_spec = llama_hetero_trim(entry.substr(split + 1));
+                char * end = nullptr;
+                const unsigned long long start = std::strtoull(start_text.c_str(), &end, 10);
+                if (start == 0 || end == start_text.c_str() || (end != nullptr && *end != '\0') || route_spec.empty()) {
+                    std::fprintf(stderr,
+                            "llama_dynamic_route_config_from_env: ignoring invalid decode schedule entry '%s' (start token must be >= 1 and route must be non-empty)\n",
+                            entry.c_str());
+                } else {
+                    llama_dynamic_decode_schedule_entry decoded;
+                    decoded.start_token = static_cast<uint64_t>(start);
+                    const std::string label = "decode-schedule@" + std::to_string(decoded.start_token);
+                    set_candidate(decoded.route, label.c_str(), route_spec.c_str(), nullptr);
+                    entries.push_back(std::move(decoded));
+                }
+            }
+        }
+
+        if (next == std::string::npos) {
+            break;
+        }
+        pos = next + 1;
+    }
+
+    std::stable_sort(
+            entries.begin(),
+            entries.end(),
+            [](const llama_dynamic_decode_schedule_entry & lhs,
+               const llama_dynamic_decode_schedule_entry & rhs) {
+                return lhs.start_token < rhs.start_token;
+            });
+
+    std::vector<llama_dynamic_decode_schedule_entry> unique_entries;
+    for (auto & entry : entries) {
+        if (!unique_entries.empty() &&
+            unique_entries.back().start_token == entry.start_token) {
+            unique_entries.back() = std::move(entry);
+        } else {
+            unique_entries.push_back(std::move(entry));
+        }
+    }
+
+    return unique_entries;
+}
+
 bool plan_is_compatible(
         const llama_dynamic_route_runtime_config & config,
         const llama_dynamic_route_request & request,
@@ -380,6 +441,10 @@ llama_dynamic_route_runtime_config llama_dynamic_route_config_from_env() {
     const char * decode_kv_env     = std::getenv("GGML_HETERO_DYNAMIC_DECODE_KV");
     const char * fallback_route_env = std::getenv("GGML_HETERO_DYNAMIC_FALLBACK_ROUTE");
     const char * fallback_kv_env    = std::getenv("GGML_HETERO_DYNAMIC_FALLBACK_KV");
+    const char * decode_schedule_env = std::getenv("GGML_HETERO_DYNAMIC_DECODE_SCHEDULE");
+    if (decode_schedule_env == nullptr || decode_schedule_env[0] == '\0') {
+        decode_schedule_env = std::getenv("GGML_HETERO_DECODE_ROUTE_SCHEDULE");
+    }
 
     if (mode_env == nullptr || mode_env[0] == '\0') {
         if ((prefill_route_env != nullptr && prefill_route_env[0] != '\0') ||
@@ -387,7 +452,8 @@ llama_dynamic_route_runtime_config llama_dynamic_route_config_from_env() {
             (decode_route_env  != nullptr && decode_route_env [0] != '\0') ||
             (decode_kv_env     != nullptr && decode_kv_env    [0] != '\0') ||
             (fallback_route_env != nullptr && fallback_route_env[0] != '\0') ||
-            (fallback_kv_env    != nullptr && fallback_kv_env   [0] != '\0')) {
+            (fallback_kv_env    != nullptr && fallback_kv_env   [0] != '\0') ||
+            (decode_schedule_env != nullptr && decode_schedule_env[0] != '\0')) {
             config.mode = llama_dynamic_route_mode::PHASE_HEURISTIC;
         }
     } else {
@@ -400,6 +466,7 @@ llama_dynamic_route_runtime_config llama_dynamic_route_config_from_env() {
     set_candidate(config.prefill,  "prefill",  prefill_route_env,  prefill_kv_env);
     set_candidate(config.decode,   "decode",   decode_route_env,   decode_kv_env);
     set_candidate(config.fallback, "fallback", fallback_route_env, fallback_kv_env);
+    config.decode_schedule = parse_decode_schedule(decode_schedule_env);
 
     config.slo_us        = env_i64_value("GGML_HETERO_DYNAMIC_SLO_US", 0);
     config.allow_qnn     = env_flag_enabled("GGML_HETERO_DYNAMIC_ALLOW_QNN", true);
@@ -477,10 +544,46 @@ llama_dynamic_route_decision llama_dynamic_route_decide(
 
     const bool is_prefill = request.n_tokens > 1;
     const auto & primary = is_prefill ? config.prefill : config.decode;
+    const bool decode_schedule_active =
+        !is_prefill &&
+        !config.decode_schedule.empty() &&
+        request.decode_token_index > 0;
     const bool decode_switch_after_active =
         !is_prefill &&
+        !decode_schedule_active &&
         config.decode_switch_after > 0 &&
         request.decode_token_index > 0;
+
+    if (decode_schedule_active) {
+        const llama_dynamic_decode_schedule_entry * selected = nullptr;
+        for (const auto & entry : config.decode_schedule) {
+            if (entry.start_token <= request.decode_token_index) {
+                selected = &entry;
+            } else {
+                break;
+            }
+        }
+
+        if (selected == nullptr) {
+            if (request.base_plan != nullptr) {
+                decision.plan = *request.base_plan;
+                decision.plan_label = "base";
+            }
+            decision.reason = "decode-schedule-wait";
+            return decision;
+        }
+
+        decision = evaluate_plan(
+                config,
+                request,
+                selected->route.plan,
+                selected->route.label.c_str(),
+                "decode-schedule");
+        decision.decode_schedule_active = true;
+        decision.decode_schedule_start_token = selected->start_token;
+        decision.decode_schedule_switch_after = selected->start_token > 0 ? selected->start_token - 1 : 0;
+        return decision;
+    }
 
     if (decode_switch_after_active &&
         request.decode_token_index <= config.decode_switch_after) {

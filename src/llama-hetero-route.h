@@ -437,6 +437,21 @@ static inline std::string llama_hetero_phase_backend_for_route(const llama_heter
     return {};
 }
 
+static inline std::string llama_hetero_phase_output_tail_backend_for_route(const llama_hetero_route_spec & spec) {
+    const std::string phase_backend = llama_hetero_canonical_backend(llama_hetero_phase_backend_for_route(spec));
+    if (phase_backend.empty()) {
+        return {};
+    }
+
+    // Mobile OpenCL dynamic routes keep transformer stages on OpenCL, but the final
+    // norm/logits tail must follow the normal scheduler placement used by static GPU.
+    if (llama_hetero_is_opencl_backend(phase_backend)) {
+        return {};
+    }
+
+    return phase_backend;
+}
+
 static inline bool llama_hetero_route_is_phase_homogeneous(const llama_hetero_route_spec & spec) {
     static constexpr std::array<llama_hetero_route_stage, 5> kStages = {{
         llama_hetero_route_stage::ATTN_PROJ,

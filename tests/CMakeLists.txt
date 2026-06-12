@@ -207,6 +207,7 @@ llama_test_cmd(bash NAME test-low-overhead-token-trace ARGS ${PROJECT_SOURCE_DIR
 llama_build(test-llama-bench-utils.cpp)
 llama_test(test-llama-bench-utils)
 llama_build_and_test(test-context-cpu-host-fallback.cpp)
+llama_build_and_test(test-hetero-output-tail-route.cpp)
 llama_build_and_test(test-model-loader-opencl-portability.cpp)
 llama_build_and_test(test-opencl-cpu-extra-copy.cpp)
 llama_build_and_test(test-opencl-extra-metadata.cpp)

@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 enum class llama_dynamic_route_mode {
     DISABLED,
@@ -18,12 +19,18 @@ struct llama_dynamic_route_candidate {
     bool                        configured = false;
 };
 
+struct llama_dynamic_decode_schedule_entry {
+    uint64_t start_token = 0;
+    llama_dynamic_route_candidate route;
+};
+
 struct llama_dynamic_route_runtime_config {
     llama_dynamic_route_mode mode = llama_dynamic_route_mode::DISABLED;
 
     llama_dynamic_route_candidate prefill;
     llama_dynamic_route_candidate decode;
     llama_dynamic_route_candidate fallback;
+    std::vector<llama_dynamic_decode_schedule_entry> decode_schedule;
 
     int64_t slo_us = 0;
     bool    allow_qnn = true;
@@ -70,6 +77,9 @@ struct llama_dynamic_route_decision {
     llama_hetero_execution_plan plan;
     std::string                 plan_label;
     std::string                 reason;
+    bool                        decode_schedule_active = false;
+    uint64_t                    decode_schedule_start_token = 0;
+    uint64_t                    decode_schedule_switch_after = 0;
 };
 
 const char * llama_dynamic_route_mode_name(llama_dynamic_route_mode mode);
