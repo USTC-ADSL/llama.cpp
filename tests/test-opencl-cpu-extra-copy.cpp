@@ -84,6 +84,19 @@ int main() {
                         llama_hetero_parse_route_spec("opencl")) == &original);
     });
 
+    t.test("qnn stage keeps the original weight copy", [](testing & t) {
+        ggml_tensor original = {};
+        ggml_tensor cpu_copy = {};
+
+        t.assert_true(
+                "QNN FFN stages should keep the original QNN/host-resident weight copy",
+                llama_model_resolve_weight_for_cpu_copy(
+                        &original,
+                        &cpu_copy,
+                        llama_hetero_route_stage::FFN,
+                        llama_hetero_parse_route_spec("qnn-npu")) == &original);
+    });
+
     t.test("manually-constructed per-stage routes only switch the stages that actually run on cpu", [](testing & t) {
         ggml_tensor original = {};
         ggml_tensor cpu_copy = {};
