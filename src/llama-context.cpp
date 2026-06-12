@@ -96,7 +96,8 @@ bool llama_context_should_try_cpu_opencl_uma_kv_handoff(
         const std::string & current_attn_backend,
         const std::string & target_attn_backend,
         uint32_t            n_tokens,
-        bool                disabled);
+        bool                disabled,
+        bool                allow_opencl_to_cpu);
 
 int64_t llama_context_transition_blocking_us(
         int64_t total_wall_us,
@@ -297,14 +298,19 @@ bool llama_context_should_try_cpu_opencl_uma_kv_handoff(
         const std::string & current_attn_backend,
         const std::string & target_attn_backend,
         uint32_t            n_tokens,
-        bool                disabled) {
+        bool                disabled,
+        bool                allow_opencl_to_cpu) {
     if (disabled || n_tokens != 1) {
         return false;
     }
 
     const std::string current = llama_hetero_canonical_backend(current_attn_backend);
     const std::string target  = llama_hetero_canonical_backend(target_attn_backend);
-    return current == "cpu" && target == "opencl";
+    if (current == "cpu" && target == "opencl") {
+        return true;
+    }
+
+    return allow_opencl_to_cpu && current == "opencl" && target == "cpu";
 }
 
 int64_t llama_context_transition_blocking_us(
@@ -2887,7 +2893,8 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                     current_attn_backend,
                     target_attn_backend,
                     n_tokens,
-                    env_flag_enabled("GGML_HETERO_DISABLE_CPU_OPENCL_UMA_KV_HANDOFF"));
+                    env_flag_enabled("GGML_HETERO_DISABLE_CPU_OPENCL_UMA_KV_HANDOFF"),
+                    env_flag_enabled("GGML_HETERO_ENABLE_OPENCL_CPU_UMA_KV_HANDOFF"));
 
         if (try_cpu_opencl_uma_kv) {
             LLAMA_LOG_INFO("%s: trying CPU/OpenCL UMA KV handoff before decode route switch (%s -> %s)\n",
@@ -2896,7 +2903,8 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                     target_attn_backend.c_str());
             const int64_t t_kv_sync_start_us = trace_timing ? ggml_time_us() : 0;
             llama_opencl_external_host_sync_timing opencl_sync_timing;
-            const bool synced = sync_dynamic_cpu_opencl_kv(/* host_to_device = */ true, &opencl_sync_timing);
+            const bool host_to_device = current_attn_backend == "cpu" && target_attn_backend == "opencl";
+            const bool synced = sync_dynamic_cpu_opencl_kv(host_to_device, &opencl_sync_timing);
             const int64_t t_kv_sync_end_us = trace_timing ? ggml_time_us() : 0;
             migrated = synced && opencl_sync_timing.synced_buffers > 0;
             if (trace_timing && hetero_phase_trace.active) {

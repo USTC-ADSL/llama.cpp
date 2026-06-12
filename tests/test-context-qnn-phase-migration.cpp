@@ -53,7 +53,8 @@ bool llama_context_should_try_cpu_opencl_uma_kv_handoff(
         const std::string & current_attn_backend,
         const std::string & target_attn_backend,
         uint32_t            n_tokens,
-        bool                disabled);
+        bool                disabled,
+        bool                allow_opencl_to_cpu);
 
 bool llama_context_should_apply_qnn_workpoint_switch(
         const llama_hetero_route_spec & current_route,
@@ -438,15 +439,35 @@ int main() {
                         "cpu",
                         "opencl",
                         1,
-                        /* disabled = */ false));
+                        /* disabled = */ false,
+                        /* allow_opencl_to_cpu = */ false));
 
         t.assert_true(
-                "OpenCL -> CPU still keeps the existing state migration path",
+                "OpenCL -> CPU keeps the state migration path unless the reverse experiment is enabled",
                 !llama_context_should_try_cpu_opencl_uma_kv_handoff(
                         "opencl",
                         "cpu",
                         1,
-                        /* disabled = */ false));
+                        /* disabled = */ false,
+                        /* allow_opencl_to_cpu = */ false));
+
+        t.assert_true(
+                "OpenCL -> CPU can try shared host KV handoff when the reverse experiment is enabled",
+                llama_context_should_try_cpu_opencl_uma_kv_handoff(
+                        "opencl",
+                        "cpu",
+                        1,
+                        /* disabled = */ false,
+                        /* allow_opencl_to_cpu = */ true));
+
+        t.assert_true(
+                "QNN -> OpenCL must keep the existing NPU-to-GPU KV handoff path",
+                !llama_context_should_try_cpu_opencl_uma_kv_handoff(
+                        "qnn-npu",
+                        "opencl",
+                        1,
+                        /* disabled = */ false,
+                        /* allow_opencl_to_cpu = */ true));
 
         t.assert_true(
                 "prefill-sized batches must not try CPU/OpenCL UMA handoff",
@@ -454,7 +475,8 @@ int main() {
                         "cpu",
                         "opencl",
                         16,
-                        /* disabled = */ false));
+                        /* disabled = */ false,
+                        /* allow_opencl_to_cpu = */ true));
 
         t.assert_true(
                 "the disable env gate must force the state rebuild path",
@@ -462,7 +484,17 @@ int main() {
                         "cpu",
                         "opencl",
                         1,
-                        /* disabled = */ true));
+                        /* disabled = */ true,
+                        /* allow_opencl_to_cpu = */ true));
+
+        t.assert_true(
+                "the disable env gate must also block reverse OpenCL -> CPU UMA handoff",
+                !llama_context_should_try_cpu_opencl_uma_kv_handoff(
+                        "opencl",
+                        "cpu",
+                        1,
+                        /* disabled = */ true,
+                        /* allow_opencl_to_cpu = */ true));
     });
 
     return t.summary();
