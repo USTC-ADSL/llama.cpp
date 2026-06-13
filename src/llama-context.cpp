@@ -129,6 +129,11 @@ bool llama_context_should_prewarm_dynamic_qnn_opencl_kv_aliases(
         const llama_hetero_kv_contract & allocated_kv_contract,
         bool                experimental_enabled);
 
+bool llama_context_should_preload_dynamic_qnn_decode_graphs(
+        bool dynamic_route_enabled,
+        bool dynamic_decode_uses_qnn,
+        bool preload_enabled);
+
 bool llama_context_should_try_cpu_opencl_uma_kv_handoff(
         const std::string & current_attn_backend,
         const std::string & target_attn_backend,
@@ -457,6 +462,13 @@ bool llama_context_should_prewarm_dynamic_qnn_opencl_kv_aliases(
     return false;
 }
 
+bool llama_context_should_preload_dynamic_qnn_decode_graphs(
+        bool dynamic_route_enabled,
+        bool dynamic_decode_uses_qnn,
+        bool preload_enabled) {
+    return preload_enabled && dynamic_route_enabled && dynamic_decode_uses_qnn;
+}
+
 bool llama_context_should_try_cpu_opencl_uma_kv_handoff(
         const std::string & current_attn_backend,
         const std::string & target_attn_backend,
@@ -659,6 +671,7 @@ namespace {
 using ggml_backend_qnn_aot_has_pending_generic_kv_writeback_t = bool (*)(ggml_backend_t backend);
 using ggml_backend_qnn_aot_flush_pending_generic_kv_writeback_t = bool (*)(ggml_backend_t backend);
 using ggml_backend_qnn_aot_reset_state_t = bool (*)(ggml_backend_t backend);
+using ggml_backend_qnn_aot_preload_decode_graphs_t = bool (*)(ggml_backend_t backend, size_t n_tokens);
 using ggml_backend_qnn_set_htp_workpoint_t = bool (*)(ggml_backend_t backend, const char * workpoint);
 
 bool hetero_dynamic_trace_timing_enabled() {
@@ -1926,6 +1939,7 @@ llama_context::llama_context(
 
         sched_reserve();
         maybe_prewarm_dynamic_qnn_opencl_kv_aliases();
+        maybe_preload_dynamic_qnn_decode_graphs();
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
@@ -2125,6 +2139,59 @@ void llama_context::maybe_prewarm_dynamic_qnn_opencl_kv_aliases() {
             timing.alias_us,
             timing.backend_sync_us,
             timing.transfer_us);
+}
+
+void llama_context::maybe_preload_dynamic_qnn_decode_graphs() {
+    if (!dynamic_route_config.enabled()) {
+        return;
+    }
+
+    bool decode_uses_qnn =
+        llama_dynamic_route_uses_qnn(dynamic_route_config.decode.plan) ||
+        llama_dynamic_route_uses_qnn(dynamic_route_config.fallback.plan);
+    for (const auto & entry : dynamic_route_config.decode_schedule) {
+        decode_uses_qnn = decode_uses_qnn || llama_dynamic_route_uses_qnn(entry.route.plan);
+    }
+
+    if (!llama_context_should_preload_dynamic_qnn_decode_graphs(
+                dynamic_route_config.enabled(),
+                decode_uses_qnn,
+                env_flag_enabled("GGML_HETERO_DYNAMIC_PRELOAD_QNN_DECODE"))) {
+        return;
+    }
+
+    ggml_backend_t qnn_backend = find_backend_for_route("qnn-npu");
+    if (qnn_backend == nullptr) {
+        LLAMA_LOG_WARN("%s: skipping QNN decode graph preload because the qnn-npu backend is unavailable\n",
+                __func__);
+        return;
+    }
+
+    ggml_backend_dev_t qnn_dev = ggml_backend_get_device(qnn_backend);
+    ggml_backend_reg_t qnn_reg = qnn_dev != nullptr ? ggml_backend_dev_backend_reg(qnn_dev) : nullptr;
+    auto * preload_fn =
+        qnn_reg != nullptr
+            ? (ggml_backend_qnn_aot_preload_decode_graphs_t)
+                  ggml_backend_reg_get_proc_address(qnn_reg, "ggml_backend_qnn_aot_preload_decode_graphs")
+            : nullptr;
+    if (preload_fn == nullptr) {
+        LLAMA_LOG_WARN("%s: qnn backend does not expose AoT decode graph preload support\n", __func__);
+        return;
+    }
+
+    const int64_t t_start_us = ggml_time_us();
+    const bool preloaded = preload_fn(qnn_backend, 1);
+    const int64_t preload_us = ggml_time_us() - t_start_us;
+    if (!preloaded) {
+        LLAMA_LOG_WARN("%s: QNN decode graph preload failed preload_us=%" PRId64 "\n",
+                __func__,
+                preload_us);
+        return;
+    }
+
+    LLAMA_LOG_INFO("%s: preloaded QNN decode AoT graphs for batch=1 preload_us=%" PRId64 "\n",
+            __func__,
+            preload_us);
 }
 
 void llama_context::validate_dynamic_seq0_token_history() {

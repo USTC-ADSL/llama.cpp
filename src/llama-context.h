@@ -300,6 +300,7 @@ private:
     bool backend_available_for_route(const std::string & backend_name) const;
     ggml_backend_t find_backend_for_route(const std::string & backend_name) const;
     void maybe_prewarm_dynamic_qnn_opencl_kv_aliases();
+    void maybe_preload_dynamic_qnn_decode_graphs();
     bool sync_dynamic_cpu_opencl_kv(
             bool host_to_device,
             llama_opencl_external_host_sync_timing * timing = nullptr,

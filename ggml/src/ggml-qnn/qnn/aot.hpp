@@ -142,6 +142,7 @@ class qnn_aot_runtime {
     bool supports_fragment_op(const ggml_tensor * op) const;
     bool prefers_cpu_op(const ggml_tensor * op) const;
     bool maybe_execute(ggml_cgraph * cgraph);
+    bool preload_decode_graphs(size_t n_tokens);
     bool has_pending_generic_kv_writeback() const;
     bool flush_pending_generic_kv_writeback();
     void reset_state();

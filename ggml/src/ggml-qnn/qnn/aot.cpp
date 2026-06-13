@@ -4065,6 +4065,27 @@ qnn_aot_runtime::graph_bucket * qnn_aot_runtime::select_transformer_graphs(size_
     return nullptr;
 }
 
+bool qnn_aot_runtime::preload_decode_graphs(size_t n_tokens) {
+    if (!_enabled) {
+        return false;
+    }
+
+    bool requested = false;
+    bool ok = true;
+
+    if (!_config.transformer_graphs.empty()) {
+        requested = true;
+        ok = select_transformer_graphs(n_tokens) != nullptr && ok;
+    }
+
+    if (!_config.lm_head_graphs.empty()) {
+        requested = true;
+        ok = select_lm_head_graph(n_tokens) != nullptr && ok;
+    }
+
+    return requested && ok;
+}
+
 qnn_aot_graph * qnn_aot_runtime::ensure_graph_loaded(const qnn_aot_graph_config & graph_config,
                                                      graph_family &                family) {
     const bool trace_timing = aot_trace_load_timing_enabled();

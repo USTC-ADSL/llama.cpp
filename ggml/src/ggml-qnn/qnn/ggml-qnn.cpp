@@ -287,6 +287,19 @@ bool ggml_backend_qnn_aot_flush_pending_generic_kv_writeback(ggml_backend_t back
     return device_ctx->aot_runtime->flush_pending_generic_kv_writeback();
 }
 
+bool ggml_backend_qnn_aot_preload_decode_graphs(ggml_backend_t backend, size_t n_tokens) {
+    if (backend == nullptr) {
+        return false;
+    }
+
+    auto * device_ctx = get_device_context(backend->device);
+    if (device_ctx == nullptr || device_ctx->aot_runtime == nullptr) {
+        return false;
+    }
+
+    return device_ctx->aot_runtime->preload_decode_graphs(n_tokens);
+}
+
 ggml_guid_t ggml_backend_qnn_guid() {
     static ggml_guid guid = { 0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81,
                               0x92, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0x09 };
@@ -676,6 +689,19 @@ bool ggml_backend_qnn_aot_reset_state(ggml_backend_t backend) {
 
     device_ctx->aot_runtime->reset_state();
     return true;
+}
+
+bool ggml_backend_qnn_aot_preload_decode_graphs(ggml_backend_t backend, size_t n_tokens) {
+    if (backend == nullptr || backend->device == nullptr) {
+        return false;
+    }
+
+    auto * device_ctx = reinterpret_cast<qnn::ggml_backend_qnn_device_context *>(backend->device->context);
+    if (device_ctx == nullptr || device_ctx->aot_runtime == nullptr) {
+        return false;
+    }
+
+    return device_ctx->aot_runtime->preload_decode_graphs(n_tokens);
 }
 
 bool ggml_backend_qnn_set_htp_workpoint(ggml_backend_t backend, const char * workpoint) {

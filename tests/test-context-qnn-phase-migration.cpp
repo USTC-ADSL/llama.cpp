@@ -89,6 +89,11 @@ bool llama_context_should_prewarm_dynamic_qnn_opencl_kv_aliases(
         const llama_hetero_kv_contract & allocated_kv_contract,
         bool                experimental_enabled);
 
+bool llama_context_should_preload_dynamic_qnn_decode_graphs(
+        bool dynamic_route_enabled,
+        bool dynamic_route_uses_qnn,
+        bool preload_enabled);
+
 bool llama_context_should_try_cpu_opencl_uma_kv_handoff(
         const std::string & current_attn_backend,
         const std::string & target_attn_backend,
@@ -786,6 +791,36 @@ int main() {
                         /* generic_kv_enabled = */ true,
                 allocated,
                 /* experimental_enabled = */ false));
+    });
+
+    t.test("qnn decode graph preload requires explicit env and qnn dynamic route", [](testing & t) {
+        t.assert_true(
+                "explicit preload and a qnn dynamic route should preload decode graphs",
+                llama_context_should_preload_dynamic_qnn_decode_graphs(
+                        /* dynamic_route_enabled = */ true,
+                        /* dynamic_route_uses_qnn = */ true,
+                        /* preload_enabled = */ true));
+
+        t.assert_true(
+                "preload must stay disabled without the explicit env gate",
+                !llama_context_should_preload_dynamic_qnn_decode_graphs(
+                        /* dynamic_route_enabled = */ true,
+                        /* dynamic_route_uses_qnn = */ true,
+                        /* preload_enabled = */ false));
+
+        t.assert_true(
+                "preload must stay disabled for non-qnn dynamic routes",
+                !llama_context_should_preload_dynamic_qnn_decode_graphs(
+                        /* dynamic_route_enabled = */ true,
+                        /* dynamic_route_uses_qnn = */ false,
+                        /* preload_enabled = */ true));
+
+        t.assert_true(
+                "static contexts must not preload qnn decode graphs",
+                !llama_context_should_preload_dynamic_qnn_decode_graphs(
+                        /* dynamic_route_enabled = */ false,
+                        /* dynamic_route_uses_qnn = */ true,
+                        /* preload_enabled = */ true));
     });
 
     t.test("single-token cpu to opencl decode can try UMA KV handoff", [](testing & t) {
