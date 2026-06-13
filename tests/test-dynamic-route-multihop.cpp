@@ -44,6 +44,7 @@ struct multihop_case_config {
     std::string expected_schedule_log;
     std::string prompt;
     int n_ctx;
+    int min_prompt_tokens;
     int decode_tokens;
     std::string expected_final_backend;
     int min_transition_count;
@@ -207,6 +208,7 @@ static multihop_case_config short_multihop_config() {
         /*.expected_schedule_log =*/ "decode_schedule=1:attn=opencl,ffn=opencl,output=opencl;3:attn=qnn-npu,ffn=qnn-npu,output=qnn-npu;5:attn=cpu,ffn=cpu,output=cpu;7:attn=opencl,ffn=opencl,output=opencl",
         /*.prompt =*/ "Mira fixed the bridge before sunrise and checked every cable.",
         /*.n_ctx =*/ 160,
+        /*.min_prompt_tokens =*/ 8,
         /*.decode_tokens =*/ 7,
         /*.expected_final_backend =*/ "opencl",
         /*.min_transition_count =*/ 4,
@@ -227,6 +229,7 @@ static multihop_case_config interval32_multihop_config() {
         /*.expected_schedule_log =*/ "decode_schedule=1:attn=cpu,ffn=cpu,output=cpu;33:attn=opencl,ffn=opencl,output=opencl;65:attn=qnn-npu,ffn=qnn-npu,output=qnn-npu;97:attn=cpu,ffn=cpu,output=cpu",
         /*.prompt =*/ "Mira fixed the bridge before sunrise and checked every cable.",
         /*.n_ctx =*/ 160,
+        /*.min_prompt_tokens =*/ 8,
         /*.decode_tokens =*/ 100,
         /*.expected_final_backend =*/ "cpu",
         /*.min_transition_count =*/ 4,
@@ -241,12 +244,15 @@ static multihop_case_config interval32_multihop_config() {
 }
 
 static multihop_case_config nonuniform_multihop_config(
-        const std::string & prompt = "Mira fixed the bridge before sunrise and checked every cable.") {
+        const std::string & prompt = "Mira fixed the bridge before sunrise and checked every cable.",
+        int n_ctx = 160,
+        int min_prompt_tokens = 8) {
     return {
         /*.schedule =*/ "1:cpu;5:opencl;14:qnn-npu;31:cpu",
         /*.expected_schedule_log =*/ "decode_schedule=1:attn=cpu,ffn=cpu,output=cpu;5:attn=opencl,ffn=opencl,output=opencl;14:attn=qnn-npu,ffn=qnn-npu,output=qnn-npu;31:attn=cpu,ffn=cpu,output=cpu",
         /*.prompt =*/ prompt,
-        /*.n_ctx =*/ 160,
+        /*.n_ctx =*/ n_ctx,
+        /*.min_prompt_tokens =*/ min_prompt_tokens,
         /*.decode_tokens =*/ 34,
         /*.expected_final_backend =*/ "cpu",
         /*.min_transition_count =*/ 4,
@@ -346,7 +352,8 @@ static route_run_result run_qnn_prefill_multihop_case(
     std::vector<llama_token> prompt_tokens = tokenize_prompt(
             vocab,
             config.prompt);
-    if (!t.assert_true("prompt should tokenize to at least eight tokens", prompt_tokens.size() >= 8)) {
+    if (!t.assert_true("prompt should tokenize to the configured minimum length",
+                prompt_tokens.size() >= static_cast<size_t>(config.min_prompt_tokens))) {
         llama_free(ctx);
         llama_model_free(model);
         return result;
@@ -684,6 +691,42 @@ int main(int argc, char ** argv) {
                 contains(fast.logs, "decode_token_index=14 switch_after_tokens=13"));
         t.assert_true(
                 "alternate-prompt nonuniform interval schedule should switch at decode token 31",
+                contains(fast.logs, "decode_token_index=31 switch_after_tokens=30"));
+    });
+
+    t.test("fast nonuniform interval logits stay aligned after longer qnn prefill", [&](testing & t) {
+        const multihop_case_config config = nonuniform_multihop_config(
+                "Before the maintenance window started, Mira copied the calibration table, "
+                "checked the backup controller status, compared the voltage history, "
+                "and wrote a concise incident note for the night operator.",
+                /* n_ctx = */ 256,
+                /* min_prompt_tokens = */ 32);
+        const route_run_result fast = run_qnn_prefill_multihop_case(
+                t,
+                logs,
+                model_path,
+                config,
+                /* fast_kv_paths = */ true,
+                /* assert_fast_path_logs = */ true);
+        const route_run_result reference = run_qnn_prefill_multihop_case(
+                t,
+                logs,
+                model_path,
+                config,
+                /* fast_kv_paths = */ false,
+                /* assert_fast_path_logs = */ false);
+        assert_semantic_candidate_overlap(t, fast, reference);
+        if (!t.assert_true("longer-prefill nonuniform interval fast run should complete", fast.ok)) {
+            return;
+        }
+        t.assert_true(
+                "longer-prefill nonuniform interval schedule should switch at decode token 5",
+                contains(fast.logs, "decode_token_index=5 switch_after_tokens=4"));
+        t.assert_true(
+                "longer-prefill nonuniform interval schedule should switch at decode token 14",
+                contains(fast.logs, "decode_token_index=14 switch_after_tokens=13"));
+        t.assert_true(
+                "longer-prefill nonuniform interval schedule should switch at decode token 31",
                 contains(fast.logs, "decode_token_index=31 switch_after_tokens=30"));
     });
 
