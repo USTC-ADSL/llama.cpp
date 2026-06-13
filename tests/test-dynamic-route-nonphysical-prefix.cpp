@@ -15,9 +15,16 @@ struct captured_logs {
     std::string text;
 };
 
+enum class invalid_kv_shape {
+    REMOVED_FRONT_TOKEN,
+    SHARED_SEQ_CELL,
+};
+
 struct route_case {
     const char * producer_backend;
     int32_t n_gpu_layers;
+    bool kv_unified;
+    invalid_kv_shape shape;
 };
 
 static void capture_log_callback(ggml_log_level level, const char * text, void * user_data) {
@@ -130,6 +137,24 @@ static bool contains(const std::string & haystack, const char * needle) {
     return haystack.find(needle) != std::string::npos;
 }
 
+static void make_live_kv_nonphysical_prefix(testing & t, llama_memory_t mem, invalid_kv_shape shape) {
+    switch (shape) {
+        case invalid_kv_shape::REMOVED_FRONT_TOKEN: {
+            const bool removed_front = llama_memory_seq_rm(mem, 0, 0, 1);
+            t.assert_true("front-token removal should succeed", removed_front);
+            t.assert_equal("seq0 should now start after position zero", (llama_pos) 1, llama_memory_seq_pos_min(mem, 0));
+            return;
+        }
+        case invalid_kv_shape::SHARED_SEQ_CELL: {
+            llama_memory_seq_cp(mem, 0, 1, 0, 1);
+            t.assert_equal("seq0 should still start at position zero", (llama_pos) 0, llama_memory_seq_pos_min(mem, 0));
+            t.assert_equal("seq1 should share the first physical token", (llama_pos) 0, llama_memory_seq_pos_min(mem, 1));
+            t.assert_equal("seq1 should only share position zero", (llama_pos) 0, llama_memory_seq_pos_max(mem, 1));
+            return;
+        }
+    }
+}
+
 static void run_nonphysical_prefix_refusal_case(
         testing & t,
         captured_logs & logs,
@@ -150,6 +175,8 @@ static void run_nonphysical_prefix_refusal_case(
     cparams.n_ctx = 128;
     cparams.n_batch = 64;
     cparams.n_ubatch = 64;
+    cparams.n_seq_max = 2;
+    cparams.kv_unified = route.kv_unified;
     cparams.n_threads = 4;
     cparams.n_threads_batch = 4;
     cparams.hetero_phase_route = route.producer_backend;
@@ -191,9 +218,7 @@ static void run_nonphysical_prefix_refusal_case(
     t.assert_equal("seq0 max should include the first decode token",
             static_cast<llama_pos>(prompt_tokens.size()), before_max);
 
-    const bool removed_front = llama_memory_seq_rm(mem, 0, 0, 1);
-    t.assert_true("front-token removal should succeed", removed_front);
-    t.assert_equal("seq0 should now start after position zero", (llama_pos) 1, llama_memory_seq_pos_min(mem, 0));
+    make_live_kv_nonphysical_prefix(t, mem, route.shape);
 
     const size_t second_decode_log_start = logs.text.size();
     std::vector<llama_token> second_decode = { prompt_tokens[prompt_tokens.size() - 2] };
@@ -259,6 +284,8 @@ int main(int argc, char ** argv) {
         run_nonphysical_prefix_refusal_case(t, logs, model_path, {
             /*.producer_backend =*/ "cpu",
             /*.n_gpu_layers =*/ 0,
+            /*.kv_unified =*/ false,
+            /*.shape =*/ invalid_kv_shape::REMOVED_FRONT_TOKEN,
         });
     });
 
@@ -266,6 +293,17 @@ int main(int argc, char ** argv) {
         run_nonphysical_prefix_refusal_case(t, logs, model_path, {
             /*.producer_backend =*/ "opencl",
             /*.n_gpu_layers =*/ -1,
+            /*.kv_unified =*/ false,
+            /*.shape =*/ invalid_kv_shape::REMOVED_FRONT_TOKEN,
+        });
+    });
+
+    t.test("cpu to qnn switch is refused when live KV contains a shared sequence cell", [&](testing & t) {
+        run_nonphysical_prefix_refusal_case(t, logs, model_path, {
+            /*.producer_backend =*/ "cpu",
+            /*.n_gpu_layers =*/ 0,
+            /*.kv_unified =*/ true,
+            /*.shape =*/ invalid_kv_shape::SHARED_SEQ_CELL,
         });
     });
 
