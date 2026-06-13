@@ -52,6 +52,8 @@ struct multihop_case_config {
     std::vector<log_expectation> fast_log_expectations;
 };
 
+static constexpr int64_t fast_transition_total_blocking_limit_us = 100000;
+
 static void capture_log_callback(ggml_log_level level, const char * text, void * user_data) {
     auto * logs = static_cast<captured_logs *>(user_data);
     if (logs != nullptr && text != nullptr) {
@@ -231,6 +233,21 @@ static std::string transition_trace_field(const std::string & line, const char *
     return line.substr(start, end == std::string::npos ? std::string::npos : end - start);
 }
 
+static int64_t transition_trace_field_i64(const std::string & line, const char * field_name) {
+    const std::string value = transition_trace_field(line, field_name);
+    if (value.empty()) {
+        return -1;
+    }
+
+    char * end = nullptr;
+    const long long parsed = std::strtoll(value.c_str(), &end, 10);
+    if (end == value.c_str() || *end != '\0') {
+        return -1;
+    }
+
+    return static_cast<int64_t>(parsed);
+}
+
 static void assert_fast_transition_trace(
         testing & t,
         const std::string & logs,
@@ -265,6 +282,32 @@ static void assert_fast_transition_zero_kv_handoff(
             label + " transition trace should report zero KV handoff",
             std::string("0"),
             transition_trace_field(line, "kv_handoff_us"));
+}
+
+static void assert_fast_transition_total_blocking_under_us(
+        testing & t,
+        const std::string & logs,
+        int decode_token_index,
+        int switch_after_tokens,
+        int64_t max_total_blocking_us) {
+    const std::string line = transition_trace_line(logs, decode_token_index, switch_after_tokens);
+    const std::string label = "decode token " + std::to_string(decode_token_index) +
+        " switch_after " + std::to_string(switch_after_tokens);
+    if (!t.assert_true(label + " transition trace should exist", !line.empty())) {
+        return;
+    }
+
+    const int64_t total_blocking_us = transition_trace_field_i64(line, "total_blocking_us");
+    if (!t.assert_true(label + " transition trace should report total blocking time",
+                total_blocking_us >= 0)) {
+        return;
+    }
+
+    t.assert_true(
+            label + " transition total blocking should stay below " +
+            std::to_string(max_total_blocking_us) + " us (actual " +
+            std::to_string(total_blocking_us) + " us)",
+            total_blocking_us < max_total_blocking_us);
 }
 
 static bool should_capture_snapshot(const std::vector<int> & snapshot_steps, int decode_step) {
@@ -701,6 +744,8 @@ int main(int argc, char ** argv) {
         assert_fast_transition_trace(t, result.logs, 65, 64);
         assert_fast_transition_trace(t, result.logs, 97, 96);
         assert_fast_transition_zero_kv_handoff(t, result.logs, 97, 96);
+        assert_fast_transition_total_blocking_under_us(t, result.logs, 33, 32, fast_transition_total_blocking_limit_us);
+        assert_fast_transition_total_blocking_under_us(t, result.logs, 97, 96, fast_transition_total_blocking_limit_us);
     });
 
     t.test("fast 32 token interval logits stay aligned with conservative migration", [&](testing & t) {
@@ -755,6 +800,8 @@ int main(int argc, char ** argv) {
         assert_fast_transition_trace(t, fast.logs, 14, 13);
         assert_fast_transition_trace(t, fast.logs, 31, 30);
         assert_fast_transition_zero_kv_handoff(t, fast.logs, 31, 30);
+        assert_fast_transition_total_blocking_under_us(t, fast.logs, 5, 4, fast_transition_total_blocking_limit_us);
+        assert_fast_transition_total_blocking_under_us(t, fast.logs, 31, 30, fast_transition_total_blocking_limit_us);
     });
 
     t.test("fast nonuniform interval logits stay aligned for alternate prompt", [&](testing & t) {
@@ -791,6 +838,8 @@ int main(int argc, char ** argv) {
         assert_fast_transition_trace(t, fast.logs, 14, 13);
         assert_fast_transition_trace(t, fast.logs, 31, 30);
         assert_fast_transition_zero_kv_handoff(t, fast.logs, 31, 30);
+        assert_fast_transition_total_blocking_under_us(t, fast.logs, 5, 4, fast_transition_total_blocking_limit_us);
+        assert_fast_transition_total_blocking_under_us(t, fast.logs, 31, 30, fast_transition_total_blocking_limit_us);
     });
 
     t.test("fast nonuniform interval logits stay aligned after longer qnn prefill", [&](testing & t) {
@@ -831,6 +880,8 @@ int main(int argc, char ** argv) {
         assert_fast_transition_trace(t, fast.logs, 14, 13);
         assert_fast_transition_trace(t, fast.logs, 31, 30);
         assert_fast_transition_zero_kv_handoff(t, fast.logs, 31, 30);
+        assert_fast_transition_total_blocking_under_us(t, fast.logs, 5, 4, fast_transition_total_blocking_limit_us);
+        assert_fast_transition_total_blocking_under_us(t, fast.logs, 31, 30, fast_transition_total_blocking_limit_us);
     });
 
     t.test("fast direct opencl to cpu logits stay aligned", [&](testing & t) {
@@ -861,6 +912,8 @@ int main(int argc, char ** argv) {
                 contains(fast.logs, "decode_token_index=17 switch_after_tokens=16"));
         assert_fast_transition_trace(t, fast.logs, 9, 8);
         assert_fast_transition_trace(t, fast.logs, 17, 16);
+        assert_fast_transition_total_blocking_under_us(t, fast.logs, 9, 8, fast_transition_total_blocking_limit_us);
+        assert_fast_transition_total_blocking_under_us(t, fast.logs, 17, 16, fast_transition_total_blocking_limit_us);
     });
 
     llama_log_set(logs.previous_callback, logs.previous_user_data);
