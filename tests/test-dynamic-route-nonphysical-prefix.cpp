@@ -15,6 +15,11 @@ struct captured_logs {
     std::string text;
 };
 
+struct route_case {
+    const char * producer_backend;
+    int32_t n_gpu_layers;
+};
+
 static void capture_log_callback(ggml_log_level level, const char * text, void * user_data) {
     auto * logs = static_cast<captured_logs *>(user_data);
     if (logs != nullptr && text != nullptr) {
@@ -47,12 +52,13 @@ static std::string get_model_path(int argc, char ** argv) {
     return env_model != nullptr ? env_model : "";
 }
 
-static void force_cpu_to_qnn_schedule_env() {
+static void force_producer_to_qnn_schedule_env(const char * producer_backend) {
     setenv("GGML_HETERO_DYNAMIC_MODE", "phase", 1);
-    setenv("GGML_HETERO_DYNAMIC_PREFILL_ROUTE", "cpu", 1);
+    setenv("GGML_HETERO_DYNAMIC_PREFILL_ROUTE", producer_backend, 1);
     unsetenv("GGML_HETERO_DYNAMIC_DECODE_ROUTE");
     unsetenv("GGML_HETERO_DYNAMIC_DECODE_KV");
-    setenv("GGML_HETERO_DYNAMIC_DECODE_SCHEDULE", "1:cpu;2:qnn-npu", 1);
+    const std::string schedule = std::string("1:") + producer_backend + ";2:qnn-npu";
+    setenv("GGML_HETERO_DYNAMIC_DECODE_SCHEDULE", schedule.c_str(), 1);
     setenv("GGML_HETERO_DYNAMIC_TRACE", "1", 1);
     setenv("GGML_HETERO_DYNAMIC_TRACE_TIMING", "1", 1);
     setenv("GGML_HETERO_DYNAMIC_TRACE_TIMING_DETAIL", "1", 1);
@@ -124,6 +130,108 @@ static bool contains(const std::string & haystack, const char * needle) {
     return haystack.find(needle) != std::string::npos;
 }
 
+static void run_nonphysical_prefix_refusal_case(
+        testing & t,
+        captured_logs & logs,
+        const std::string & model_path,
+        const route_case & route) {
+    force_producer_to_qnn_schedule_env(route.producer_backend);
+
+    llama_model_params mparams = llama_model_default_params();
+    mparams.n_gpu_layers = route.n_gpu_layers;
+    mparams.hetero_phase_route = route.producer_backend;
+
+    llama_model * model = llama_model_load_from_file(model_path.c_str(), mparams);
+    if (!t.assert_true("model should load", model != nullptr)) {
+        return;
+    }
+
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx = 128;
+    cparams.n_batch = 64;
+    cparams.n_ubatch = 64;
+    cparams.n_threads = 4;
+    cparams.n_threads_batch = 4;
+    cparams.hetero_phase_route = route.producer_backend;
+    cparams.no_perf = true;
+
+    llama_context * ctx = llama_init_from_model(model, cparams);
+    if (!t.assert_true("context should initialize with producer and scheduled QNN routes", ctx != nullptr)) {
+        llama_model_free(model);
+        return;
+    }
+    llama_set_warmup(ctx, false);
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    std::vector<llama_token> prompt_tokens = tokenize_prompt(
+            vocab,
+            "Mira fixed the bridge before sunrise.");
+    if (!t.assert_true("prompt should tokenize to at least four tokens", prompt_tokens.size() >= 4)) {
+        llama_free(ctx);
+        llama_model_free(model);
+        return;
+    }
+
+    if (!t.assert_true("prefill on the producer backend should decode", decode_tokens(ctx, prompt_tokens, 0))) {
+        llama_free(ctx);
+        llama_model_free(model);
+        return;
+    }
+    std::vector<llama_token> first_decode = { prompt_tokens.back() };
+    if (!t.assert_true("first scheduled producer decode should decode", decode_tokens(ctx, first_decode, prompt_tokens.size()))) {
+        llama_free(ctx);
+        llama_model_free(model);
+        return;
+    }
+
+    llama_memory_t mem = llama_get_memory(ctx);
+    const llama_pos before_min = llama_memory_seq_pos_min(mem, 0);
+    const llama_pos before_max = llama_memory_seq_pos_max(mem, 0);
+    t.assert_equal("seq0 should start as an append-only prefix", (llama_pos) 0, before_min);
+    t.assert_equal("seq0 max should include the first decode token",
+            static_cast<llama_pos>(prompt_tokens.size()), before_max);
+
+    const bool removed_front = llama_memory_seq_rm(mem, 0, 0, 1);
+    t.assert_true("front-token removal should succeed", removed_front);
+    t.assert_equal("seq0 should now start after position zero", (llama_pos) 1, llama_memory_seq_pos_min(mem, 0));
+
+    const size_t second_decode_log_start = logs.text.size();
+    std::vector<llama_token> second_decode = { prompt_tokens[prompt_tokens.size() - 2] };
+    if (!t.assert_true("second decode should continue on the existing producer route after QNN switch refusal",
+                decode_tokens(ctx, second_decode, static_cast<llama_pos>(prompt_tokens.size() + 1)))) {
+        llama_free(ctx);
+        llama_model_free(model);
+        return;
+    }
+
+    const std::string second_decode_logs = logs.text.substr(second_decode_log_start);
+    const std::string route_after_refusal = current_route(ctx);
+
+    t.assert_true(
+            "runtime should reject non-QNN -> QNN switch for non-physical-prefix memory",
+            contains(second_decode_logs,
+                "refusing non-QNN -> qnn decode switch because memory is not a physical seq0 prefix"));
+    t.assert_true(
+            "tracked token history should be cleared after the memory is fragmented",
+            contains(second_decode_logs,
+                "clearing tracked seq0 token history because memory is not a physical seq0 prefix"));
+    t.assert_true(
+            "direct generic KV import must not be prepared after the guard rejects the switch",
+            !contains(second_decode_logs, "prepared direct generic KV import"));
+    t.assert_true(
+            "direct generic KV import must not be used after the guard rejects the switch",
+            !contains(second_decode_logs, "using direct generic KV import"));
+    t.assert_true(
+            "QNN prefix replay must not be queued after the guard rejects the switch",
+            !contains(second_decode_logs, "queued QNN prefix replay"));
+    t.assert_true(
+            "route should remain on the producer backend after the refused switch",
+            contains(route_after_refusal, route.producer_backend) && !contains(route_after_refusal, "qnn"));
+
+    llama_free(ctx);
+    llama_model_free(model);
+}
+
 int main(int argc, char ** argv) {
     const std::string model_path = get_model_path(argc, argv);
     if (model_path.empty()) {
@@ -140,109 +248,25 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
-    force_cpu_to_qnn_schedule_env();
-
     captured_logs logs;
     llama_log_get(&logs.previous_callback, &logs.previous_user_data);
     llama_log_set(capture_log_callback, &logs);
 
+    ggml_backend_load_all();
+
     testing t;
     t.test("cpu to qnn switch is refused when live seq0 memory is not a physical prefix", [&](testing & t) {
-        ggml_backend_load_all();
+        run_nonphysical_prefix_refusal_case(t, logs, model_path, {
+            /*.producer_backend =*/ "cpu",
+            /*.n_gpu_layers =*/ 0,
+        });
+    });
 
-        llama_model_params mparams = llama_model_default_params();
-        mparams.n_gpu_layers = 0;
-        mparams.hetero_phase_route = "cpu";
-
-        llama_model * model = llama_model_load_from_file(model_path.c_str(), mparams);
-        if (!t.assert_true("model should load", model != nullptr)) {
-            return;
-        }
-
-        llama_context_params cparams = llama_context_default_params();
-        cparams.n_ctx = 128;
-        cparams.n_batch = 64;
-        cparams.n_ubatch = 64;
-        cparams.n_threads = 4;
-        cparams.n_threads_batch = 4;
-        cparams.hetero_phase_route = "cpu";
-        cparams.no_perf = true;
-
-        llama_context * ctx = llama_init_from_model(model, cparams);
-        if (!t.assert_true("context should initialize with CPU and scheduled QNN routes", ctx != nullptr)) {
-            llama_model_free(model);
-            return;
-        }
-        llama_set_warmup(ctx, false);
-
-        const llama_vocab * vocab = llama_model_get_vocab(model);
-        std::vector<llama_token> prompt_tokens = tokenize_prompt(
-                vocab,
-                "Mira fixed the bridge before sunrise.");
-        if (!t.assert_true("prompt should tokenize to at least four tokens", prompt_tokens.size() >= 4)) {
-            llama_free(ctx);
-            llama_model_free(model);
-            return;
-        }
-
-        if (!t.assert_true("prefill on CPU should decode", decode_tokens(ctx, prompt_tokens, 0))) {
-            llama_free(ctx);
-            llama_model_free(model);
-            return;
-        }
-        std::vector<llama_token> first_decode = { prompt_tokens.back() };
-        if (!t.assert_true("first scheduled CPU decode should decode", decode_tokens(ctx, first_decode, prompt_tokens.size()))) {
-            llama_free(ctx);
-            llama_model_free(model);
-            return;
-        }
-
-        llama_memory_t mem = llama_get_memory(ctx);
-        const llama_pos before_min = llama_memory_seq_pos_min(mem, 0);
-        const llama_pos before_max = llama_memory_seq_pos_max(mem, 0);
-        t.assert_equal("seq0 should start as an append-only prefix", (llama_pos) 0, before_min);
-        t.assert_equal("seq0 max should include the first decode token",
-                static_cast<llama_pos>(prompt_tokens.size()), before_max);
-
-        const bool removed_front = llama_memory_seq_rm(mem, 0, 0, 1);
-        t.assert_true("front-token removal should succeed", removed_front);
-        t.assert_equal("seq0 should now start after position zero", (llama_pos) 1, llama_memory_seq_pos_min(mem, 0));
-
-        const size_t second_decode_log_start = logs.text.size();
-        std::vector<llama_token> second_decode = { prompt_tokens[prompt_tokens.size() - 2] };
-        if (!t.assert_true("second decode should continue on the existing CPU route after QNN switch refusal",
-                    decode_tokens(ctx, second_decode, static_cast<llama_pos>(prompt_tokens.size() + 1)))) {
-            llama_free(ctx);
-            llama_model_free(model);
-            return;
-        }
-
-        const std::string second_decode_logs = logs.text.substr(second_decode_log_start);
-        const std::string route_after_refusal = current_route(ctx);
-
-        t.assert_true(
-                "runtime should reject non-QNN -> QNN switch for non-physical-prefix memory",
-                contains(second_decode_logs,
-                    "refusing non-QNN -> qnn decode switch because memory is not a physical seq0 prefix"));
-        t.assert_true(
-                "tracked token history should be cleared after the memory is fragmented",
-                contains(second_decode_logs,
-                    "clearing tracked seq0 token history because memory is not a physical seq0 prefix"));
-        t.assert_true(
-                "direct generic KV import must not be prepared after the guard rejects the switch",
-                !contains(second_decode_logs, "prepared direct generic KV import"));
-        t.assert_true(
-                "direct generic KV import must not be used after the guard rejects the switch",
-                !contains(second_decode_logs, "using direct generic KV import"));
-        t.assert_true(
-                "QNN prefix replay must not be queued after the guard rejects the switch",
-                !contains(second_decode_logs, "queued QNN prefix replay"));
-        t.assert_true(
-                "route should remain CPU after the refused switch",
-                contains(route_after_refusal, "cpu") && !contains(route_after_refusal, "qnn"));
-
-        llama_free(ctx);
-        llama_model_free(model);
+    t.test("opencl to qnn switch is refused when live seq0 memory is not a physical prefix", [&](testing & t) {
+        run_nonphysical_prefix_refusal_case(t, logs, model_path, {
+            /*.producer_backend =*/ "opencl",
+            /*.n_gpu_layers =*/ -1,
+        });
     });
 
     llama_log_set(logs.previous_callback, logs.previous_user_data);
