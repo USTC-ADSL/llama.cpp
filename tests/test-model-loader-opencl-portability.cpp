@@ -23,6 +23,9 @@ bool llama_model_loader_requires_cpu_weight_residency(
 bool llama_model_loader_decode_schedule_requires_cpu_weight_residency(
         const char * decode_schedule);
 
+bool llama_model_loader_decode_schedule_requires_opencl_weight_portability(
+        const char * decode_schedule);
+
 int main() {
     testing t;
 
@@ -163,6 +166,18 @@ int main() {
         t.assert_true(
                 "non-CPU decode schedules should not allocate CPU_REPACK duplicates",
                 !llama_model_loader_decode_schedule_requires_cpu_weight_residency("1:qnn-npu;65:opencl"));
+    });
+
+    t.test("decode schedule with opencl entries requires opencl weight portability", [](testing & t) {
+        t.assert_true(
+                "scheduled OpenCL decode slices should prepare OpenCL-capable primary weights",
+                llama_model_loader_decode_schedule_requires_opencl_weight_portability("1:qnn-npu;33:opencl;65:cpu"));
+    });
+
+    t.test("decode schedule without opencl entries does not request opencl weight portability", [](testing & t) {
+        t.assert_true(
+                "non-OpenCL decode schedules should not force OpenCL-capable primary weights",
+                !llama_model_loader_decode_schedule_requires_opencl_weight_portability("1:qnn-npu;65:cpu"));
     });
 
     t.test("dynamic opencl portability does not preserve OpenCL host buft by default", [](testing & t) {

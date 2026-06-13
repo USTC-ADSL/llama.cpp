@@ -1106,6 +1106,9 @@ bool llama_model_loader_requires_cpu_weight_residency(
 bool llama_model_loader_decode_schedule_requires_cpu_weight_residency(
         const char * decode_schedule);
 
+bool llama_model_loader_decode_schedule_requires_opencl_weight_portability(
+        const char * decode_schedule);
+
 bool llama_model_loader_should_preserve_opencl_host_buft_for_mmap(
         bool hetero_phase_route_active,
         bool hetero_portable_cpu_weights_for_opencl_dynamic_stage,
@@ -1133,6 +1136,29 @@ static ggml_backend_buffer_type_t select_weight_opencl_portable_buft(
     return select_weight_cpu_default_buft(hparams, tensor, op);
 }
 
+static bool llama_model_loader_route_requires_opencl_weight_portability(
+        const llama_hetero_route_spec & route) {
+    if (!route.has_any_route()) {
+        return false;
+    }
+
+    static constexpr std::array<llama_hetero_route_stage, 5> k_weight_route_stages = {{
+        llama_hetero_route_stage::ATTN_PROJ,
+        llama_hetero_route_stage::ATTN_CORE,
+        llama_hetero_route_stage::ATTN_OUT,
+        llama_hetero_route_stage::FFN,
+        llama_hetero_route_stage::OUTPUT,
+    }};
+
+    for (const auto stage : k_weight_route_stages) {
+        if (llama_hetero_backend_kind(route.backend_for(stage)) == 2) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 bool llama_model_loader_requires_opencl_weight_portability(
         bool hetero_phase_route_active,
         int hetero_phase_backend_kind,
@@ -1145,14 +1171,9 @@ bool llama_model_loader_requires_opencl_weight_portability(
         return false;
     }
 
-    const auto route_uses_opencl = [](const llama_hetero_route_spec & route) {
-        return route.has_any_route() &&
-               llama_hetero_backend_kind(llama_hetero_phase_backend_for_route(route)) == 2;
-    };
-
-    return route_uses_opencl(dynamic_prefill_route) ||
-           route_uses_opencl(dynamic_decode_route) ||
-           route_uses_opencl(dynamic_fallback_route);
+    return llama_model_loader_route_requires_opencl_weight_portability(dynamic_prefill_route) ||
+           llama_model_loader_route_requires_opencl_weight_portability(dynamic_decode_route) ||
+           llama_model_loader_route_requires_opencl_weight_portability(dynamic_fallback_route);
 }
 
 bool llama_model_loader_should_enable_opencl_cpu_extra_cpu_copy(
@@ -1236,6 +1257,38 @@ bool llama_model_loader_decode_schedule_requires_cpu_weight_residency(
     return false;
 }
 
+bool llama_model_loader_decode_schedule_requires_opencl_weight_portability(
+        const char * decode_schedule) {
+    if (decode_schedule == nullptr || decode_schedule[0] == '\0') {
+        return false;
+    }
+
+    const std::string spec = decode_schedule;
+    size_t pos = 0;
+    while (pos < spec.size()) {
+        const size_t next = spec.find(';', pos);
+        const std::string raw_entry = spec.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+        const std::string entry = llama_hetero_trim(raw_entry);
+        if (!entry.empty()) {
+            const size_t split = entry.find(':');
+            if (split != std::string::npos) {
+                const std::string route_spec = llama_hetero_trim(entry.substr(split + 1));
+                if (llama_model_loader_route_requires_opencl_weight_portability(
+                            llama_hetero_parse_route_spec(route_spec.c_str()))) {
+                    return true;
+                }
+            }
+        }
+
+        if (next == std::string::npos) {
+            break;
+        }
+        pos = next + 1;
+    }
+
+    return false;
+}
+
 bool llama_model_loader_should_preserve_opencl_host_buft_for_mmap(
         bool hetero_phase_route_active,
         bool hetero_portable_cpu_weights_for_opencl_dynamic_stage,
@@ -1292,7 +1345,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 hetero_phase_backend_kind,
                 dynamic_prefill_route,
                 dynamic_decode_route,
-                dynamic_fallback_route);
+                dynamic_fallback_route) ||
+        llama_model_loader_decode_schedule_requires_opencl_weight_portability(dynamic_decode_schedule_env);
     const bool enable_opencl_cpu_extra_cpu_copy =
         llama_model_loader_should_enable_opencl_cpu_extra_cpu_copy(
                 dynamic_prefill_route,
