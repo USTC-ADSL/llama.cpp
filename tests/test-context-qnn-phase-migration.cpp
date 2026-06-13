@@ -1,5 +1,6 @@
 #include "../src/llama-hetero-route.h"
 #include "../src/llama-context.h"
+#include "../src/llama-dyn-route.h"
 #include "../src/llama-kv-cache.h"
 #include "testing.h"
 
@@ -92,6 +93,9 @@ bool llama_context_should_try_cpu_opencl_uma_kv_handoff(
         uint32_t            n_tokens,
         bool                disabled,
         bool                allow_opencl_to_cpu);
+
+const llama_dynamic_route_candidate * llama_context_initial_dynamic_decode_candidate(
+        const llama_dynamic_route_runtime_config & config);
 
 llama_hetero_route_spec llama_kv_cache_dynamic_decode_route_for_initial_placement(
         const char * explicit_decode_route,
@@ -791,6 +795,62 @@ int main() {
         t.assert_true(
                 "a schedule that does not start at token 1 should not invent an initial decode consumer",
                 !delayed_schedule.has_any_route());
+    });
+
+    t.test("context contract promotion can use the first decode schedule route", [](testing & t) {
+        auto make_candidate = [](const char * label, const char * route) {
+            llama_dynamic_route_candidate candidate;
+            candidate.label = label != nullptr ? label : "";
+            candidate.plan = llama_hetero_build_execution_plan(route, nullptr);
+            candidate.configured = route != nullptr && route[0] != '\0';
+            return candidate;
+        };
+
+        llama_dynamic_route_runtime_config scheduled;
+        scheduled.prefill = make_candidate("prefill", "qnn-npu");
+        scheduled.decode_schedule.push_back({
+                1,
+                make_candidate("decode-schedule@1", "opencl"),
+        });
+
+        const llama_dynamic_route_candidate * from_schedule =
+            llama_context_initial_dynamic_decode_candidate(scheduled);
+        t.assert_true(
+                "schedule starting at token 1 should supply the context initial decode candidate",
+                from_schedule != nullptr);
+        t.assert_equal(
+                "opencl-first schedule should be visible to qnn/opencl contract promotion",
+                std::string("opencl"),
+                llama_hetero_phase_backend_for_route(from_schedule->plan.route));
+
+        const auto shared = llama_dynamic_phase_shared_qnn_kv_contract(
+                llama_hetero_phase_backend_for_route(scheduled.prefill.plan.route),
+                llama_hetero_phase_backend_for_route(from_schedule->plan.route),
+                /* qnn_host_buffer_available = */ true,
+                /* opencl_can_alias_qnn_host = */ true);
+        t.assert_true(
+                "schedule-derived qnn-prefill/opencl-decode should be eligible for shared qnn kv promotion",
+                shared.stage_boundary_active());
+
+        scheduled.decode = make_candidate("decode", "cpu");
+        const llama_dynamic_route_candidate * explicit_decode =
+            llama_context_initial_dynamic_decode_candidate(scheduled);
+        t.assert_true(
+                "explicit decode route should stay visible",
+                explicit_decode != nullptr);
+        t.assert_equal(
+                "explicit decode route keeps priority over schedule-derived promotion",
+                std::string("cpu"),
+                llama_hetero_phase_backend_for_route(explicit_decode->plan.route));
+
+        llama_dynamic_route_runtime_config delayed;
+        delayed.decode_schedule.push_back({
+                33,
+                make_candidate("decode-schedule@33", "opencl"),
+        });
+        t.assert_true(
+                "a delayed schedule must not invent a context initial decode candidate",
+                llama_context_initial_dynamic_decode_candidate(delayed) == nullptr);
     });
 
     return t.summary();

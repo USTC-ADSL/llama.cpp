@@ -134,6 +134,9 @@ bool llama_context_should_try_cpu_opencl_uma_kv_handoff(
         bool                disabled,
         bool                allow_opencl_to_cpu);
 
+const llama_dynamic_route_candidate * llama_context_initial_dynamic_decode_candidate(
+        const llama_dynamic_route_runtime_config & config);
+
 int64_t llama_context_transition_blocking_us(
         int64_t total_wall_us,
         int64_t process_ubatch_us);
@@ -465,6 +468,24 @@ bool llama_context_should_try_cpu_opencl_uma_kv_handoff(
     }
 
     return allow_opencl_to_cpu && current == "opencl" && target == "cpu";
+}
+
+const llama_dynamic_route_candidate * llama_context_initial_dynamic_decode_candidate(
+        const llama_dynamic_route_runtime_config & config) {
+    if (config.decode.configured) {
+        return &config.decode;
+    }
+
+    for (const auto & entry : config.decode_schedule) {
+        if (entry.start_token == 1 && entry.route.configured) {
+            return &entry.route;
+        }
+        if (entry.start_token > 1) {
+            break;
+        }
+    }
+
+    return nullptr;
 }
 
 int64_t llama_context_transition_blocking_us(
@@ -1514,18 +1535,20 @@ llama_context::llama_context(
         maybe_promote_allocated_kv(dynamic_route_config.fallback);
 
         const auto maybe_promote_dynamic_phase_shared_qnn_kv = [&]() {
-            if (!dynamic_route_config.prefill.configured || !dynamic_route_config.decode.configured) {
+            const llama_dynamic_route_candidate * initial_decode =
+                llama_context_initial_dynamic_decode_candidate(dynamic_route_config);
+            if (!dynamic_route_config.prefill.configured || initial_decode == nullptr) {
                 return;
             }
 
             if (!llama_hetero_route_is_phase_homogeneous(dynamic_route_config.prefill.plan.route) ||
-                !llama_hetero_route_is_phase_homogeneous(dynamic_route_config.decode.plan.route)) {
+                !llama_hetero_route_is_phase_homogeneous(initial_decode->plan.route)) {
                 return;
             }
 
             llama_hetero_kv_contract upgraded = llama_dynamic_phase_shared_qnn_kv_contract(
                     llama_hetero_phase_backend_for_route(dynamic_route_config.prefill.plan.route),
-                    llama_hetero_phase_backend_for_route(dynamic_route_config.decode.plan.route),
+                    llama_hetero_phase_backend_for_route(initial_decode->plan.route),
                     qnn_host_buffer_available,
                     opencl_can_alias_qnn_host);
             if (!upgraded.stage_boundary_active() ||
