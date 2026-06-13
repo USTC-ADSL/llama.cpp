@@ -248,6 +248,11 @@ static int64_t transition_trace_field_i64(const std::string & line, const char *
     return static_cast<int64_t>(parsed);
 }
 
+static std::string homogeneous_route(const char * backend) {
+    const std::string value = backend != nullptr ? backend : "";
+    return "attn=" + value + ",ffn=" + value + ",output=" + value;
+}
+
 static void assert_fast_transition_trace(
         testing & t,
         const std::string & logs,
@@ -273,6 +278,30 @@ static void assert_fast_transition_trace(
             label + " post-switch target-token gap should match the measured first target-token gap",
             first_token_gap,
             post_switch_tbt);
+}
+
+static void assert_fast_transition_route(
+        testing & t,
+        const std::string & logs,
+        int decode_token_index,
+        int switch_after_tokens,
+        const std::string & expected_source_route,
+        const std::string & expected_target_route) {
+    const std::string line = transition_trace_line(logs, decode_token_index, switch_after_tokens);
+    const std::string label = "decode token " + std::to_string(decode_token_index) +
+        " switch_after " + std::to_string(switch_after_tokens);
+    if (!t.assert_true(label + " transition trace should exist", !line.empty())) {
+        return;
+    }
+
+    t.assert_equal(
+            label + " transition trace should report source route",
+            expected_source_route,
+            transition_trace_field(line, "source_route"));
+    t.assert_equal(
+            label + " transition trace should report target route",
+            expected_target_route,
+            transition_trace_field(line, "target_route"));
 }
 
 static void assert_fast_transition_zero_kv_handoff(
@@ -772,6 +801,9 @@ int main(int argc, char ** argv) {
         assert_fast_transition_trace(t, result.logs, 33, 32);
         assert_fast_transition_trace(t, result.logs, 65, 64);
         assert_fast_transition_trace(t, result.logs, 97, 96);
+        assert_fast_transition_route(t, result.logs, 33, 32, homogeneous_route("cpu"), homogeneous_route("opencl"));
+        assert_fast_transition_route(t, result.logs, 65, 64, homogeneous_route("opencl"), homogeneous_route("qnn-npu"));
+        assert_fast_transition_route(t, result.logs, 97, 96, homogeneous_route("qnn-npu"), homogeneous_route("cpu"));
         assert_fast_transition_zero_kv_handoff(t, result.logs, 97, 96);
         assert_fast_transition_total_blocking_under_us(t, result.logs, 33, 32, fast_transition_total_blocking_limit_us);
         assert_fast_transition_total_blocking_under_us(t, result.logs, 97, 96, fast_transition_total_blocking_limit_us);
@@ -828,6 +860,9 @@ int main(int argc, char ** argv) {
         assert_fast_transition_trace(t, fast.logs, 5, 4);
         assert_fast_transition_trace(t, fast.logs, 14, 13);
         assert_fast_transition_trace(t, fast.logs, 31, 30);
+        assert_fast_transition_route(t, fast.logs, 5, 4, homogeneous_route("cpu"), homogeneous_route("opencl"));
+        assert_fast_transition_route(t, fast.logs, 14, 13, homogeneous_route("opencl"), homogeneous_route("qnn-npu"));
+        assert_fast_transition_route(t, fast.logs, 31, 30, homogeneous_route("qnn-npu"), homogeneous_route("cpu"));
         assert_fast_transition_zero_kv_handoff(t, fast.logs, 31, 30);
         assert_fast_transition_total_blocking_under_us(t, fast.logs, 5, 4, fast_transition_total_blocking_limit_us);
         assert_fast_transition_total_blocking_under_us(t, fast.logs, 31, 30, fast_transition_total_blocking_limit_us);
@@ -941,6 +976,8 @@ int main(int argc, char ** argv) {
                 contains(fast.logs, "decode_token_index=17 switch_after_tokens=16"));
         assert_fast_transition_trace(t, fast.logs, 9, 8);
         assert_fast_transition_trace(t, fast.logs, 17, 16);
+        assert_fast_transition_route(t, fast.logs, 9, 8, homogeneous_route("opencl"), homogeneous_route("cpu"));
+        assert_fast_transition_route(t, fast.logs, 17, 16, homogeneous_route("cpu"), homogeneous_route("opencl"));
         assert_fast_transition_total_blocking_under_us(t, fast.logs, 9, 8, fast_transition_total_blocking_limit_us);
         assert_fast_transition_total_blocking_under_us(t, fast.logs, 17, 16, fast_transition_total_blocking_limit_us);
     });
@@ -981,6 +1018,10 @@ int main(int argc, char ** argv) {
         assert_fast_transition_trace(t, fast.logs, 9, 8);
         assert_fast_transition_trace(t, fast.logs, 13, 12);
         assert_fast_transition_trace(t, fast.logs, 17, 16);
+        assert_fast_transition_route(t, fast.logs, 5, 4, homogeneous_route("opencl"), homogeneous_route("qnn-npu"));
+        assert_fast_transition_route(t, fast.logs, 9, 8, homogeneous_route("qnn-npu"), homogeneous_route("opencl"));
+        assert_fast_transition_route(t, fast.logs, 13, 12, homogeneous_route("opencl"), homogeneous_route("qnn-npu"));
+        assert_fast_transition_route(t, fast.logs, 17, 16, homogeneous_route("qnn-npu"), homogeneous_route("cpu"));
         assert_fast_transition_total_blocking_under_us(t, fast.logs, 13, 12, fast_transition_total_blocking_limit_us);
         assert_fast_transition_zero_kv_handoff(t, fast.logs, 17, 16);
         assert_fast_transition_total_blocking_under_us(t, fast.logs, 17, 16, fast_transition_total_blocking_limit_us);

@@ -2611,6 +2611,7 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         }
     }
 
+    const std::string source_route = llama_hetero_format_route_spec(hetero_plan.route);
     const std::string target_route = llama_hetero_format_route_spec(decision.plan.route);
     const char * decode_qnn_workpoint = std::getenv("GGML_HETERO_DYNAMIC_DECODE_QNN_WORKPOINT");
     if (qnn_htp_current_workpoint.empty()) {
@@ -2658,6 +2659,7 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
             hetero_phase_trace.qnn_workpoint_apply_us = qnn_workpoint_apply_us;
             hetero_phase_trace.route_label = decision.plan_label.empty() ? "decode" : decision.plan_label;
             hetero_phase_trace.route_reason = applied ? "qnn-workpoint-only" : "qnn-workpoint-apply-failed";
+            hetero_phase_trace.source_route = source_route;
             hetero_phase_trace.target_route = target_route;
         }
 
@@ -2734,6 +2736,7 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
             hetero_phase_trace.actual_gpu_freq_hz = actual_freq_hz;
             hetero_phase_trace.route_label = decision.plan_label.empty() ? "decode" : decision.plan_label;
             hetero_phase_trace.route_reason = applied ? "gpu-freq-only" : "gpu-freq-apply-failed";
+            hetero_phase_trace.source_route = source_route;
             hetero_phase_trace.target_route = target_route;
         }
 
@@ -2844,6 +2847,7 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
             hetero_phase_trace.actual_cpu_freq_khz = actual_freq_khz;
             hetero_phase_trace.route_label = decision.plan_label.empty() ? "decode" : decision.plan_label;
             hetero_phase_trace.route_reason = applied ? "cpu-freq-only" : "cpu-freq-apply-failed";
+            hetero_phase_trace.source_route = source_route;
             hetero_phase_trace.target_route = target_route;
         }
 
@@ -3048,6 +3052,7 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                 hetero_phase_trace.route_apply_us = 0;
                 hetero_phase_trace.route_label = decision.plan_label.empty() ? "decode" : decision.plan_label;
                 hetero_phase_trace.route_reason = applied ? "cpu-state-only" : "cpu-state-apply-failed";
+                hetero_phase_trace.source_route = source_route;
                 hetero_phase_trace.target_route = target_route;
             }
             hetero_phase_trace.cpu_affinity_apply_us = cpu_affinity_apply_us;
@@ -3125,6 +3130,7 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                 hetero_phase_trace.route_apply_us = 0;
                 hetero_phase_trace.route_label = decision.plan_label.empty() ? "decode" : decision.plan_label;
                 hetero_phase_trace.route_reason = "cpu-route-metadata-only";
+                hetero_phase_trace.source_route = source_route;
                 hetero_phase_trace.target_route = target_route;
             }
             if (dynamic_route_config.trace_enabled) {
@@ -3635,6 +3641,7 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         hetero_phase_trace.route_noop = !sched_need_reserve;
         hetero_phase_trace.route_apply_us = t_apply_end_us - t_apply_start_us;
         hetero_phase_trace.route_label = decision.plan_label;
+        hetero_phase_trace.source_route = source_route;
         hetero_phase_trace.target_route = target_route;
     }
 
@@ -3774,6 +3781,7 @@ void llama_context::hetero_transition_trace_log(
             "transition_energy_mj= transition_energy_source=unavailable "
             "success=1 fallback=0 support_status=ok "
             "decode_token_index=%" PRIu64 " switch_after_tokens=%" PRIu64 " "
+            "source_route=%s target_route=%s "
             "requested_gpu_freq_hz=%" PRIu64 " actual_gpu_freq_hz=%" PRIu64 " "
             "requested_cpu_freq_khz=%" PRIu64 " actual_cpu_freq_khz=%" PRIu64 " "
             "requested_cpu_affinity_mask=%s actual_cpu_affinity_mask=%s "
@@ -3798,6 +3806,8 @@ void llama_context::hetero_transition_trace_log(
             first_token_gap.c_str(),
             hetero_phase_trace.decode_token_index,
             hetero_phase_trace.switch_after_tokens,
+            hetero_phase_trace.source_route.empty() ? "<default>" : hetero_phase_trace.source_route.c_str(),
+            hetero_phase_trace.target_route.empty() ? "<default>" : hetero_phase_trace.target_route.c_str(),
             hetero_phase_trace.requested_gpu_freq_hz,
             hetero_phase_trace.actual_gpu_freq_hz,
             hetero_phase_trace.requested_cpu_freq_khz,
