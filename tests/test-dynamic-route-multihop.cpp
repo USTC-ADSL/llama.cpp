@@ -540,6 +540,25 @@ int main(int argc, char ** argv) {
                 contains(result.logs, "decode_token_index=97 switch_after_tokens=96"));
     });
 
+    t.test("fast 32 token interval logits stay aligned with conservative migration", [&](testing & t) {
+        const multihop_case_config config = interval32_multihop_config();
+        const route_run_result fast = run_qnn_prefill_multihop_case(
+                t,
+                logs,
+                model_path,
+                config,
+                /* fast_kv_paths = */ true,
+                /* assert_fast_path_logs = */ true);
+        const route_run_result reference = run_qnn_prefill_multihop_case(
+                t,
+                logs,
+                model_path,
+                config,
+                /* fast_kv_paths = */ false,
+                /* assert_fast_path_logs = */ false);
+        assert_semantic_alignment(t, fast, reference);
+    });
+
     llama_log_set(logs.previous_callback, logs.previous_user_data);
     return t.summary();
 }
