@@ -3,9 +3,11 @@
 #include "llama.h"
 #include "testing.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <numeric>
 #include <string>
 #include <vector>
 
@@ -13,6 +15,22 @@ struct captured_logs {
     ggml_log_callback previous_callback = nullptr;
     void * previous_user_data = nullptr;
     std::string text;
+};
+
+struct top_logit {
+    llama_token token;
+    float logit;
+};
+
+struct semantic_snapshot {
+    std::vector<top_logit> top;
+};
+
+struct route_run_result {
+    bool ok = false;
+    std::string logs;
+    std::string final_route;
+    std::vector<semantic_snapshot> snapshots;
 };
 
 static void capture_log_callback(ggml_log_level level, const char * text, void * user_data) {
@@ -47,7 +65,7 @@ static std::string get_model_path(int argc, char ** argv) {
     return env_model != nullptr ? env_model : "";
 }
 
-static void force_qnn_prefill_multihop_schedule_env() {
+static void force_qnn_prefill_multihop_schedule_env(bool fast_kv_paths) {
     setenv("GGML_HETERO_DYNAMIC_MODE", "phase", 1);
     setenv("GGML_HETERO_DYNAMIC_PREFILL_ROUTE", "qnn-npu", 1);
     unsetenv("GGML_HETERO_DYNAMIC_DECODE_ROUTE");
@@ -57,8 +75,15 @@ static void force_qnn_prefill_multihop_schedule_env() {
     setenv("GGML_HETERO_DYNAMIC_TRACE", "1", 1);
     setenv("GGML_HETERO_DYNAMIC_TRACE_TIMING", "1", 1);
     setenv("GGML_HETERO_DYNAMIC_TRACE_TIMING_DETAIL", "1", 1);
-    setenv("GGML_QNN_AOT_WRITE_GENERIC_KV", "1", 1);
-    setenv("GGML_HETERO_ENABLE_OPENCL_CPU_UMA_KV_HANDOFF", "1", 1);
+    if (fast_kv_paths) {
+        setenv("GGML_QNN_AOT_WRITE_GENERIC_KV", "1", 1);
+        unsetenv("GGML_HETERO_DISABLE_CPU_OPENCL_UMA_KV_HANDOFF");
+        setenv("GGML_HETERO_ENABLE_OPENCL_CPU_UMA_KV_HANDOFF", "1", 1);
+    } else {
+        setenv("GGML_QNN_AOT_WRITE_GENERIC_KV", "0", 1);
+        setenv("GGML_HETERO_DISABLE_CPU_OPENCL_UMA_KV_HANDOFF", "1", 1);
+        unsetenv("GGML_HETERO_ENABLE_OPENCL_CPU_UMA_KV_HANDOFF");
+    }
 }
 
 static std::vector<llama_token> tokenize_prompt(const llama_vocab * vocab, const std::string & prompt) {
@@ -137,8 +162,59 @@ static int count_occurrences(const std::string & haystack, const char * needle) 
     return count;
 }
 
-static void run_qnn_prefill_multihop_case(testing & t, captured_logs & logs, const std::string & model_path) {
-    force_qnn_prefill_multihop_schedule_env();
+static std::vector<top_logit> top_k_logits(const float * logits, int32_t n_vocab, size_t k) {
+    if (logits == nullptr || n_vocab <= 0 || k == 0) {
+        return {};
+    }
+
+    k = std::min(k, static_cast<size_t>(n_vocab));
+    std::vector<llama_token> ids(static_cast<size_t>(n_vocab));
+    std::iota(ids.begin(), ids.end(), 0);
+    const auto better = [&](llama_token lhs, llama_token rhs) {
+        return logits[lhs] > logits[rhs];
+    };
+
+    std::nth_element(ids.begin(), ids.begin() + static_cast<ptrdiff_t>(k - 1), ids.end(), better);
+    ids.resize(k);
+    std::sort(ids.begin(), ids.end(), better);
+
+    std::vector<top_logit> top;
+    top.reserve(k);
+    for (const llama_token token : ids) {
+        top.push_back({ token, logits[token] });
+    }
+    return top;
+}
+
+static int rank_of_token(const std::vector<top_logit> & top, llama_token token, size_t limit) {
+    limit = std::min(limit, top.size());
+    for (size_t i = 0; i < limit; ++i) {
+        if (top[i].token == token) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+static int top_overlap(const std::vector<top_logit> & lhs, const std::vector<top_logit> & rhs, size_t limit) {
+    limit = std::min({ limit, lhs.size(), rhs.size() });
+    int overlap = 0;
+    for (size_t i = 0; i < limit; ++i) {
+        if (rank_of_token(rhs, lhs[i].token, limit) >= 0) {
+            ++overlap;
+        }
+    }
+    return overlap;
+}
+
+static route_run_result run_qnn_prefill_multihop_case(
+        testing & t,
+        captured_logs & logs,
+        const std::string & model_path,
+        bool fast_kv_paths,
+        bool assert_fast_path_logs) {
+    route_run_result result;
+    force_qnn_prefill_multihop_schedule_env(fast_kv_paths);
     const size_t run_log_start = logs.text.size();
 
     llama_model_params mparams = llama_model_default_params();
@@ -147,7 +223,7 @@ static void run_qnn_prefill_multihop_case(testing & t, captured_logs & logs, con
 
     llama_model * model = llama_model_load_from_file(model_path.c_str(), mparams);
     if (!t.assert_true("model should load", model != nullptr)) {
-        return;
+        return result;
     }
 
     llama_context_params cparams = llama_context_default_params();
@@ -162,24 +238,25 @@ static void run_qnn_prefill_multihop_case(testing & t, captured_logs & logs, con
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (!t.assert_true("context should initialize with QNN prefill and scheduled decode routes", ctx != nullptr)) {
         llama_model_free(model);
-        return;
+        return result;
     }
     llama_set_warmup(ctx, false);
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
     std::vector<llama_token> prompt_tokens = tokenize_prompt(
             vocab,
             "Mira fixed the bridge before sunrise and checked every cable.");
     if (!t.assert_true("prompt should tokenize to at least eight tokens", prompt_tokens.size() >= 8)) {
         llama_free(ctx);
         llama_model_free(model);
-        return;
+        return result;
     }
 
     if (!t.assert_true("QNN prefill should decode", decode_tokens(ctx, prompt_tokens, 0))) {
         llama_free(ctx);
         llama_model_free(model);
-        return;
+        return result;
     }
 
     for (int i = 0; i < 7; ++i) {
@@ -189,61 +266,119 @@ static void run_qnn_prefill_multihop_case(testing & t, captured_logs & logs, con
                     decode_tokens(ctx, decode_token, static_cast<llama_pos>(prompt_tokens.size() + (size_t) i)))) {
             llama_free(ctx);
             llama_model_free(model);
-            return;
+            return result;
         }
+
+        const float * logits = llama_get_logits_ith(ctx, 0);
+        if (!t.assert_true("scheduled decode token should expose logits", logits != nullptr)) {
+            llama_free(ctx);
+            llama_model_free(model);
+            return result;
+        }
+        result.snapshots.push_back({ top_k_logits(logits, n_vocab, 64) });
     }
 
-    const std::string run_logs = logs.text.substr(run_log_start);
-    const std::string route_after = current_route(ctx);
+    result.logs = logs.text.substr(run_log_start);
+    result.final_route = current_route(ctx);
+    result.ok = true;
 
     t.assert_true(
             "dynamic schedule should be active",
-            contains(run_logs, "decode_schedule=1:attn=opencl,ffn=opencl,output=opencl;3:attn=qnn-npu,ffn=qnn-npu,output=qnn-npu;5:attn=cpu,ffn=cpu,output=cpu;7:attn=opencl,ffn=opencl,output=opencl"));
-    t.assert_true(
-            "QNN -> OpenCL should use direct shared KV handoff",
-            contains(run_logs, "completed direct shared QNN/OpenCL KV handoff"));
-    t.assert_true(
-            "OpenCL -> QNN should prepare direct generic KV import",
-            contains(run_logs, "prepared direct generic KV import"));
-    t.assert_true(
-            "OpenCL -> QNN should use direct generic KV import",
-            contains(run_logs, "using direct generic KV import"));
-    t.assert_true(
-            "QNN -> CPU should reuse QNN-written live generic KV",
-            contains(run_logs, "reusing QNN-written live generic KV directly"));
-    t.assert_true(
-            "CPU -> OpenCL should use UMA KV handoff",
-            contains(run_logs, "completed CPU/OpenCL UMA KV handoff"));
+            contains(result.logs, "decode_schedule=1:attn=opencl,ffn=opencl,output=opencl;3:attn=qnn-npu,ffn=qnn-npu,output=qnn-npu;5:attn=cpu,ffn=cpu,output=cpu;7:attn=opencl,ffn=opencl,output=opencl"));
+    if (assert_fast_path_logs) {
+        t.assert_true(
+                "QNN -> OpenCL should use direct shared KV handoff",
+                contains(result.logs, "completed direct shared QNN/OpenCL KV handoff"));
+        t.assert_true(
+                "OpenCL -> QNN should prepare direct generic KV import",
+                contains(result.logs, "prepared direct generic KV import"));
+        t.assert_true(
+                "OpenCL -> QNN should use direct generic KV import",
+                contains(result.logs, "using direct generic KV import"));
+        t.assert_true(
+                "QNN -> CPU should reuse QNN-written live generic KV",
+                contains(result.logs, "reusing QNN-written live generic KV directly"));
+        t.assert_true(
+                "CPU -> OpenCL should use UMA KV handoff",
+                contains(result.logs, "completed CPU/OpenCL UMA KV handoff"));
+    }
     t.assert_true(
             "four route transitions should be traced",
-            count_occurrences(run_logs, "TRANSITION_TRACE") >= 4);
+            count_occurrences(result.logs, "TRANSITION_TRACE") >= 4);
     t.assert_true(
             "all traced transitions should report success",
-            count_occurrences(run_logs, "success=1") >= 4);
+            count_occurrences(result.logs, "success=1") >= 4);
     t.assert_true(
             "fast multihop route should not refuse QNN switching",
-            !contains(run_logs, "refusing non-QNN -> qnn decode switch"));
-    t.assert_true(
-            "fast multihop route should not queue prefix replay",
-            !contains(run_logs, "queued QNN prefix replay"));
-    t.assert_true(
-            "fast multihop route should not rebuild from state",
-            !contains(run_logs, "rebuild_dynamic_consumer_kv_from_state"));
+            !contains(result.logs, "refusing non-QNN -> qnn decode switch"));
+    if (assert_fast_path_logs) {
+        t.assert_true(
+                "fast multihop route should not queue prefix replay",
+                !contains(result.logs, "queued QNN prefix replay"));
+        t.assert_true(
+                "fast multihop route should not rebuild from state",
+                !contains(result.logs, "rebuild_dynamic_consumer_kv_from_state"));
+    }
     t.assert_true(
             "fast multihop route should not fall back",
-            !contains(run_logs, "fallback=1"));
+            !contains(result.logs, "fallback=1"));
     t.assert_true(
             "fast multihop route should not hit unmatched QNN AoT graphs",
-            !contains(run_logs, "unmatched cgraph"));
+            !contains(result.logs, "unmatched cgraph"));
+    t.assert_true(
+            "fast multihop route should not hit CPU_REPACK weight readback abort",
+            !contains(result.logs, "CPU_REPACK does not implement get_tensor"));
     t.assert_true(
             "fast multihop route should not crash",
-            !contains(run_logs, "SIGSEGV") && !contains(run_logs, "Segmentation fault"));
+            !contains(result.logs, "SIGSEGV") && !contains(result.logs, "Segmentation fault"));
     t.assert_true(
             "final scheduled route should be OpenCL",
-            contains(route_after, "opencl") && !contains(route_after, "qnn") && !contains(route_after, "cpu"));
+            contains(result.final_route, "opencl") && !contains(result.final_route, "qnn") && !contains(result.final_route, "cpu"));
 
     llama_free(ctx);
     llama_model_free(model);
+    return result;
+}
+
+static void assert_semantic_alignment(testing & t, const route_run_result & fast, const route_run_result & reference) {
+    if (!t.assert_true("fast multihop run should complete", fast.ok) ||
+        !t.assert_true("reference multihop run should complete", reference.ok)) {
+        return;
+    }
+
+    if (!t.assert_equal("fast/reference runs should produce the same number of logits snapshots",
+                reference.snapshots.size(), fast.snapshots.size())) {
+        return;
+    }
+
+    for (size_t i = 0; i < fast.snapshots.size(); ++i) {
+        const auto & fast_top = fast.snapshots[i].top;
+        const auto & ref_top = reference.snapshots[i].top;
+        if (!t.assert_true("fast logits snapshot should contain top candidates", !fast_top.empty()) ||
+            !t.assert_true("reference logits snapshot should contain top candidates", !ref_top.empty())) {
+            return;
+        }
+
+        const int ref_top1_rank_in_fast = rank_of_token(fast_top, ref_top[0].token, 64);
+        const int fast_top1_rank_in_ref = rank_of_token(ref_top, fast_top[0].token, 64);
+        const int overlap16 = top_overlap(fast_top, ref_top, 16);
+        std::fprintf(stderr,
+                "semantic alignment decode_step=%zu fast_top1=%d ref_top1=%d "
+                "ref_top1_rank_in_fast=%d fast_top1_rank_in_ref=%d top16_overlap=%d\n",
+                i + 1,
+                fast_top[0].token,
+                ref_top[0].token,
+                ref_top1_rank_in_fast,
+                fast_top1_rank_in_ref,
+                overlap16);
+
+        t.assert_true("reference top-1 token should remain in fast-path top-64 candidates",
+                ref_top1_rank_in_fast >= 0);
+        t.assert_true("fast-path top-1 token should remain in reference top-64 candidates",
+                fast_top1_rank_in_ref >= 0);
+        t.assert_true("fast/reference top-16 candidate sets should overlap",
+                overlap16 >= 1);
+    }
 }
 
 int main(int argc, char ** argv) {
@@ -270,7 +405,28 @@ int main(int argc, char ** argv) {
 
     testing t;
     t.test("qnn prefill dynamic decode supports opencl qnn cpu opencl multihop", [&](testing & t) {
-        run_qnn_prefill_multihop_case(t, logs, model_path);
+        run_qnn_prefill_multihop_case(
+                t,
+                logs,
+                model_path,
+                /* fast_kv_paths = */ true,
+                /* assert_fast_path_logs = */ true);
+    });
+
+    t.test("fast multihop logits stay aligned with conservative migration", [&](testing & t) {
+        const route_run_result fast = run_qnn_prefill_multihop_case(
+                t,
+                logs,
+                model_path,
+                /* fast_kv_paths = */ true,
+                /* assert_fast_path_logs = */ true);
+        const route_run_result reference = run_qnn_prefill_multihop_case(
+                t,
+                logs,
+                model_path,
+                /* fast_kv_paths = */ false,
+                /* assert_fast_path_logs = */ false);
+        assert_semantic_alignment(t, fast, reference);
     });
 
     llama_log_set(logs.previous_callback, logs.previous_user_data);
