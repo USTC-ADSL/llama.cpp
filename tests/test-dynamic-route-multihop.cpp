@@ -198,6 +198,45 @@ static int count_occurrences(const std::string & haystack, const char * needle) 
     return count;
 }
 
+static std::string transition_trace_line(
+        const std::string & logs,
+        int decode_token_index,
+        int switch_after_tokens) {
+    const std::string token_marker = "decode_token_index=" + std::to_string(decode_token_index);
+    const std::string boundary_marker = "switch_after_tokens=" + std::to_string(switch_after_tokens);
+    size_t pos = 0;
+    while ((pos = logs.find("TRANSITION_TRACE", pos)) != std::string::npos) {
+        const size_t end = logs.find('\n', pos);
+        const std::string line = logs.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+        if (contains(line, token_marker.c_str()) && contains(line, boundary_marker.c_str())) {
+            return line;
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        pos = end + 1;
+    }
+    return {};
+}
+
+static void assert_fast_transition_trace(
+        testing & t,
+        const std::string & logs,
+        int decode_token_index,
+        int switch_after_tokens) {
+    const std::string line = transition_trace_line(logs, decode_token_index, switch_after_tokens);
+    const std::string label = "decode token " + std::to_string(decode_token_index) +
+        " switch_after " + std::to_string(switch_after_tokens);
+    if (!t.assert_true(label + " transition trace should exist", !line.empty())) {
+        return;
+    }
+
+    t.assert_true(label + " transition trace should report success", contains(line, "success=1"));
+    t.assert_true(label + " transition trace should not fall back", contains(line, "fallback=0"));
+    t.assert_true(label + " transition trace should report ok support status", contains(line, "support_status=ok"));
+    t.assert_true(label + " transition trace should avoid graph rebuild", contains(line, "graph_rebuild_us=0"));
+}
+
 static bool should_capture_snapshot(const std::vector<int> & snapshot_steps, int decode_step) {
     return std::find(snapshot_steps.begin(), snapshot_steps.end(), decode_step) != snapshot_steps.end();
 }
@@ -610,6 +649,9 @@ int main(int argc, char ** argv) {
         t.assert_true(
                 "32-token interval schedule should switch at decode token 97",
                 contains(result.logs, "decode_token_index=97 switch_after_tokens=96"));
+        assert_fast_transition_trace(t, result.logs, 33, 32);
+        assert_fast_transition_trace(t, result.logs, 65, 64);
+        assert_fast_transition_trace(t, result.logs, 97, 96);
     });
 
     t.test("fast 32 token interval logits stay aligned with conservative migration", [&](testing & t) {
@@ -660,6 +702,9 @@ int main(int argc, char ** argv) {
         t.assert_true(
                 "nonuniform interval schedule should switch at decode token 31",
                 contains(fast.logs, "decode_token_index=31 switch_after_tokens=30"));
+        assert_fast_transition_trace(t, fast.logs, 5, 4);
+        assert_fast_transition_trace(t, fast.logs, 14, 13);
+        assert_fast_transition_trace(t, fast.logs, 31, 30);
     });
 
     t.test("fast nonuniform interval logits stay aligned for alternate prompt", [&](testing & t) {
@@ -692,6 +737,9 @@ int main(int argc, char ** argv) {
         t.assert_true(
                 "alternate-prompt nonuniform interval schedule should switch at decode token 31",
                 contains(fast.logs, "decode_token_index=31 switch_after_tokens=30"));
+        assert_fast_transition_trace(t, fast.logs, 5, 4);
+        assert_fast_transition_trace(t, fast.logs, 14, 13);
+        assert_fast_transition_trace(t, fast.logs, 31, 30);
     });
 
     t.test("fast nonuniform interval logits stay aligned after longer qnn prefill", [&](testing & t) {
@@ -728,6 +776,9 @@ int main(int argc, char ** argv) {
         t.assert_true(
                 "longer-prefill nonuniform interval schedule should switch at decode token 31",
                 contains(fast.logs, "decode_token_index=31 switch_after_tokens=30"));
+        assert_fast_transition_trace(t, fast.logs, 5, 4);
+        assert_fast_transition_trace(t, fast.logs, 14, 13);
+        assert_fast_transition_trace(t, fast.logs, 31, 30);
     });
 
     llama_log_set(logs.previous_callback, logs.previous_user_data);
