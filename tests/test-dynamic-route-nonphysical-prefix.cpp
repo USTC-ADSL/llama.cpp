@@ -18,6 +18,7 @@ struct captured_logs {
 enum class invalid_kv_shape {
     REMOVED_FRONT_TOKEN,
     SHARED_SEQ_CELL,
+    SHIFTED_FRONT_TOKEN,
 };
 
 struct route_case {
@@ -152,6 +153,11 @@ static void make_live_kv_nonphysical_prefix(testing & t, llama_memory_t mem, inv
             t.assert_equal("seq1 should only share position zero", (llama_pos) 0, llama_memory_seq_pos_max(mem, 1));
             return;
         }
+        case invalid_kv_shape::SHIFTED_FRONT_TOKEN: {
+            llama_memory_seq_add(mem, 0, 0, 1, 1);
+            t.assert_equal("seq0 should now start after the shifted position zero", (llama_pos) 1, llama_memory_seq_pos_min(mem, 0));
+            return;
+        }
     }
 }
 
@@ -250,6 +256,15 @@ static void run_nonphysical_prefix_refusal_case(
             "QNN prefix replay must not be queued after the guard rejects the switch",
             !contains(second_decode_logs, "queued QNN prefix replay"));
     t.assert_true(
+            "QNN AoT must not see an unmatched graph after the guard rejects the switch",
+            !contains(second_decode_logs, "unmatched cgraph"));
+    t.assert_true(
+            "K-shift maintenance must not fail after the guard rejects the switch",
+            !contains(second_decode_logs, "failed to compute K-shift"));
+    t.assert_true(
+            "the refused switch must not crash",
+            !contains(second_decode_logs, "SIGSEGV") && !contains(second_decode_logs, "Segmentation fault"));
+    t.assert_true(
             "route should remain on the producer backend after the refused switch",
             contains(route_after_refusal, route.producer_backend) && !contains(route_after_refusal, "qnn"));
 
@@ -304,6 +319,24 @@ int main(int argc, char ** argv) {
             /*.n_gpu_layers =*/ 0,
             /*.kv_unified =*/ true,
             /*.shape =*/ invalid_kv_shape::SHARED_SEQ_CELL,
+        });
+    });
+
+    t.test("cpu to qnn switch is refused when live seq0 memory has a pending shift", [&](testing & t) {
+        run_nonphysical_prefix_refusal_case(t, logs, model_path, {
+            /*.producer_backend =*/ "cpu",
+            /*.n_gpu_layers =*/ 0,
+            /*.kv_unified =*/ false,
+            /*.shape =*/ invalid_kv_shape::SHIFTED_FRONT_TOKEN,
+        });
+    });
+
+    t.test("opencl to qnn switch is refused when live seq0 memory has a pending shift", [&](testing & t) {
+        run_nonphysical_prefix_refusal_case(t, logs, model_path, {
+            /*.producer_backend =*/ "opencl",
+            /*.n_gpu_layers =*/ -1,
+            /*.kv_unified =*/ false,
+            /*.shape =*/ invalid_kv_shape::SHIFTED_FRONT_TOKEN,
         });
     });
 

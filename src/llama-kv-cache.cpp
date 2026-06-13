@@ -18,11 +18,33 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 //
 // llama_kv_cache
 //
+
+struct llama_scoped_env_override {
+    const char * name;
+    bool had_previous;
+    std::string previous;
+
+    llama_scoped_env_override(const char * name, const char * value) :
+        name(name),
+        had_previous(std::getenv(name) != nullptr),
+        previous(had_previous ? std::getenv(name) : "") {
+        setenv(name, value, 1);
+    }
+
+    ~llama_scoped_env_override() {
+        if (had_previous) {
+            setenv(name, previous.c_str(), 1);
+        } else {
+            unsetenv(name);
+        }
+    }
+};
 
 llama_hetero_route_spec llama_kv_cache_dynamic_decode_route_for_initial_placement(
         const char * explicit_decode_route,
@@ -1051,6 +1073,10 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
         // apply K-shift if needed
         if (hparams.rope_type != LLAMA_ROPE_TYPE_NONE) {
+            // K-shift is a KV maintenance graph, not an AoT decode graph. Do not
+            // let QNN AoT claim cache_k/cache_v stage-looking tensors here.
+            llama_scoped_env_override disable_qnn_backend("GGML_QNN_DISABLE_BACKEND", "1");
+
             ggml_backend_sched_reset(sched);
 
             auto * res = lctx->get_gf_res_reserve();
