@@ -240,11 +240,12 @@ static multihop_case_config interval32_multihop_config() {
     };
 }
 
-static multihop_case_config nonuniform_multihop_config() {
+static multihop_case_config nonuniform_multihop_config(
+        const std::string & prompt = "Mira fixed the bridge before sunrise and checked every cable.") {
     return {
         /*.schedule =*/ "1:cpu;5:opencl;14:qnn-npu;31:cpu",
         /*.expected_schedule_log =*/ "decode_schedule=1:attn=cpu,ffn=cpu,output=cpu;5:attn=opencl,ffn=opencl,output=opencl;14:attn=qnn-npu,ffn=qnn-npu,output=qnn-npu;31:attn=cpu,ffn=cpu,output=cpu",
-        /*.prompt =*/ "Mira fixed the bridge before sunrise and checked every cable.",
+        /*.prompt =*/ prompt,
         /*.n_ctx =*/ 160,
         /*.decode_tokens =*/ 34,
         /*.expected_final_backend =*/ "cpu",
@@ -651,6 +652,38 @@ int main(int argc, char ** argv) {
                 contains(fast.logs, "decode_token_index=14 switch_after_tokens=13"));
         t.assert_true(
                 "nonuniform interval schedule should switch at decode token 31",
+                contains(fast.logs, "decode_token_index=31 switch_after_tokens=30"));
+    });
+
+    t.test("fast nonuniform interval logits stay aligned for alternate prompt", [&](testing & t) {
+        const multihop_case_config config = nonuniform_multihop_config(
+                "Nora logged the sensor readings before sunset and verified every checksum.");
+        const route_run_result fast = run_qnn_prefill_multihop_case(
+                t,
+                logs,
+                model_path,
+                config,
+                /* fast_kv_paths = */ true,
+                /* assert_fast_path_logs = */ true);
+        const route_run_result reference = run_qnn_prefill_multihop_case(
+                t,
+                logs,
+                model_path,
+                config,
+                /* fast_kv_paths = */ false,
+                /* assert_fast_path_logs = */ false);
+        assert_semantic_candidate_overlap(t, fast, reference);
+        if (!t.assert_true("alternate-prompt nonuniform interval fast run should complete", fast.ok)) {
+            return;
+        }
+        t.assert_true(
+                "alternate-prompt nonuniform interval schedule should switch at decode token 5",
+                contains(fast.logs, "decode_token_index=5 switch_after_tokens=4"));
+        t.assert_true(
+                "alternate-prompt nonuniform interval schedule should switch at decode token 14",
+                contains(fast.logs, "decode_token_index=14 switch_after_tokens=13"));
+        t.assert_true(
+                "alternate-prompt nonuniform interval schedule should switch at decode token 31",
                 contains(fast.logs, "decode_token_index=31 switch_after_tokens=30"));
     });
 
