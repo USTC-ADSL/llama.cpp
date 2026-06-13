@@ -159,5 +159,61 @@ int main() {
         unsetenv("GGML_HETERO_DYNAMIC_MODE");
     });
 
+    t.test("decode route schedule supports nonuniform token intervals", [](testing & t) {
+        setenv("GGML_HETERO_DYNAMIC_MODE", "phase", 1);
+        setenv("GGML_HETERO_DYNAMIC_DECODE_SCHEDULE", "1:cpu;5:opencl;14:qnn-npu;31:cpu", 1);
+
+        const llama_dynamic_route_runtime_config config = llama_dynamic_route_config_from_env();
+        const llama_hetero_execution_plan cpu_plan = llama_hetero_build_execution_plan("cpu", nullptr);
+        const llama_hetero_execution_plan opencl_plan = llama_hetero_build_execution_plan("opencl", nullptr);
+        const llama_hetero_execution_plan qnn_plan = llama_hetero_build_execution_plan("qnn-npu", nullptr);
+
+        llama_dynamic_route_decision token_4 = llama_dynamic_route_decide(
+                config,
+                decode_request(4, cpu_plan, cpu_plan));
+        t.assert_true("token 4 stays on CPU", !token_4.should_apply);
+        t.assert_true("token 4 uses schedule", token_4.decode_schedule_active);
+        t.assert_equal("token 4 schedule start", uint64_t(1), token_4.decode_schedule_start_token);
+        t.assert_equal("token 4 route", std::string("cpu"), route_string(token_4));
+
+        llama_dynamic_route_decision token_5 = llama_dynamic_route_decide(
+                config,
+                decode_request(5, cpu_plan, cpu_plan));
+        t.assert_true("token 5 switches to OpenCL", token_5.should_apply);
+        t.assert_equal("token 5 route", std::string("opencl"), route_string(token_5));
+        t.assert_equal("token 5 switch boundary", uint64_t(4), token_5.decode_schedule_switch_after);
+
+        llama_dynamic_route_decision token_13 = llama_dynamic_route_decide(
+                config,
+                decode_request(13, opencl_plan, cpu_plan));
+        t.assert_true("token 13 stays on OpenCL", !token_13.should_apply);
+        t.assert_equal("token 13 schedule start", uint64_t(5), token_13.decode_schedule_start_token);
+        t.assert_equal("token 13 route", std::string("opencl"), route_string(token_13));
+
+        llama_dynamic_route_decision token_14 = llama_dynamic_route_decide(
+                config,
+                decode_request(14, opencl_plan, cpu_plan));
+        t.assert_true("token 14 switches to QNN", token_14.should_apply);
+        t.assert_equal("token 14 route", std::string("qnn-npu"), route_string(token_14));
+        t.assert_equal("token 14 switch boundary", uint64_t(13), token_14.decode_schedule_switch_after);
+
+        llama_dynamic_route_decision token_30 = llama_dynamic_route_decide(
+                config,
+                decode_request(30, qnn_plan, cpu_plan));
+        t.assert_true("token 30 stays on QNN", !token_30.should_apply);
+        t.assert_equal("token 30 schedule start", uint64_t(14), token_30.decode_schedule_start_token);
+        t.assert_equal("token 30 route", std::string("qnn-npu"), route_string(token_30));
+
+        llama_dynamic_route_decision token_31 = llama_dynamic_route_decide(
+                config,
+                decode_request(31, qnn_plan, cpu_plan));
+        t.assert_true("token 31 switches back to CPU", token_31.should_apply);
+        t.assert_equal("token 31 route", std::string("cpu"), route_string(token_31));
+        t.assert_equal("token 31 switch boundary", uint64_t(30), token_31.decode_schedule_switch_after);
+
+        unsetenv("GGML_HETERO_DYNAMIC_DECODE_SCHEDULE");
+        unsetenv("GGML_HETERO_DYNAMIC_MODE");
+    });
+
     return t.summary();
 }
