@@ -93,6 +93,10 @@ bool llama_context_should_try_cpu_opencl_uma_kv_handoff(
         bool                disabled,
         bool                allow_opencl_to_cpu);
 
+llama_hetero_route_spec llama_kv_cache_dynamic_decode_route_for_initial_placement(
+        const char * explicit_decode_route,
+        const char * decode_schedule);
+
 bool llama_context_should_apply_qnn_workpoint_switch(
         const llama_hetero_route_spec & current_route,
         const llama_hetero_route_spec & target_route,
@@ -762,6 +766,31 @@ int main() {
                         1,
                         /* disabled = */ true,
                         /* allow_opencl_to_cpu = */ true));
+    });
+
+    t.test("kv placement can use the first decode schedule route as initial decode consumer", [](testing & t) {
+        const auto from_schedule =
+            llama_kv_cache_dynamic_decode_route_for_initial_placement(nullptr, "1:cpu;33:opencl;65:qnn-npu");
+
+        t.assert_equal(
+                "schedule starting at token 1 should provide the initial decode consumer",
+                std::string("cpu"),
+                llama_hetero_phase_backend_for_route(from_schedule));
+
+        const auto explicit_decode =
+            llama_kv_cache_dynamic_decode_route_for_initial_placement("opencl", "1:cpu;33:qnn-npu");
+
+        t.assert_equal(
+                "explicit decode route should keep priority over schedule-derived placement",
+                std::string("opencl"),
+                llama_hetero_phase_backend_for_route(explicit_decode));
+
+        const auto delayed_schedule =
+            llama_kv_cache_dynamic_decode_route_for_initial_placement(nullptr, "33:opencl;65:qnn-npu");
+
+        t.assert_true(
+                "a schedule that does not start at token 1 should not invent an initial decode consumer",
+                !delayed_schedule.has_any_route());
     });
 
     return t.summary();

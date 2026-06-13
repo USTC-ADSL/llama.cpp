@@ -348,6 +348,10 @@ int64_t estimate_plan_latency_us(
 
 } // namespace
 
+std::vector<llama_dynamic_decode_schedule_entry> llama_dynamic_route_parse_decode_schedule(const char * value) {
+    return parse_decode_schedule(value);
+}
+
 const char * llama_dynamic_route_mode_name(llama_dynamic_route_mode mode) {
     switch (mode) {
         case llama_dynamic_route_mode::DISABLED:

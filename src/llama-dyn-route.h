@@ -95,6 +95,8 @@ bool llama_dynamic_route_build_runtime_config(
 
 llama_dynamic_route_runtime_config llama_dynamic_route_config_from_env();
 
+std::vector<llama_dynamic_decode_schedule_entry> llama_dynamic_route_parse_decode_schedule(const char * value);
+
 bool llama_dynamic_route_uses_qnn(const llama_hetero_execution_plan & plan);
 bool llama_dynamic_route_uses_opencl(const llama_hetero_execution_plan & plan);
 

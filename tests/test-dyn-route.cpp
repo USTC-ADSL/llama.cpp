@@ -111,6 +111,16 @@ int main() {
         unsetenv("GGML_HETERO_DYNAMIC_MODE");
     });
 
+    t.test("decode route schedule parser is reusable outside env config", [](testing & t) {
+        const auto schedule = llama_dynamic_route_parse_decode_schedule("1:cpu;33:opencl;65:qnn-npu");
+
+        t.assert_equal("schedule entries", size_t(3), schedule.size());
+        t.assert_equal("first start", uint64_t(1), schedule[0].start_token);
+        t.assert_equal("first route", std::string("cpu"), llama_hetero_phase_backend_for_route(schedule[0].route.plan.route));
+        t.assert_equal("second route", std::string("opencl"), llama_hetero_phase_backend_for_route(schedule[1].route.plan.route));
+        t.assert_equal("third route", std::string("qnn-npu"), llama_hetero_phase_backend_for_route(schedule[2].route.plan.route));
+    });
+
     t.test("decode route schedule can switch cpu to qnn and back to cpu", [](testing & t) {
         setenv("GGML_HETERO_DYNAMIC_MODE", "phase", 1);
         setenv("GGML_HETERO_DYNAMIC_DECODE_SCHEDULE", "1:cpu;33:qnn-npu;65:cpu", 1);

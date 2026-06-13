@@ -5,6 +5,7 @@
 #include "llama-model.h"
 #include "llama-context.h"
 #include "llama-hetero-route.h"
+#include "llama-dyn-route.h"
 
 #include <algorithm>
 #include <cassert>
@@ -22,6 +23,10 @@
 //
 // llama_kv_cache
 //
+
+llama_hetero_route_spec llama_kv_cache_dynamic_decode_route_for_initial_placement(
+        const char * explicit_decode_route,
+        const char * decode_schedule);
 
 std::vector<std::pair<size_t, size_t>> llama_kv_cache_plan_token_prefix_sync_ranges(
         size_t   tensor_offset,
@@ -78,6 +83,22 @@ std::vector<std::pair<size_t, size_t>> llama_kv_cache_plan_token_prefix_sync_ran
     }
 
     return merged;
+}
+
+llama_hetero_route_spec llama_kv_cache_dynamic_decode_route_for_initial_placement(
+        const char * explicit_decode_route,
+        const char * decode_schedule) {
+    llama_hetero_route_spec route = llama_hetero_parse_route_spec(explicit_decode_route);
+    if (route.has_any_route()) {
+        return route;
+    }
+
+    const auto schedule = llama_dynamic_route_parse_decode_schedule(decode_schedule);
+    if (!schedule.empty() && schedule.front().start_token == 1) {
+        return schedule.front().route.plan.route;
+    }
+
+    return {};
 }
 
 llama_kv_cache::llama_kv_cache(
@@ -280,8 +301,14 @@ llama_kv_cache::llama_kv_cache(
     const auto & hetero_route = model.get_hetero_plan().route;
     const llama_hetero_route_spec dynamic_prefill_route =
         llama_hetero_parse_route_spec(std::getenv("GGML_HETERO_DYNAMIC_PREFILL_ROUTE"));
+    const char * dynamic_decode_schedule_env = std::getenv("GGML_HETERO_DYNAMIC_DECODE_SCHEDULE");
+    if (dynamic_decode_schedule_env == nullptr || dynamic_decode_schedule_env[0] == '\0') {
+        dynamic_decode_schedule_env = std::getenv("GGML_HETERO_DECODE_ROUTE_SCHEDULE");
+    }
     const llama_hetero_route_spec dynamic_decode_route =
-        llama_hetero_parse_route_spec(std::getenv("GGML_HETERO_DYNAMIC_DECODE_ROUTE"));
+        llama_kv_cache_dynamic_decode_route_for_initial_placement(
+                std::getenv("GGML_HETERO_DYNAMIC_DECODE_ROUTE"),
+                dynamic_decode_schedule_env);
     const std::string dynamic_prefill_consumer_backend = route_attn_consumer_backend(dynamic_prefill_route);
     const std::string dynamic_decode_consumer_backend  = route_attn_consumer_backend(dynamic_decode_route);
     const bool dynamic_phase_switch_active =
