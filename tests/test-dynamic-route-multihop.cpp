@@ -396,6 +396,26 @@ static multihop_case_config opencl_cpu_direct_multihop_config() {
     };
 }
 
+static multihop_case_config repeated_qnn_reentry_multihop_config() {
+    return {
+        /*.schedule =*/ "1:opencl;5:qnn-npu;9:opencl;13:qnn-npu;17:cpu",
+        /*.expected_schedule_log =*/ "decode_schedule=1:attn=opencl,ffn=opencl,output=opencl;5:attn=qnn-npu,ffn=qnn-npu,output=qnn-npu;9:attn=opencl,ffn=opencl,output=opencl;13:attn=qnn-npu,ffn=qnn-npu,output=qnn-npu;17:attn=cpu,ffn=cpu,output=cpu",
+        /*.prompt =*/ "Mira fixed the bridge before sunrise and checked every cable.",
+        /*.n_ctx =*/ 160,
+        /*.min_prompt_tokens =*/ 8,
+        /*.decode_tokens =*/ 20,
+        /*.expected_final_backend =*/ "cpu",
+        /*.min_transition_count =*/ 5,
+        /*.snapshot_steps =*/ { 1, 4, 5, 8, 9, 12, 13, 16, 17, 20 },
+        /*.fast_log_expectations =*/ {
+            { "completed direct shared QNN/OpenCL KV handoff", 2 },
+            { "prepared direct generic KV import", 2 },
+            { "using direct generic KV import", 2 },
+            { "reusing QNN-written live generic KV directly", 1 },
+        },
+    };
+}
+
 static std::vector<top_logit> top_k_logits(const float * logits, int32_t n_vocab, size_t k) {
     if (logits == nullptr || n_vocab <= 0 || k == 0) {
         return {};
@@ -913,6 +933,47 @@ int main(int argc, char ** argv) {
         assert_fast_transition_trace(t, fast.logs, 9, 8);
         assert_fast_transition_trace(t, fast.logs, 17, 16);
         assert_fast_transition_total_blocking_under_us(t, fast.logs, 9, 8, fast_transition_total_blocking_limit_us);
+        assert_fast_transition_total_blocking_under_us(t, fast.logs, 17, 16, fast_transition_total_blocking_limit_us);
+    });
+
+    t.test("fast repeated qnn reentry logits stay aligned after first qnn switch", [&](testing & t) {
+        const multihop_case_config config = repeated_qnn_reentry_multihop_config();
+        const route_run_result fast = run_qnn_prefill_multihop_case(
+                t,
+                logs,
+                model_path,
+                config,
+                /* fast_kv_paths = */ true,
+                /* assert_fast_path_logs = */ true);
+        const route_run_result reference = run_qnn_prefill_multihop_case(
+                t,
+                logs,
+                model_path,
+                config,
+                /* fast_kv_paths = */ false,
+                /* assert_fast_path_logs = */ false);
+        assert_semantic_candidate_overlap(t, fast, reference);
+        if (!t.assert_true("repeated QNN re-entry fast run should complete", fast.ok)) {
+            return;
+        }
+        t.assert_true(
+                "repeated QNN re-entry schedule should first switch into QNN at decode token 5",
+                contains(fast.logs, "decode_token_index=5 switch_after_tokens=4"));
+        t.assert_true(
+                "repeated QNN re-entry schedule should switch back to OpenCL at decode token 9",
+                contains(fast.logs, "decode_token_index=9 switch_after_tokens=8"));
+        t.assert_true(
+                "repeated QNN re-entry schedule should switch into QNN again at decode token 13",
+                contains(fast.logs, "decode_token_index=13 switch_after_tokens=12"));
+        t.assert_true(
+                "repeated QNN re-entry schedule should switch to CPU at decode token 17",
+                contains(fast.logs, "decode_token_index=17 switch_after_tokens=16"));
+        assert_fast_transition_trace(t, fast.logs, 5, 4);
+        assert_fast_transition_trace(t, fast.logs, 9, 8);
+        assert_fast_transition_trace(t, fast.logs, 13, 12);
+        assert_fast_transition_trace(t, fast.logs, 17, 16);
+        assert_fast_transition_total_blocking_under_us(t, fast.logs, 13, 12, fast_transition_total_blocking_limit_us);
+        assert_fast_transition_zero_kv_handoff(t, fast.logs, 17, 16);
         assert_fast_transition_total_blocking_under_us(t, fast.logs, 17, 16, fast_transition_total_blocking_limit_us);
     });
 
