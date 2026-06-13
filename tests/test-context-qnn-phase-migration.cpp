@@ -24,6 +24,12 @@ bool llama_context_should_sync_opencl_before_qnn_direct_import(
         uint32_t            n_tokens,
         bool                generic_kv_enabled);
 
+llama_opencl_external_host_sync_scope llama_context_opencl_sync_scope_for_qnn_direct_import(
+        const std::string & current_attn_backend,
+        const std::string & target_attn_backend,
+        uint32_t            n_tokens,
+        bool                generic_kv_enabled);
+
 bool llama_context_should_use_qnn_written_generic_kv_for_cpu(
         const std::string & current_attn_backend,
         const std::string & target_attn_backend,
@@ -367,6 +373,25 @@ int main() {
         t.assert_true(
                 "prefill-sized batches should not trigger QNN direct import sync",
                 !llama_context_should_sync_opencl_before_qnn_direct_import("opencl", "qnn-npu", 8, true));
+    });
+
+    t.test("opencl to qnn direct generic kv import syncs only the active prefix", [](testing & t) {
+        t.assert_true(
+                "OpenCL->QNN direct import should sync only the active generic KV prefix that QNN will import",
+                llama_context_opencl_sync_scope_for_qnn_direct_import("opencl", "qnn-npu", 1, true) ==
+                    llama_opencl_external_host_sync_scope::ACTIVE_KV_PREFIX);
+        t.assert_true(
+                "CPU->QNN direct import does not need an OpenCL producer sync scope",
+                llama_context_opencl_sync_scope_for_qnn_direct_import("cpu", "qnn-npu", 1, true) ==
+                    llama_opencl_external_host_sync_scope::FULL_BUFFER);
+        t.assert_true(
+                "OpenCL->QNN full-buffer scope remains the compatibility default without generic KV import",
+                llama_context_opencl_sync_scope_for_qnn_direct_import("opencl", "qnn-npu", 1, false) ==
+                    llama_opencl_external_host_sync_scope::FULL_BUFFER);
+        t.assert_true(
+                "prefill-sized OpenCL->QNN batches should keep the full-buffer compatibility default",
+                llama_context_opencl_sync_scope_for_qnn_direct_import("opencl", "qnn-npu", 8, true) ==
+                    llama_opencl_external_host_sync_scope::FULL_BUFFER);
     });
 
     t.test("qnn state migration is disabled without generic kv materialization", [](testing & t) {

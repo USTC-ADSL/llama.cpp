@@ -65,6 +65,12 @@ bool llama_context_should_sync_opencl_before_qnn_direct_import(
         uint32_t            n_tokens,
         bool                generic_kv_enabled);
 
+llama_opencl_external_host_sync_scope llama_context_opencl_sync_scope_for_qnn_direct_import(
+        const std::string & current_attn_backend,
+        const std::string & target_attn_backend,
+        uint32_t            n_tokens,
+        bool                generic_kv_enabled);
+
 bool llama_context_should_use_qnn_written_generic_kv_for_cpu(
         const std::string & current_attn_backend,
         const std::string & target_attn_backend,
@@ -221,6 +227,20 @@ bool llama_context_should_sync_opencl_before_qnn_direct_import(
     const std::string current = llama_hetero_canonical_backend(current_attn_backend);
     const std::string target  = llama_hetero_canonical_backend(target_attn_backend);
     return current == "opencl" && llama_hetero_is_qnn_backend(target);
+}
+
+llama_opencl_external_host_sync_scope llama_context_opencl_sync_scope_for_qnn_direct_import(
+        const std::string & current_attn_backend,
+        const std::string & target_attn_backend,
+        uint32_t            n_tokens,
+        bool                generic_kv_enabled) {
+    return llama_context_should_sync_opencl_before_qnn_direct_import(
+                current_attn_backend,
+                target_attn_backend,
+                n_tokens,
+                generic_kv_enabled)
+            ? llama_opencl_external_host_sync_scope::ACTIVE_KV_PREFIX
+            : llama_opencl_external_host_sync_scope::FULL_BUFFER;
 }
 
 bool llama_context_should_use_qnn_written_generic_kv_for_cpu(
@@ -3177,13 +3197,23 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         }
 
         if (prepared && current_attn_backend == "opencl") {
-            prepared = sync_dynamic_cpu_opencl_kv(/* host_to_device = */ false, &opencl_sync_timing);
+            const auto sync_scope = llama_context_opencl_sync_scope_for_qnn_direct_import(
+                    current_attn_backend,
+                    target_attn_backend,
+                    n_tokens,
+                    generic_qnn_kv_enabled);
+            prepared = sync_dynamic_cpu_opencl_kv(
+                    /* host_to_device = */ false,
+                    &opencl_sync_timing,
+                    sync_scope);
             if (!prepared) {
                 LLAMA_LOG_WARN("%s: failed to synchronize OpenCL KV back to host before QNN direct import\n",
                         __func__);
             } else {
-                LLAMA_LOG_INFO("%s: synchronized OpenCL KV back to host before QNN direct import alias_us=%" PRId64 " backend_sync_us=%" PRId64 " transfer_us=%" PRId64 "\n",
+                LLAMA_LOG_INFO("%s: synchronized OpenCL KV back to host before QNN direct import using %zu range(s), total %.2f MiB alias_us=%" PRId64 " backend_sync_us=%" PRId64 " transfer_us=%" PRId64 "\n",
                         __func__,
+                        opencl_sync_timing.synced_ranges,
+                        opencl_sync_timing.synced_bytes / 1024.0 / 1024.0,
                         opencl_sync_timing.alias_us,
                         opencl_sync_timing.backend_sync_us,
                         opencl_sync_timing.transfer_us);
