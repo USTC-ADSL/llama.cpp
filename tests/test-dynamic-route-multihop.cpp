@@ -335,6 +335,24 @@ static multihop_case_config nonuniform_multihop_config(
     };
 }
 
+static multihop_case_config opencl_cpu_direct_multihop_config() {
+    return {
+        /*.schedule =*/ "1:opencl;9:cpu;17:opencl",
+        /*.expected_schedule_log =*/ "decode_schedule=1:attn=opencl,ffn=opencl,output=opencl;9:attn=cpu,ffn=cpu,output=cpu;17:attn=opencl,ffn=opencl,output=opencl",
+        /*.prompt =*/ "Mira fixed the bridge before sunrise and checked every cable.",
+        /*.n_ctx =*/ 160,
+        /*.min_prompt_tokens =*/ 8,
+        /*.decode_tokens =*/ 20,
+        /*.expected_final_backend =*/ "opencl",
+        /*.min_transition_count =*/ 3,
+        /*.snapshot_steps =*/ { 1, 8, 9, 16, 17, 20 },
+        /*.fast_log_expectations =*/ {
+            { "completed direct shared QNN/OpenCL KV handoff", 1 },
+            { "completed CPU/OpenCL UMA KV handoff", 2 },
+        },
+    };
+}
+
 static std::vector<top_logit> top_k_logits(const float * logits, int32_t n_vocab, size_t k) {
     if (logits == nullptr || n_vocab <= 0 || k == 0) {
         return {};
@@ -813,6 +831,36 @@ int main(int argc, char ** argv) {
         assert_fast_transition_trace(t, fast.logs, 14, 13);
         assert_fast_transition_trace(t, fast.logs, 31, 30);
         assert_fast_transition_zero_kv_handoff(t, fast.logs, 31, 30);
+    });
+
+    t.test("fast direct opencl to cpu logits stay aligned", [&](testing & t) {
+        const multihop_case_config config = opencl_cpu_direct_multihop_config();
+        const route_run_result fast = run_qnn_prefill_multihop_case(
+                t,
+                logs,
+                model_path,
+                config,
+                /* fast_kv_paths = */ true,
+                /* assert_fast_path_logs = */ true);
+        const route_run_result reference = run_qnn_prefill_multihop_case(
+                t,
+                logs,
+                model_path,
+                config,
+                /* fast_kv_paths = */ false,
+                /* assert_fast_path_logs = */ false);
+        assert_semantic_candidate_overlap(t, fast, reference);
+        if (!t.assert_true("direct OpenCL -> CPU fast run should complete", fast.ok)) {
+            return;
+        }
+        t.assert_true(
+                "direct OpenCL -> CPU schedule should switch at decode token 9",
+                contains(fast.logs, "decode_token_index=9 switch_after_tokens=8"));
+        t.assert_true(
+                "direct CPU -> OpenCL schedule should switch back at decode token 17",
+                contains(fast.logs, "decode_token_index=17 switch_after_tokens=16"));
+        assert_fast_transition_trace(t, fast.logs, 9, 8);
+        assert_fast_transition_trace(t, fast.logs, 17, 16);
     });
 
     llama_log_set(logs.previous_callback, logs.previous_user_data);
