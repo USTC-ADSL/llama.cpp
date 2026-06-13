@@ -77,8 +77,10 @@ bool llama_context_should_use_qnn_written_generic_kv_for_cpu(
         uint32_t            n_tokens,
         bool                generic_kv_enabled,
         bool                qnn_writeback_ready,
-        bool                live_kv_cpu_backed,
+        bool                live_kv_cpu_accessible,
         bool                qnn_writeback_flushed);
+
+bool llama_context_kv_buft_is_cpu_accessible(ggml_backend_buffer_type_t buft);
 
 bool llama_context_should_try_qnn_written_generic_kv_for_opencl(
         const std::string & current_attn_backend,
@@ -266,11 +268,11 @@ bool llama_context_should_use_qnn_written_generic_kv_for_cpu(
         uint32_t            n_tokens,
         bool                generic_kv_enabled,
         bool                qnn_writeback_ready,
-        bool                live_kv_cpu_backed,
+        bool                live_kv_cpu_accessible,
         bool                qnn_writeback_flushed) {
     GGML_UNUSED(qnn_writeback_flushed);
 
-    if (!generic_kv_enabled || !qnn_writeback_ready || !live_kv_cpu_backed || n_tokens != 1) {
+    if (!generic_kv_enabled || !qnn_writeback_ready || !live_kv_cpu_accessible || n_tokens != 1) {
         return false;
     }
 
@@ -294,7 +296,20 @@ bool llama_context_should_try_qnn_written_generic_kv_for_opencl(
     return llama_hetero_is_qnn_backend(current) && target == "opencl";
 }
 
-static bool llama_context_live_kv_is_cpu_backed(const llama_memory_i * memory) {
+bool llama_context_kv_buft_is_cpu_accessible(ggml_backend_buffer_type_t buft) {
+    if (buft == nullptr) {
+        return false;
+    }
+
+    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu_dev != nullptr && ggml_backend_dev_supports_buft(cpu_dev, buft)) {
+        return true;
+    }
+
+    return ggml_backend_buft_is_host(buft);
+}
+
+static bool llama_context_live_kv_is_cpu_accessible(const llama_memory_i * memory) {
     if (memory == nullptr) {
         return false;
     }
@@ -304,28 +319,19 @@ static bool llama_context_live_kv_is_cpu_backed(const llama_memory_i * memory) {
         return false;
     }
 
-    ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
-    bool has_cpu_kv = false;
+    bool has_cpu_accessible_kv = false;
     for (const auto & [buft, bytes] : breakdown) {
         if (bytes == 0) {
             continue;
         }
 
-        if (buft == cpu_buft) {
-            has_cpu_kv = true;
-            continue;
+        if (!llama_context_kv_buft_is_cpu_accessible(buft)) {
+            return false;
         }
-
-        const char * buft_name = buft != nullptr ? ggml_backend_buft_name(buft) : nullptr;
-        if (buft_name != nullptr && std::strcmp(buft_name, "CPU") == 0) {
-            has_cpu_kv = true;
-            continue;
-        }
-
-        return false;
+        has_cpu_accessible_kv = true;
     }
 
-    return has_cpu_kv;
+    return has_cpu_accessible_kv;
 }
 
 llama_hetero_kv_contract llama_dynamic_phase_shared_qnn_kv_contract(
@@ -3228,7 +3234,7 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                 n_tokens,
                 generic_qnn_kv_enabled,
                 qnn_generic_kv_writeback_ready,
-                llama_context_live_kv_is_cpu_backed(memory.get()),
+                llama_context_live_kv_is_cpu_accessible(memory.get()),
                 qnn_generic_kv_writeback_flushed)) {
         migrated_qnn_kv = true;
         LLAMA_LOG_INFO("%s: reusing QNN-written live generic KV directly for decode route switch (%s -> %s); state rebuild skipped\n",

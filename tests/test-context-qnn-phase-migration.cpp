@@ -37,8 +37,10 @@ bool llama_context_should_use_qnn_written_generic_kv_for_cpu(
         uint32_t            n_tokens,
         bool                generic_kv_enabled,
         bool                qnn_writeback_ready,
-        bool                live_kv_cpu_backed,
+        bool                live_kv_cpu_accessible,
         bool                qnn_writeback_flushed);
+
+bool llama_context_kv_buft_is_cpu_accessible(ggml_backend_buffer_type_t buft);
 
 bool llama_context_should_try_qnn_written_generic_kv_for_opencl(
         const std::string & current_attn_backend,
@@ -431,16 +433,35 @@ int main() {
                 !llama_context_should_attempt_qnn_phase_kv_migration("qnn-npu", "opencl", 14, true));
     });
 
+    t.test("qnn host kv buffer is cpu accessible", [](testing & t) {
+        t.assert_true(
+                "CPU KV buffer should be CPU accessible",
+                llama_context_kv_buft_is_cpu_accessible(ggml_backend_cpu_buffer_type()));
+
+        ggml_backend_dev_t qnn_dev = ggml_backend_dev_by_name("qnn-npu");
+        t.assert_true("qnn-npu device should be registered for qnn host KV tests", qnn_dev != nullptr);
+
+        ggml_backend_buffer_type_t qnn_host_buft =
+            qnn_dev != nullptr ? ggml_backend_dev_host_buffer_type(qnn_dev) : nullptr;
+        t.assert_true("qnn-npu host buffer type should be available", qnn_host_buft != nullptr);
+
+        if (qnn_host_buft != nullptr) {
+            t.assert_true(
+                    "qnn-npu-host KV buffer should be CPU accessible because the CPU backend supports host bufts",
+                    llama_context_kv_buft_is_cpu_accessible(qnn_host_buft));
+        }
+    });
+
     t.test("qnn to cpu can reuse flushed live generic kv without state rebuild", [](testing & t) {
         t.assert_true(
-                "qnn->cpu can skip state rebuild when QNN generic KV writeback is ready and live KV is CPU-backed",
+                "qnn->cpu can skip state rebuild when QNN generic KV writeback is ready and live KV is CPU-accessible",
                 llama_context_should_use_qnn_written_generic_kv_for_cpu(
                         "qnn-npu",
                         "cpu",
                         1,
                         /* generic_kv_enabled = */ true,
                         /* qnn_writeback_ready = */ true,
-                        /* live_kv_cpu_backed = */ true,
+                        /* live_kv_cpu_accessible = */ true,
                         /* qnn_writeback_flushed = */ false));
 
         t.assert_true(
@@ -451,7 +472,7 @@ int main() {
                         1,
                         /* generic_kv_enabled = */ true,
                         /* qnn_writeback_ready = */ false,
-                        /* live_kv_cpu_backed = */ true,
+                        /* live_kv_cpu_accessible = */ true,
                         /* qnn_writeback_flushed = */ false));
 
         t.assert_true(
@@ -462,18 +483,18 @@ int main() {
                         1,
                         /* generic_kv_enabled = */ true,
                         /* qnn_writeback_ready = */ true,
-                        /* live_kv_cpu_backed = */ false,
+                        /* live_kv_cpu_accessible = */ false,
                         /* qnn_writeback_flushed = */ false));
 
         t.assert_true(
-                "qnn->cpu must not skip state rebuild after QNN generic KV flush when live KV is not CPU-backed",
+                "qnn->cpu must not skip state rebuild after QNN generic KV flush when live KV is not CPU-accessible",
                 !llama_context_should_use_qnn_written_generic_kv_for_cpu(
                         "qnn-npu",
                         "cpu",
                         1,
                         /* generic_kv_enabled = */ true,
                         /* qnn_writeback_ready = */ true,
-                        /* live_kv_cpu_backed = */ false,
+                        /* live_kv_cpu_accessible = */ false,
                         /* qnn_writeback_flushed = */ true));
 
         t.assert_true(
@@ -484,7 +505,7 @@ int main() {
                         1,
                         /* generic_kv_enabled = */ true,
                         /* qnn_writeback_ready = */ true,
-                        /* live_kv_cpu_backed = */ true,
+                        /* live_kv_cpu_accessible = */ true,
                         /* qnn_writeback_flushed = */ true));
     });
 
