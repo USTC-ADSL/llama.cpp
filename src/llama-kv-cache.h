@@ -194,6 +194,7 @@ public:
     uint32_t get_n_stream() const;
 
     bool get_has_shift() const;
+    bool seq_is_physical_prefix(llama_seq_id seq_id, uint32_t * n_tokens = nullptr) const;
 
     //
     // graph_build API

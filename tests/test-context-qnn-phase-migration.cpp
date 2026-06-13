@@ -433,6 +433,66 @@ int main() {
                 !llama_context_should_attempt_qnn_phase_kv_migration("qnn-npu", "opencl", 14, true));
     });
 
+    t.test("kv cells physical prefix predicate rejects non-append-only seq0 states", [](testing & t) {
+        llama_kv_cells cells;
+        cells.resize(8);
+
+        uint32_t n_tokens = 99;
+        t.assert_true("an empty cache is a valid zero-token physical prefix",
+                      cells.seq_is_physical_prefix(0, &n_tokens));
+        t.assert_equal("empty physical prefix should report zero tokens", n_tokens, (uint32_t) 0);
+
+        cells.pos_set(0, 0);
+        cells.seq_add(0, 0);
+        cells.pos_set(1, 1);
+        cells.seq_add(1, 0);
+
+        t.assert_true("seq0 rows [0, 2) with matching positions are a physical prefix",
+                      cells.seq_is_physical_prefix(0, &n_tokens));
+        t.assert_equal("physical prefix should report its token count", n_tokens, (uint32_t) 2);
+
+        cells.pos_set(3, 3);
+        cells.seq_add(3, 0);
+        t.assert_true("a hole in the physical prefix must be rejected",
+                      !cells.seq_is_physical_prefix(0, &n_tokens));
+
+        cells.reset();
+        cells.pos_set(1, 0);
+        cells.seq_add(1, 0);
+        t.assert_true("position zero stored outside physical row zero must be rejected",
+                      !cells.seq_is_physical_prefix(0, &n_tokens));
+
+        cells.reset();
+        cells.pos_set(0, 1);
+        cells.seq_add(0, 0);
+        t.assert_true("a non-zero logical start must be rejected",
+                      !cells.seq_is_physical_prefix(0, &n_tokens));
+
+        cells.reset();
+        cells.pos_set(0, 0);
+        cells.seq_add(0, 0);
+        cells.pos_set(1, 1);
+        cells.seq_add(1, 0);
+        cells.pos_add(1, 1);
+        t.assert_true("pending shifted KV state must be rejected",
+                      !cells.seq_is_physical_prefix(0, &n_tokens));
+
+        cells.reset();
+        cells.pos_set(0, 0);
+        cells.seq_add(0, 0);
+        cells.seq_add(0, 1);
+        t.assert_true("cells shared with another sequence must be rejected",
+                      !cells.seq_is_physical_prefix(0, &n_tokens));
+
+        cells.reset();
+        cells.pos_set(0, 0);
+        cells.seq_add(0, 0);
+        cells.pos_set(1, 1);
+        cells.seq_add(1, 1);
+        t.assert_true("extra used cells from another sequence must be rejected",
+                      !cells.seq_is_physical_prefix(0, &n_tokens));
+    });
+
     t.test("qnn host kv buffer is cpu accessible", [](testing & t) {
         t.assert_true(
                 "CPU KV buffer should be CPU accessible",

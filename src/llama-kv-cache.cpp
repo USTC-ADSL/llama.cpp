@@ -1655,6 +1655,12 @@ bool llama_kv_cache::get_has_shift() const {
     return result;
 }
 
+bool llama_kv_cache::seq_is_physical_prefix(llama_seq_id seq_id, uint32_t * n_tokens) const {
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    return v_cells[seq_to_stream[seq_id]].seq_is_physical_prefix(seq_id, n_tokens);
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 

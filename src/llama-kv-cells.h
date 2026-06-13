@@ -96,6 +96,46 @@ public:
         return has_shift;
     }
 
+    bool seq_is_physical_prefix(llama_seq_id seq_id, uint32_t * n_tokens = nullptr) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        if (n_tokens != nullptr) {
+            *n_tokens = 0;
+        }
+
+        if (seq_pos[seq_id].empty()) {
+            return used.empty();
+        }
+
+        if (has_shift) {
+            return false;
+        }
+
+        const llama_pos min_pos = seq_pos[seq_id].begin()->first;
+        const llama_pos max_pos = seq_pos[seq_id].rbegin()->first;
+        if (min_pos != 0 || max_pos < 0 || max_pos >= (llama_pos) pos.size()) {
+            return false;
+        }
+
+        const uint32_t prefix = (uint32_t) max_pos + 1;
+        if (used.size() != prefix) {
+            return false;
+        }
+
+        for (uint32_t i = 0; i < prefix; ++i) {
+            if (pos[i] != (llama_pos) i || !seq[i].test(seq_id) || seq[i].count() != 1 || shift[i] != 0) {
+                return false;
+            }
+        }
+
+        if (n_tokens != nullptr) {
+            *n_tokens = prefix;
+        }
+
+        return true;
+    }
+
     // move cell isrc to idst (used during defrag)
     //void mv(uint32_t isrc, uint32_t idst) {
     //    assert(isrc < pos.size());

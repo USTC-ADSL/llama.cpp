@@ -1013,13 +1013,64 @@ bool llama_context_write_u64_file(const std::string & path, uint64_t value) {
     return written > 0 && close_rc == 0;
 }
 
-size_t seq0_prefix_tokens_from_memory(const llama_memory_i * memory) {
+bool seq0_prefix_tokens_from_memory(const llama_memory_i * memory, size_t & n_tokens) {
+    n_tokens = 0;
     if (memory == nullptr) {
-        return 0;
+        return true;
     }
 
-    const llama_pos seq0_max = memory->seq_pos_max(0);
-    return seq0_max < 0 ? 0 : static_cast<size_t>(seq0_max) + 1;
+    const auto seq0_prefix_from_cache = [](const llama_kv_cache * kv_cache, size_t & n_tokens) {
+        n_tokens = 0;
+        if (kv_cache == nullptr) {
+            return false;
+        }
+
+        uint32_t cache_tokens = 0;
+        if (!kv_cache->seq_is_physical_prefix(0, &cache_tokens)) {
+            return false;
+        }
+
+        n_tokens = cache_tokens;
+        return true;
+    };
+
+    if (auto * kv_cache = dynamic_cast<const llama_kv_cache *>(memory)) {
+        return seq0_prefix_from_cache(kv_cache, n_tokens);
+    }
+
+    if (auto * kv_cache_iswa = dynamic_cast<const llama_kv_cache_iswa *>(memory)) {
+        size_t base_tokens = 0;
+        size_t swa_tokens = 0;
+        if (!seq0_prefix_from_cache(kv_cache_iswa->get_base(), base_tokens) ||
+            !seq0_prefix_from_cache(kv_cache_iswa->get_swa(), swa_tokens) ||
+            base_tokens != swa_tokens) {
+            return false;
+        }
+
+        n_tokens = base_tokens;
+        return true;
+    }
+
+    if (auto * hybrid_memory = dynamic_cast<const llama_memory_hybrid *>(memory)) {
+        return seq0_prefix_from_cache(hybrid_memory->get_mem_attn(), n_tokens);
+    }
+
+    if (auto * hybrid_iswa_memory = dynamic_cast<const llama_memory_hybrid_iswa *>(memory)) {
+        auto * attn_cache = hybrid_iswa_memory->get_mem_attn();
+        size_t base_tokens = 0;
+        size_t swa_tokens = 0;
+        if (attn_cache == nullptr ||
+            !seq0_prefix_from_cache(attn_cache->get_base(), base_tokens) ||
+            !seq0_prefix_from_cache(attn_cache->get_swa(), swa_tokens) ||
+            base_tokens != swa_tokens) {
+            return false;
+        }
+
+        n_tokens = base_tokens;
+        return true;
+    }
+
+    return memory->seq_pos_max(0) < 0;
 }
 
 bool batch_extract_appendable_seq0_tokens(
@@ -2081,7 +2132,17 @@ void llama_context::validate_dynamic_seq0_token_history() {
         return;
     }
 
-    const size_t prefix_tokens = seq0_prefix_tokens_from_memory(memory.get());
+    size_t prefix_tokens = 0;
+    const bool prefix_valid = seq0_prefix_tokens_from_memory(memory.get(), prefix_tokens);
+    if (!prefix_valid) {
+        if (!dynamic_seq0_token_history.empty()) {
+            LLAMA_LOG_WARN("%s: clearing tracked seq0 token history because memory is not a physical seq0 prefix\n",
+                    __func__);
+        }
+        dynamic_seq0_token_history.clear();
+        return;
+    }
+
     if (prefix_tokens == dynamic_seq0_token_history.size()) {
         return;
     }
@@ -3096,7 +3157,12 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
     bool qnn_generic_kv_writeback_flushed = false;
 
     if (switching_into_qnn_decode) {
-        const size_t prefix_tokens = seq0_prefix_tokens_from_memory(memory.get());
+        size_t prefix_tokens = 0;
+        if (!seq0_prefix_tokens_from_memory(memory.get(), prefix_tokens)) {
+            LLAMA_LOG_WARN("%s: refusing non-QNN -> qnn decode switch because memory is not a physical seq0 prefix\n",
+                    __func__);
+            return;
+        }
         if (prefix_tokens > 0 && dynamic_seq0_token_history.size() != prefix_tokens) {
             LLAMA_LOG_WARN("%s: refusing non-QNN -> qnn decode switch because seq0 token history is unavailable (tracked=%zu, memory=%zu)\n",
                     __func__,
