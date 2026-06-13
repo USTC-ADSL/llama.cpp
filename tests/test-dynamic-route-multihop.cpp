@@ -240,6 +240,25 @@ static multihop_case_config interval32_multihop_config() {
     };
 }
 
+static multihop_case_config nonuniform_multihop_config() {
+    return {
+        /*.schedule =*/ "1:cpu;5:opencl;14:qnn-npu;31:cpu",
+        /*.expected_schedule_log =*/ "decode_schedule=1:attn=cpu,ffn=cpu,output=cpu;5:attn=opencl,ffn=opencl,output=opencl;14:attn=qnn-npu,ffn=qnn-npu,output=qnn-npu;31:attn=cpu,ffn=cpu,output=cpu",
+        /*.prompt =*/ "Mira fixed the bridge before sunrise and checked every cable.",
+        /*.n_ctx =*/ 160,
+        /*.decode_tokens =*/ 34,
+        /*.expected_final_backend =*/ "cpu",
+        /*.min_transition_count =*/ 4,
+        /*.snapshot_steps =*/ { 1, 4, 5, 13, 14, 30, 31, 34 },
+        /*.fast_log_expectations =*/ {
+            { "reusing QNN-written live generic KV directly", 2 },
+            { "completed CPU/OpenCL UMA KV handoff", 1 },
+            { "prepared direct generic KV import", 1 },
+            { "using direct generic KV import", 1 },
+        },
+    };
+}
+
 static std::vector<top_logit> top_k_logits(const float * logits, int32_t n_vocab, size_t k) {
     if (logits == nullptr || n_vocab <= 0 || k == 0) {
         return {};
@@ -464,6 +483,51 @@ static void assert_semantic_alignment(testing & t, const route_run_result & fast
     }
 }
 
+static void assert_semantic_candidate_overlap(testing & t, const route_run_result & fast, const route_run_result & reference) {
+    if (!t.assert_true("fast multihop run should complete", fast.ok) ||
+        !t.assert_true("reference multihop run should complete", reference.ok)) {
+        return;
+    }
+
+    if (!t.assert_equal("fast/reference runs should produce the same number of logits snapshots",
+                reference.snapshots.size(), fast.snapshots.size())) {
+        return;
+    }
+
+    for (size_t i = 0; i < fast.snapshots.size(); ++i) {
+        const auto & fast_top = fast.snapshots[i].top;
+        const auto & ref_top = reference.snapshots[i].top;
+        if (!t.assert_equal("fast/reference snapshots should use the same decode step",
+                    reference.snapshots[i].decode_step, fast.snapshots[i].decode_step)) {
+            return;
+        }
+        if (!t.assert_true("fast logits snapshot should contain top candidates", !fast_top.empty()) ||
+            !t.assert_true("reference logits snapshot should contain top candidates", !ref_top.empty())) {
+            return;
+        }
+
+        const int ref_top1_rank_in_fast = rank_of_token(fast_top, ref_top[0].token, 64);
+        const int fast_top1_rank_in_ref = rank_of_token(ref_top, fast_top[0].token, 64);
+        const int overlap16 = top_overlap(fast_top, ref_top, 16);
+        const int overlap64 = top_overlap(fast_top, ref_top, 64);
+        std::fprintf(stderr,
+                "semantic candidate alignment decode_step=%zu fast_top1=%d ref_top1=%d "
+                "ref_top1_rank_in_fast=%d fast_top1_rank_in_ref=%d top16_overlap=%d top64_overlap=%d\n",
+                static_cast<size_t>(fast.snapshots[i].decode_step),
+                fast_top[0].token,
+                ref_top[0].token,
+                ref_top1_rank_in_fast,
+                fast_top1_rank_in_ref,
+                overlap16,
+                overlap64);
+
+        t.assert_true("fast/reference top-16 candidate sets should overlap",
+                overlap16 >= 1);
+        t.assert_true("fast/reference top-64 candidate sets should retain semantic overlap",
+                overlap64 >= 4);
+    }
+}
+
 int main(int argc, char ** argv) {
     const std::string model_path = get_model_path(argc, argv);
     if (model_path.empty()) {
@@ -557,6 +621,37 @@ int main(int argc, char ** argv) {
                 /* fast_kv_paths = */ false,
                 /* assert_fast_path_logs = */ false);
         assert_semantic_alignment(t, fast, reference);
+    });
+
+    t.test("fast nonuniform interval logits stay aligned with conservative migration", [&](testing & t) {
+        const multihop_case_config config = nonuniform_multihop_config();
+        const route_run_result fast = run_qnn_prefill_multihop_case(
+                t,
+                logs,
+                model_path,
+                config,
+                /* fast_kv_paths = */ true,
+                /* assert_fast_path_logs = */ true);
+        const route_run_result reference = run_qnn_prefill_multihop_case(
+                t,
+                logs,
+                model_path,
+                config,
+                /* fast_kv_paths = */ false,
+                /* assert_fast_path_logs = */ false);
+        assert_semantic_candidate_overlap(t, fast, reference);
+        if (!t.assert_true("nonuniform interval fast run should complete", fast.ok)) {
+            return;
+        }
+        t.assert_true(
+                "nonuniform interval schedule should switch at decode token 5",
+                contains(fast.logs, "decode_token_index=5 switch_after_tokens=4"));
+        t.assert_true(
+                "nonuniform interval schedule should switch at decode token 14",
+                contains(fast.logs, "decode_token_index=14 switch_after_tokens=13"));
+        t.assert_true(
+                "nonuniform interval schedule should switch at decode token 31",
+                contains(fast.logs, "decode_token_index=31 switch_after_tokens=30"));
     });
 
     llama_log_set(logs.previous_callback, logs.previous_user_data);
