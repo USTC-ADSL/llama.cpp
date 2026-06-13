@@ -16,6 +16,7 @@ struct captured_logs {
 };
 
 enum class invalid_kv_shape {
+    MISSING_MIDDLE_TOKEN,
     REMOVED_FRONT_TOKEN,
     SHARED_SEQ_CELL,
     SHIFTED_FRONT_TOKEN,
@@ -140,6 +141,12 @@ static bool contains(const std::string & haystack, const char * needle) {
 
 static void make_live_kv_nonphysical_prefix(testing & t, llama_memory_t mem, invalid_kv_shape shape) {
     switch (shape) {
+        case invalid_kv_shape::MISSING_MIDDLE_TOKEN: {
+            const bool removed_middle = llama_memory_seq_rm(mem, 0, 1, 2);
+            t.assert_true("middle-token removal should succeed", removed_middle);
+            t.assert_equal("seq0 should still start at position zero", (llama_pos) 0, llama_memory_seq_pos_min(mem, 0));
+            return;
+        }
         case invalid_kv_shape::REMOVED_FRONT_TOKEN: {
             const bool removed_front = llama_memory_seq_rm(mem, 0, 0, 1);
             t.assert_true("front-token removal should succeed", removed_front);
@@ -337,6 +344,24 @@ int main(int argc, char ** argv) {
             /*.n_gpu_layers =*/ -1,
             /*.kv_unified =*/ false,
             /*.shape =*/ invalid_kv_shape::SHIFTED_FRONT_TOKEN,
+        });
+    });
+
+    t.test("cpu to qnn switch is refused when live seq0 memory has a middle hole", [&](testing & t) {
+        run_nonphysical_prefix_refusal_case(t, logs, model_path, {
+            /*.producer_backend =*/ "cpu",
+            /*.n_gpu_layers =*/ 0,
+            /*.kv_unified =*/ false,
+            /*.shape =*/ invalid_kv_shape::MISSING_MIDDLE_TOKEN,
+        });
+    });
+
+    t.test("opencl to qnn switch is refused when live seq0 memory has a middle hole", [&](testing & t) {
+        run_nonphysical_prefix_refusal_case(t, logs, model_path, {
+            /*.producer_backend =*/ "opencl",
+            /*.n_gpu_layers =*/ -1,
+            /*.kv_unified =*/ false,
+            /*.shape =*/ invalid_kv_shape::MISSING_MIDDLE_TOKEN,
         });
     });
 
