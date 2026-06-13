@@ -80,6 +80,13 @@ bool llama_context_should_use_qnn_written_generic_kv_for_cpu(
         bool                live_kv_cpu_backed,
         bool                qnn_writeback_flushed);
 
+bool llama_context_should_try_qnn_written_generic_kv_for_opencl(
+        const std::string & current_attn_backend,
+        const std::string & target_attn_backend,
+        uint32_t            n_tokens,
+        bool                generic_kv_enabled,
+        bool                qnn_writeback_ready);
+
 llama_hetero_kv_contract llama_dynamic_phase_shared_qnn_kv_contract(
         const std::string & prefill_attn_backend,
         const std::string & decode_attn_backend,
@@ -267,6 +274,21 @@ bool llama_context_should_use_qnn_written_generic_kv_for_cpu(
     const std::string current = llama_hetero_canonical_backend(current_attn_backend);
     const std::string target  = llama_hetero_canonical_backend(target_attn_backend);
     return llama_hetero_is_qnn_backend(current) && target == "cpu";
+}
+
+bool llama_context_should_try_qnn_written_generic_kv_for_opencl(
+        const std::string & current_attn_backend,
+        const std::string & target_attn_backend,
+        uint32_t            n_tokens,
+        bool                generic_kv_enabled,
+        bool                qnn_writeback_ready) {
+    if (!generic_kv_enabled || !qnn_writeback_ready || n_tokens != 1) {
+        return false;
+    }
+
+    const std::string current = llama_hetero_canonical_backend(current_attn_backend);
+    const std::string target  = llama_hetero_canonical_backend(target_attn_backend);
+    return llama_hetero_is_qnn_backend(current) && target == "opencl";
 }
 
 static bool llama_context_live_kv_is_cpu_backed(const llama_memory_i * memory) {
@@ -3335,6 +3357,49 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                     opencl_sync_timing.alias_us,
                     opencl_sync_timing.backend_sync_us,
                     opencl_sync_timing.transfer_us);
+        }
+    }
+
+    if (!migrated_qnn_kv &&
+        llama_context_should_try_qnn_written_generic_kv_for_opencl(
+                current_attn_backend,
+                target_attn_backend,
+                n_tokens,
+                generic_qnn_kv_enabled,
+                qnn_generic_kv_writeback_ready)) {
+        LLAMA_LOG_INFO("%s: trying QNN-written generic KV handoff before decode route switch (%s -> %s)\n",
+                __func__,
+                current_attn_backend.c_str(),
+                target_attn_backend.c_str());
+        const int64_t t_kv_sync_start_us = trace_timing ? ggml_time_us() : 0;
+        llama_opencl_external_host_sync_timing opencl_sync_timing;
+        const bool synced = sync_dynamic_cpu_opencl_kv(
+                /* host_to_device = */ true,
+                &opencl_sync_timing,
+                llama_opencl_external_host_sync_scope::ACTIVE_KV_PREFIX);
+        const int64_t t_kv_sync_end_us = trace_timing ? ggml_time_us() : 0;
+        migrated_qnn_kv = synced && opencl_sync_timing.synced_buffers > 0;
+        if (trace_timing && hetero_phase_trace.active) {
+            hetero_phase_trace.kv_migration_us += t_kv_sync_end_us - t_kv_sync_start_us;
+            hetero_phase_trace.kv_alias_us += opencl_sync_timing.alias_us;
+            hetero_phase_trace.kv_backend_sync_us += opencl_sync_timing.backend_sync_us;
+            hetero_phase_trace.kv_transfer_us += opencl_sync_timing.transfer_us;
+        }
+        if (migrated_qnn_kv) {
+            LLAMA_LOG_INFO("%s: completed QNN-written generic KV handoff to OpenCL using %zu host-visible KV buffer(s), %zu range(s), total %.2f MiB alias_us=%" PRId64 " backend_sync_us=%" PRId64 " transfer_us=%" PRId64 "\n",
+                    __func__,
+                    opencl_sync_timing.synced_buffers,
+                    opencl_sync_timing.synced_ranges,
+                    opencl_sync_timing.synced_bytes / 1024.0 / 1024.0,
+                    opencl_sync_timing.alias_us,
+                    opencl_sync_timing.backend_sync_us,
+                    opencl_sync_timing.transfer_us);
+        } else if (synced) {
+            LLAMA_LOG_WARN("%s: QNN-written generic KV handoff to OpenCL found no host-visible KV buffers; falling back to state rebuild\n",
+                    __func__);
+        } else {
+            LLAMA_LOG_WARN("%s: QNN-written generic KV handoff to OpenCL sync failed; falling back to state rebuild\n",
+                    __func__);
         }
     }
 

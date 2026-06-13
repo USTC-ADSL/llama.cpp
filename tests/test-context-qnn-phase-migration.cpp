@@ -39,6 +39,13 @@ bool llama_context_should_use_qnn_written_generic_kv_for_cpu(
         bool                live_kv_cpu_backed,
         bool                qnn_writeback_flushed);
 
+bool llama_context_should_try_qnn_written_generic_kv_for_opencl(
+        const std::string & current_attn_backend,
+        const std::string & target_attn_backend,
+        uint32_t            n_tokens,
+        bool                generic_kv_enabled,
+        bool                qnn_writeback_ready);
+
 llama_hetero_kv_contract llama_dynamic_phase_shared_qnn_kv_contract(
         const std::string & prefill_attn_backend,
         const std::string & decode_attn_backend,
@@ -471,6 +478,44 @@ int main() {
                         /* qnn_writeback_ready = */ true,
                         /* live_kv_cpu_backed = */ true,
                         /* qnn_writeback_flushed = */ true));
+    });
+
+    t.test("qnn to opencl can try qnn-written generic kv handoff when writeback is ready", [](testing & t) {
+        t.assert_true(
+                "qnn->opencl decode can try active-prefix sync from QNN-written generic KV",
+                llama_context_should_try_qnn_written_generic_kv_for_opencl(
+                        "qnn-npu",
+                        "opencl",
+                        1,
+                        /* generic_kv_enabled = */ true,
+                        /* qnn_writeback_ready = */ true));
+
+        t.assert_true(
+                "qnn->opencl must not try generic KV handoff before QNN writeback is ready",
+                !llama_context_should_try_qnn_written_generic_kv_for_opencl(
+                        "qnn-npu",
+                        "opencl",
+                        1,
+                        /* generic_kv_enabled = */ true,
+                        /* qnn_writeback_ready = */ false));
+
+        t.assert_true(
+                "prefill-sized qnn->opencl batches must keep the existing migration path",
+                !llama_context_should_try_qnn_written_generic_kv_for_opencl(
+                        "qnn-npu",
+                        "opencl",
+                        8,
+                        /* generic_kv_enabled = */ true,
+                        /* qnn_writeback_ready = */ true));
+
+        t.assert_true(
+                "qnn->cpu is handled by the CPU-specific live generic KV predicate",
+                !llama_context_should_try_qnn_written_generic_kv_for_opencl(
+                        "qnn-npu",
+                        "cpu",
+                        1,
+                        /* generic_kv_enabled = */ true,
+                        /* qnn_writeback_ready = */ true));
     });
 
     t.test("non-qnn producers still use their existing migration logic", [](testing & t) {
