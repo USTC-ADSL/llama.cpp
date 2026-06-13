@@ -52,6 +52,13 @@ bool llama_context_should_use_qnn_shared_phase_kv(
         bool                generic_kv_enabled,
         const llama_hetero_kv_contract & allocated_kv_contract);
 
+llama_opencl_external_host_sync_scope llama_context_opencl_sync_scope_for_qnn_shared_phase_kv(
+        const std::string & current_attn_backend,
+        const std::string & target_attn_backend,
+        uint32_t            n_tokens,
+        bool                generic_kv_enabled,
+        const llama_hetero_kv_contract & allocated_kv_contract);
+
 bool llama_context_should_try_qnn_opencl_direct_host_ptr_visibility(
         const std::string & current_attn_backend,
         const std::string & target_attn_backend,
@@ -482,6 +489,32 @@ int main() {
         t.assert_true(
                 "a qnn-rpcmem allocated contract should bypass state rebuild for qnn->opencl decode switches",
                 llama_context_should_use_qnn_shared_phase_kv("qnn-npu", "opencl", 1, true, allocated));
+    });
+
+    t.test("qnn to opencl shared kv handoff syncs only the active prefix", [](testing & t) {
+        const auto allocated = llama_dynamic_phase_shared_qnn_kv_contract(
+                "qnn-npu",
+                "opencl",
+                /* qnn_host_buffer_available = */ true,
+                /* opencl_can_alias_qnn_host = */ true);
+        const auto legacy = llama_dynamic_phase_migration_kv_contract("cpu", "opencl", "legacy-unit-test");
+
+        t.assert_true(
+                "qnn->opencl direct shared KV handoff should sync only the active prefix",
+                llama_context_opencl_sync_scope_for_qnn_shared_phase_kv("qnn-npu", "opencl", 1, true, allocated) ==
+                    llama_opencl_external_host_sync_scope::ACTIVE_KV_PREFIX);
+        t.assert_true(
+                "legacy allocated KV contracts must keep the full-buffer compatibility default",
+                llama_context_opencl_sync_scope_for_qnn_shared_phase_kv("qnn-npu", "opencl", 1, true, legacy) ==
+                    llama_opencl_external_host_sync_scope::FULL_BUFFER);
+        t.assert_true(
+                "prefill-sized qnn->opencl batches must keep the full-buffer compatibility default",
+                llama_context_opencl_sync_scope_for_qnn_shared_phase_kv("qnn-npu", "opencl", 8, true, allocated) ==
+                    llama_opencl_external_host_sync_scope::FULL_BUFFER);
+        t.assert_true(
+                "qnn->cpu must not use the OpenCL shared-KV sync scope helper",
+                llama_context_opencl_sync_scope_for_qnn_shared_phase_kv("qnn-npu", "cpu", 1, true, allocated) ==
+                    llama_opencl_external_host_sync_scope::FULL_BUFFER);
     });
 
     t.test("single-token qnn to opencl decode does not use the shared kv fast path when the allocated contract is legacy", [](testing & t) {

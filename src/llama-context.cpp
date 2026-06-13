@@ -93,6 +93,13 @@ bool llama_context_should_use_qnn_shared_phase_kv(
         bool                generic_kv_enabled,
         const llama_hetero_kv_contract & allocated_kv_contract);
 
+llama_opencl_external_host_sync_scope llama_context_opencl_sync_scope_for_qnn_shared_phase_kv(
+        const std::string & current_attn_backend,
+        const std::string & target_attn_backend,
+        uint32_t            n_tokens,
+        bool                generic_kv_enabled,
+        const llama_hetero_kv_contract & allocated_kv_contract);
+
 bool llama_context_should_try_qnn_opencl_direct_host_ptr_visibility(
         const std::string & current_attn_backend,
         const std::string & target_attn_backend,
@@ -359,6 +366,22 @@ bool llama_context_should_use_qnn_shared_phase_kv(
            allocated_kv_contract.implemented &&
            allocated_kv_contract.buffer_available &&
            allocated_kv_contract.zero_copy;
+}
+
+llama_opencl_external_host_sync_scope llama_context_opencl_sync_scope_for_qnn_shared_phase_kv(
+        const std::string & current_attn_backend,
+        const std::string & target_attn_backend,
+        uint32_t            n_tokens,
+        bool                generic_kv_enabled,
+        const llama_hetero_kv_contract & allocated_kv_contract) {
+    return llama_context_should_use_qnn_shared_phase_kv(
+                current_attn_backend,
+                target_attn_backend,
+                n_tokens,
+                generic_kv_enabled,
+                allocated_kv_contract)
+            ? llama_opencl_external_host_sync_scope::ACTIVE_KV_PREFIX
+            : llama_opencl_external_host_sync_scope::FULL_BUFFER;
 }
 
 bool llama_context_should_try_qnn_opencl_direct_host_ptr_visibility(
@@ -3281,7 +3304,15 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         llama_opencl_external_host_sync_timing opencl_sync_timing;
         migrated_qnn_kv =
             target_attn_backend == "opencl"
-                ? sync_dynamic_cpu_opencl_kv(/* host_to_device = */ true, &opencl_sync_timing)
+                ? sync_dynamic_cpu_opencl_kv(
+                        /* host_to_device = */ true,
+                        &opencl_sync_timing,
+                        llama_context_opencl_sync_scope_for_qnn_shared_phase_kv(
+                                current_attn_backend,
+                                target_attn_backend,
+                                n_tokens,
+                                generic_qnn_kv_enabled,
+                                hetero_kv_contract_allocated))
                 : true;
         const int64_t t_kv_sync_end_us = trace_timing ? ggml_time_us() : 0;
         if (trace_timing && hetero_phase_trace.active) {
@@ -3295,6 +3326,15 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                     __func__,
                     current_attn_backend.c_str(),
                     target_attn_backend.c_str());
+        } else if (target_attn_backend == "opencl") {
+            LLAMA_LOG_INFO("%s: completed direct shared QNN/OpenCL KV handoff using %zu host-visible KV buffer(s), %zu range(s), total %.2f MiB alias_us=%" PRId64 " backend_sync_us=%" PRId64 " transfer_us=%" PRId64 "\n",
+                    __func__,
+                    opencl_sync_timing.synced_buffers,
+                    opencl_sync_timing.synced_ranges,
+                    opencl_sync_timing.synced_bytes / 1024.0 / 1024.0,
+                    opencl_sync_timing.alias_us,
+                    opencl_sync_timing.backend_sync_us,
+                    opencl_sync_timing.transfer_us);
         }
     }
 
