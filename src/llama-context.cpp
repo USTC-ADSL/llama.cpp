@@ -3770,7 +3770,7 @@ void llama_context::hetero_transition_trace_log(
             "cpu_freq_apply_us=%" PRId64 " cpu_affinity_apply_us=%" PRId64 " cpu_threads_apply_us=%" PRId64 " "
             "sched_reserve_us=%" PRId64 " kv_handoff_us=%" PRId64 " "
             "graph_rebuild_us=%" PRId64 " decode_entry_us=%" PRId64 " "
-            "total_blocking_us=%" PRId64 " first_token_gap_us=%s post_switch_tbt_us= "
+            "total_blocking_us=%" PRId64 " first_token_gap_us=%s post_switch_tbt_us=%s "
             "transition_energy_mj= transition_energy_source=unavailable "
             "success=1 fallback=0 support_status=ok "
             "decode_token_index=%" PRIu64 " switch_after_tokens=%" PRIu64 " "
@@ -3794,6 +3794,7 @@ void llama_context::hetero_transition_trace_log(
             hetero_phase_trace.bootstrap_sched_rebuild_us,
             total_us,
             transition_blocking_us,
+            first_token_gap.c_str(),
             first_token_gap.c_str(),
             hetero_phase_trace.decode_token_index,
             hetero_phase_trace.switch_after_tokens,

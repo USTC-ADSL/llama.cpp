@@ -264,6 +264,15 @@ static void assert_fast_transition_trace(
     t.assert_true(label + " transition trace should not fall back", contains(line, "fallback=0"));
     t.assert_true(label + " transition trace should report ok support status", contains(line, "support_status=ok"));
     t.assert_true(label + " transition trace should avoid graph rebuild", contains(line, "graph_rebuild_us=0"));
+    const std::string first_token_gap = transition_trace_field(line, "first_token_gap_us");
+    const std::string post_switch_tbt = transition_trace_field(line, "post_switch_tbt_us");
+    t.assert_true(
+            label + " transition trace should include the post-switch target-token gap",
+            transition_trace_field_i64(line, "post_switch_tbt_us") >= 0);
+    t.assert_equal(
+            label + " post-switch target-token gap should match the measured first target-token gap",
+            first_token_gap,
+            post_switch_tbt);
 }
 
 static void assert_fast_transition_zero_kv_handoff(
