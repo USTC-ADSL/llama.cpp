@@ -19,9 +19,27 @@ struct llama_dynamic_route_candidate {
     bool                        configured = false;
 };
 
+struct llama_dynamic_backend_state {
+    bool        has_qnn_workpoint = false;
+    std::string qnn_workpoint;
+
+    bool     has_gpu_freq_hz = false;
+    uint64_t gpu_freq_hz = 0;
+
+    bool     has_cpu_freq_khz = false;
+    uint64_t cpu_freq_khz = 0;
+
+    bool        has_cpu_affinity_mask = false;
+    std::string cpu_affinity_mask;
+
+    bool    has_cpu_threads = false;
+    int32_t cpu_threads = 0;
+};
+
 struct llama_dynamic_decode_schedule_entry {
     uint64_t start_token = 0;
     llama_dynamic_route_candidate route;
+    llama_dynamic_backend_state backend_state;
 };
 
 struct llama_dynamic_route_runtime_config {
@@ -80,6 +98,7 @@ struct llama_dynamic_route_decision {
     bool                        decode_schedule_active = false;
     uint64_t                    decode_schedule_start_token = 0;
     uint64_t                    decode_schedule_switch_after = 0;
+    llama_dynamic_backend_state backend_state;
 };
 
 const char * llama_dynamic_route_mode_name(llama_dynamic_route_mode mode);

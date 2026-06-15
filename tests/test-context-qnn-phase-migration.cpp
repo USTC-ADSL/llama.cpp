@@ -927,6 +927,7 @@ int main() {
         scheduled.decode_schedule.push_back({
                 1,
                 make_candidate("decode-schedule@1", "opencl"),
+                {},
         });
 
         const llama_dynamic_route_candidate * from_schedule =
@@ -963,6 +964,7 @@ int main() {
         delayed.decode_schedule.push_back({
                 33,
                 make_candidate("decode-schedule@33", "opencl"),
+                {},
         });
         t.assert_true(
                 "a delayed schedule must not invent a context initial decode candidate",

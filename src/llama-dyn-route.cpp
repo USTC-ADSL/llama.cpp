@@ -2,10 +2,13 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -50,6 +53,160 @@ std::string env_string_alias_value(const char * primary, const char * fallback) 
     return env_string_value(fallback);
 }
 
+bool parse_positive_u64(const std::string & value, uint64_t & out) {
+    const std::string trimmed = llama_hetero_trim(value);
+    if (trimmed.empty()) {
+        return false;
+    }
+
+    errno = 0;
+    char * end = nullptr;
+    const unsigned long long parsed = std::strtoull(trimmed.c_str(), &end, 10);
+    if (errno == ERANGE ||
+        end == trimmed.c_str() ||
+        end == nullptr ||
+        *end != '\0' ||
+        parsed == 0) {
+        return false;
+    }
+
+    out = static_cast<uint64_t>(parsed);
+    return true;
+}
+
+bool parse_positive_i32(const std::string & value, int32_t & out) {
+    const std::string trimmed = llama_hetero_trim(value);
+    if (trimmed.empty()) {
+        return false;
+    }
+
+    errno = 0;
+    char * end = nullptr;
+    const long long parsed = std::strtoll(trimmed.c_str(), &end, 10);
+    if (errno == ERANGE ||
+        end == trimmed.c_str() ||
+        end == nullptr ||
+        *end != '\0' ||
+        parsed <= 0 ||
+        parsed > std::numeric_limits<int32_t>::max()) {
+        return false;
+    }
+
+    out = static_cast<int32_t>(parsed);
+    return true;
+}
+
+void parse_decode_schedule_backend_state(
+        const std::string & state_spec,
+        llama_dynamic_backend_state & state,
+        const std::string & entry) {
+    size_t pos = 0;
+    while (pos < state_spec.size()) {
+        const size_t next = state_spec.find(',', pos);
+        const std::string raw_field =
+            state_spec.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+        const std::string field = llama_hetero_trim(raw_field);
+        if (!field.empty()) {
+            const size_t split = field.find('=');
+            if (split == std::string::npos) {
+                std::fprintf(stderr,
+                        "llama_dynamic_route_config_from_env: ignoring invalid decode schedule state field '%s' in '%s' (expected key=value)\n",
+                        field.c_str(),
+                        entry.c_str());
+            } else {
+                const std::string key = llama_hetero_to_lower(llama_hetero_trim(field.substr(0, split)));
+                const std::string value = llama_hetero_trim(field.substr(split + 1));
+
+                if (key == "qnn_workpoint" || key == "workpoint") {
+                    if (value.empty()) {
+                        std::fprintf(stderr,
+                                "llama_dynamic_route_config_from_env: ignoring empty qnn_workpoint in decode schedule entry '%s'\n",
+                                entry.c_str());
+                    } else {
+                        state.has_qnn_workpoint = true;
+                        state.qnn_workpoint = value;
+                    }
+                } else if (key == "gpu_freq_hz") {
+                    uint64_t parsed = 0;
+                    if (parse_positive_u64(value, parsed)) {
+                        state.has_gpu_freq_hz = true;
+                        state.gpu_freq_hz = parsed;
+                    } else {
+                        std::fprintf(stderr,
+                                "llama_dynamic_route_config_from_env: ignoring invalid gpu_freq_hz='%s' in decode schedule entry '%s'\n",
+                                value.c_str(),
+                                entry.c_str());
+                    }
+                } else if (key == "cpu_freq_khz") {
+                    uint64_t parsed = 0;
+                    if (parse_positive_u64(value, parsed)) {
+                        state.has_cpu_freq_khz = true;
+                        state.cpu_freq_khz = parsed;
+                    } else {
+                        std::fprintf(stderr,
+                                "llama_dynamic_route_config_from_env: ignoring invalid cpu_freq_khz='%s' in decode schedule entry '%s'\n",
+                                value.c_str(),
+                                entry.c_str());
+                    }
+                } else if (key == "affinity" || key == "cpu_affinity_mask") {
+                    if (value.empty()) {
+                        std::fprintf(stderr,
+                                "llama_dynamic_route_config_from_env: ignoring empty CPU affinity mask in decode schedule entry '%s'\n",
+                                entry.c_str());
+                    } else {
+                        state.has_cpu_affinity_mask = true;
+                        state.cpu_affinity_mask = value;
+                    }
+                } else if (key == "threads" || key == "cpu_threads") {
+                    int32_t parsed = 0;
+                    if (parse_positive_i32(value, parsed)) {
+                        state.has_cpu_threads = true;
+                        state.cpu_threads = parsed;
+                    } else {
+                        std::fprintf(stderr,
+                                "llama_dynamic_route_config_from_env: ignoring invalid CPU threads='%s' in decode schedule entry '%s'\n",
+                                value.c_str(),
+                                entry.c_str());
+                    }
+                } else {
+                    std::fprintf(stderr,
+                            "llama_dynamic_route_config_from_env: ignoring unknown decode schedule state key '%s' in '%s'\n",
+                            key.c_str(),
+                            entry.c_str());
+                }
+            }
+        }
+
+        if (next == std::string::npos) {
+            break;
+        }
+        pos = next + 1;
+    }
+}
+
+void split_decode_schedule_route_and_state(
+        const std::string & route_with_state,
+        std::string & route_spec,
+        llama_dynamic_backend_state & state,
+        const std::string & entry) {
+    route_spec = llama_hetero_trim(route_with_state);
+    if (route_spec.empty() || route_spec.back() != '}') {
+        return;
+    }
+
+    const size_t open = route_spec.rfind('{');
+    if (open == std::string::npos) {
+        std::fprintf(stderr,
+                "llama_dynamic_route_config_from_env: ignoring malformed decode schedule state suffix in '%s'\n",
+                entry.c_str());
+        return;
+    }
+
+    const std::string state_spec = route_spec.substr(open + 1, route_spec.size() - open - 2);
+    route_spec = llama_hetero_trim(route_spec.substr(0, open));
+    parse_decode_schedule_backend_state(state_spec, state, entry);
+}
+
 bool candidate_uses_backend(
         const llama_hetero_execution_plan & plan,
         bool (*predicate)(const std::string &)) {
@@ -90,7 +247,13 @@ std::vector<llama_dynamic_decode_schedule_entry> parse_decode_schedule(const cha
                         entry.c_str());
             } else {
                 const std::string start_text = llama_hetero_trim(entry.substr(0, split));
-                const std::string route_spec = llama_hetero_trim(entry.substr(split + 1));
+                std::string route_spec;
+                llama_dynamic_backend_state backend_state;
+                split_decode_schedule_route_and_state(
+                        entry.substr(split + 1),
+                        route_spec,
+                        backend_state,
+                        entry);
                 char * end = nullptr;
                 const unsigned long long start = std::strtoull(start_text.c_str(), &end, 10);
                 if (start == 0 || end == start_text.c_str() || (end != nullptr && *end != '\0') || route_spec.empty()) {
@@ -102,6 +265,7 @@ std::vector<llama_dynamic_decode_schedule_entry> parse_decode_schedule(const cha
                     decoded.start_token = static_cast<uint64_t>(start);
                     const std::string label = "decode-schedule@" + std::to_string(decoded.start_token);
                     set_candidate(decoded.route, label.c_str(), route_spec.c_str(), nullptr);
+                    decoded.backend_state = std::move(backend_state);
                     entries.push_back(std::move(decoded));
                 }
             }
@@ -586,6 +750,7 @@ llama_dynamic_route_decision llama_dynamic_route_decide(
         decision.decode_schedule_active = true;
         decision.decode_schedule_start_token = selected->start_token;
         decision.decode_schedule_switch_after = selected->start_token > 0 ? selected->start_token - 1 : 0;
+        decision.backend_state = selected->backend_state;
         return decision;
     }
 

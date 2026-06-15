@@ -121,6 +121,64 @@ int main() {
         t.assert_equal("third route", std::string("qnn-npu"), llama_hetero_phase_backend_for_route(schedule[2].route.plan.route));
     });
 
+    t.test("decode route schedule parser supports per-entry backend state", [](testing & t) {
+        const auto schedule = llama_dynamic_route_parse_decode_schedule(
+                "1:cpu{threads=6,affinity=FC,cpu_freq_khz=4320000};"
+                "33:opencl{gpu_freq_hz=660000000};"
+                "65:qnn-npu{qnn_workpoint=burst}");
+
+        t.assert_equal("schedule entries", size_t(3), schedule.size());
+        t.assert_equal("CPU route", std::string("cpu"), llama_hetero_phase_backend_for_route(schedule[0].route.plan.route));
+        t.assert_true("CPU threads configured", schedule[0].backend_state.has_cpu_threads);
+        t.assert_equal("CPU threads", int32_t(6), schedule[0].backend_state.cpu_threads);
+        t.assert_true("CPU affinity configured", schedule[0].backend_state.has_cpu_affinity_mask);
+        t.assert_equal("CPU affinity", std::string("FC"), schedule[0].backend_state.cpu_affinity_mask);
+        t.assert_true("CPU frequency configured", schedule[0].backend_state.has_cpu_freq_khz);
+        t.assert_equal("CPU frequency", uint64_t(4320000), schedule[0].backend_state.cpu_freq_khz);
+
+        t.assert_equal("OpenCL route", std::string("opencl"), llama_hetero_phase_backend_for_route(schedule[1].route.plan.route));
+        t.assert_true("GPU frequency configured", schedule[1].backend_state.has_gpu_freq_hz);
+        t.assert_equal("GPU frequency", uint64_t(660000000), schedule[1].backend_state.gpu_freq_hz);
+
+        t.assert_equal("QNN route", std::string("qnn-npu"), llama_hetero_phase_backend_for_route(schedule[2].route.plan.route));
+        t.assert_true("QNN workpoint configured", schedule[2].backend_state.has_qnn_workpoint);
+        t.assert_equal("QNN workpoint", std::string("burst"), schedule[2].backend_state.qnn_workpoint);
+    });
+
+    t.test("decode route schedule state is carried by selected decision", [](testing & t) {
+        llama_dynamic_route_runtime_config config;
+        config.mode = llama_dynamic_route_mode::PHASE_HEURISTIC;
+        config.decode_schedule = llama_dynamic_route_parse_decode_schedule(
+                "1:cpu{threads=6,affinity=FC,cpu_freq_khz=4320000};"
+                "33:opencl{gpu_freq_hz=660000000};"
+                "65:qnn-npu{workpoint=burst}");
+
+        const llama_hetero_execution_plan cpu_plan = llama_hetero_build_execution_plan("cpu", nullptr);
+        const llama_hetero_execution_plan opencl_plan = llama_hetero_build_execution_plan("opencl", nullptr);
+
+        llama_dynamic_route_decision token_33 = llama_dynamic_route_decide(
+                config,
+                decode_request(33, cpu_plan, cpu_plan));
+        t.assert_true("token 33 switches to OpenCL", token_33.should_apply);
+        t.assert_true("token 33 carries GPU frequency", token_33.backend_state.has_gpu_freq_hz);
+        t.assert_equal("token 33 GPU frequency", uint64_t(660000000), token_33.backend_state.gpu_freq_hz);
+
+        llama_dynamic_route_decision token_64 = llama_dynamic_route_decide(
+                config,
+                decode_request(64, opencl_plan, cpu_plan));
+        t.assert_true("token 64 is a route noop", !token_64.should_apply);
+        t.assert_equal("token 64 reason", std::string("already-active"), token_64.reason);
+        t.assert_true("token 64 still carries selected GPU frequency", token_64.backend_state.has_gpu_freq_hz);
+        t.assert_equal("token 64 GPU frequency", uint64_t(660000000), token_64.backend_state.gpu_freq_hz);
+
+        llama_dynamic_route_decision token_65 = llama_dynamic_route_decide(
+                config,
+                decode_request(65, opencl_plan, cpu_plan));
+        t.assert_true("token 65 switches to QNN", token_65.should_apply);
+        t.assert_true("token 65 carries QNN workpoint", token_65.backend_state.has_qnn_workpoint);
+        t.assert_equal("token 65 QNN workpoint", std::string("burst"), token_65.backend_state.qnn_workpoint);
+    });
+
     t.test("decode route schedule can switch cpu to qnn and back to cpu", [](testing & t) {
         setenv("GGML_HETERO_DYNAMIC_MODE", "phase", 1);
         setenv("GGML_HETERO_DYNAMIC_DECODE_SCHEDULE", "1:cpu;33:qnn-npu;65:cpu", 1);

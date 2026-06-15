@@ -689,6 +689,49 @@ bool env_flag_enabled(const char * name) {
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
+uint64_t llama_context_effective_decode_gpu_freq_hz(
+        const llama_dynamic_route_runtime_config & config,
+        const llama_dynamic_route_decision &       decision) {
+    return decision.backend_state.has_gpu_freq_hz
+        ? decision.backend_state.gpu_freq_hz
+        : config.decode_gpu_freq_hz;
+}
+
+uint64_t llama_context_effective_decode_cpu_freq_khz(
+        const llama_dynamic_route_runtime_config & config,
+        const llama_dynamic_route_decision &       decision) {
+    return decision.backend_state.has_cpu_freq_khz
+        ? decision.backend_state.cpu_freq_khz
+        : config.decode_cpu_freq_khz;
+}
+
+std::string llama_context_effective_decode_cpu_affinity_mask(
+        const llama_dynamic_route_runtime_config & config,
+        const llama_dynamic_route_decision &       decision) {
+    return decision.backend_state.has_cpu_affinity_mask
+        ? decision.backend_state.cpu_affinity_mask
+        : config.decode_cpu_affinity_mask;
+}
+
+int32_t llama_context_effective_decode_cpu_threads(
+        const llama_dynamic_route_runtime_config & config,
+        const llama_dynamic_route_decision &       decision) {
+    return decision.backend_state.has_cpu_threads
+        ? decision.backend_state.cpu_threads
+        : config.decode_cpu_threads;
+}
+
+const char * llama_context_effective_decode_qnn_workpoint(
+        const llama_dynamic_route_decision & decision,
+        std::string &                        owned_workpoint) {
+    if (decision.backend_state.has_qnn_workpoint) {
+        owned_workpoint = decision.backend_state.qnn_workpoint;
+        return owned_workpoint.c_str();
+    }
+
+    return std::getenv("GGML_HETERO_DYNAMIC_DECODE_QNN_WORKPOINT");
+}
+
 std::string llama_context_format_cpu_mask(uint64_t mask) {
     char buffer[32];
     std::snprintf(buffer, sizeof(buffer), "%" PRIX64, mask);
@@ -2511,7 +2554,6 @@ std::string llama_context::get_dynamic_route_mode() const {
 bool llama_context::should_sync_before_dynamic_gpu_freq_switch(uint32_t n_tokens) const {
     if (!dynamic_route_config.enabled() ||
         !dynamic_route_config.decode_gpu_freq_sync_before_apply ||
-        dynamic_route_config.decode_gpu_freq_hz == 0 ||
         n_tokens != 1) {
         return false;
     }
@@ -2540,12 +2582,14 @@ bool llama_context::should_sync_before_dynamic_gpu_freq_switch(uint32_t n_tokens
         return false;
     }
 
+    const uint64_t target_gpu_freq_hz =
+        llama_context_effective_decode_gpu_freq_hz(dynamic_route_config, decision);
     return llama_context_should_apply_gpu_freq_switch(
             hetero_plan.route,
             decision.plan.route,
             n_tokens,
             gpu_current_freq_hz,
-            dynamic_route_config.decode_gpu_freq_hz);
+            target_gpu_freq_hz);
 }
 
 void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
@@ -2613,7 +2657,23 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
 
     const std::string source_route = llama_hetero_format_route_spec(hetero_plan.route);
     const std::string target_route = llama_hetero_format_route_spec(decision.plan.route);
-    const char * decode_qnn_workpoint = std::getenv("GGML_HETERO_DYNAMIC_DECODE_QNN_WORKPOINT");
+    std::string decode_qnn_workpoint_storage;
+    const char * decode_qnn_workpoint =
+        llama_context_effective_decode_qnn_workpoint(decision, decode_qnn_workpoint_storage);
+    const uint64_t target_gpu_freq_hz =
+        llama_context_effective_decode_gpu_freq_hz(dynamic_route_config, decision);
+    const uint64_t target_cpu_freq_khz =
+        llama_context_effective_decode_cpu_freq_khz(dynamic_route_config, decision);
+    const std::string configured_cpu_affinity_mask =
+        llama_context_effective_decode_cpu_affinity_mask(dynamic_route_config, decision);
+    const int32_t target_cpu_threads =
+        llama_context_effective_decode_cpu_threads(dynamic_route_config, decision);
+    const std::string current_phase_backend =
+        llama_hetero_canonical_backend(llama_hetero_phase_backend_for_route(hetero_plan.route));
+    const std::string target_phase_backend =
+        llama_hetero_canonical_backend(llama_hetero_phase_backend_for_route(decision.plan.route));
+    const bool schedule_route_switch_pending =
+        decision.should_apply && decision.decode_schedule_active;
     if (qnn_htp_current_workpoint.empty()) {
         const char * initial_workpoint = std::getenv("GGML_QNN_HTP_WORKPOINT");
         if (initial_workpoint == nullptr || initial_workpoint[0] == '\0') {
@@ -2622,14 +2682,24 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         qnn_htp_current_workpoint = llama_context_canonical_qnn_workpoint(initial_workpoint);
     }
 
-    if (!decision.should_apply &&
+    const bool should_apply_qnn_workpoint_state_only =
+        !decision.should_apply &&
         decision.reason != "decode-switch-wait" &&
         llama_context_should_apply_qnn_workpoint_switch(
                 hetero_plan.route,
                 decision.plan.route,
                 n_tokens,
                 qnn_htp_current_workpoint,
-                decode_qnn_workpoint)) {
+                decode_qnn_workpoint);
+    const bool should_apply_qnn_workpoint_before_route =
+        schedule_route_switch_pending &&
+        target_phase_backend == "qnn-npu" &&
+        decode_qnn_workpoint != nullptr &&
+        decode_qnn_workpoint[0] != '\0' &&
+        llama_context_canonical_qnn_workpoint(qnn_htp_current_workpoint.c_str()) !=
+            llama_context_canonical_qnn_workpoint(decode_qnn_workpoint);
+
+    if (should_apply_qnn_workpoint_state_only || should_apply_qnn_workpoint_before_route) {
         ggml_backend_t qnn_backend = find_backend_for_route("qnn-npu");
         bool applied = false;
         const int64_t t_qnn_workpoint_start_us = trace_timing ? ggml_time_us() : 0;
@@ -2653,19 +2723,23 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
             trace_timing ? t_qnn_workpoint_end_us - t_qnn_workpoint_start_us : 0;
 
         if (trace_timing && hetero_phase_trace.active) {
-            hetero_phase_trace.route_applied = applied;
-            hetero_phase_trace.route_noop = true;
-            hetero_phase_trace.route_apply_us = 0;
+            if (should_apply_qnn_workpoint_state_only) {
+                hetero_phase_trace.route_applied = applied;
+                hetero_phase_trace.route_noop = true;
+                hetero_phase_trace.route_apply_us = 0;
+                hetero_phase_trace.route_label = decision.plan_label.empty() ? "decode" : decision.plan_label;
+                hetero_phase_trace.route_reason = applied ? "qnn-workpoint-only" : "qnn-workpoint-apply-failed";
+                hetero_phase_trace.source_route = source_route;
+                hetero_phase_trace.target_route = target_route;
+            }
             hetero_phase_trace.qnn_workpoint_apply_us = qnn_workpoint_apply_us;
-            hetero_phase_trace.route_label = decision.plan_label.empty() ? "decode" : decision.plan_label;
-            hetero_phase_trace.route_reason = applied ? "qnn-workpoint-only" : "qnn-workpoint-apply-failed";
-            hetero_phase_trace.source_route = source_route;
-            hetero_phase_trace.target_route = target_route;
         }
 
         if (applied) {
             qnn_htp_current_workpoint = llama_context_canonical_qnn_workpoint(decode_qnn_workpoint);
-            dynamic_route_state.route_switches++;
+            if (should_apply_qnn_workpoint_state_only) {
+                dynamic_route_state.route_switches++;
+            }
             LLAMA_LOG_INFO("%s: applied qnn HTP workpoint switch to %s\n", __func__, decode_qnn_workpoint);
         } else {
             LLAMA_LOG_ERROR("%s: failed to apply qnn HTP workpoint switch to %s\n", __func__, decode_qnn_workpoint);
@@ -2683,10 +2757,12 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                     qnn_workpoint_apply_us,
                     target_route.empty() ? "<default>" : target_route.c_str());
         }
-        return;
+        if (should_apply_qnn_workpoint_state_only || !applied) {
+            return;
+        }
     }
 
-    if (gpu_current_freq_hz == 0 && dynamic_route_config.decode_gpu_freq_hz > 0) {
+    if (gpu_current_freq_hz == 0 && target_gpu_freq_hz > 0) {
         uint64_t observed_gpu_freq_hz = 0;
         if (llama_context_read_u64_file(dynamic_route_config.gpu_cur_freq_path, observed_gpu_freq_hz) ||
             llama_context_read_u64_file(dynamic_route_config.gpu_min_freq_path, observed_gpu_freq_hz)) {
@@ -2694,15 +2770,23 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         }
     }
 
-    if (!decision.should_apply &&
+    const bool should_apply_gpu_freq_state_only =
+        !decision.should_apply &&
         decision.reason != "decode-switch-wait" &&
         llama_context_should_apply_gpu_freq_switch(
                 hetero_plan.route,
                 decision.plan.route,
                 n_tokens,
                 gpu_current_freq_hz,
-                dynamic_route_config.decode_gpu_freq_hz)) {
-        const uint64_t target_freq_hz = dynamic_route_config.decode_gpu_freq_hz;
+                target_gpu_freq_hz);
+    const bool should_apply_gpu_freq_before_route =
+        schedule_route_switch_pending &&
+        target_phase_backend == "opencl" &&
+        target_gpu_freq_hz > 0 &&
+        (gpu_current_freq_hz == 0 || gpu_current_freq_hz != target_gpu_freq_hz);
+
+    if (should_apply_gpu_freq_state_only || should_apply_gpu_freq_before_route) {
+        const uint64_t target_freq_hz = target_gpu_freq_hz;
         const uint64_t floor_freq_hz =
             gpu_current_freq_hz > 0 ? std::min(gpu_current_freq_hz, target_freq_hz) : target_freq_hz;
 
@@ -2728,21 +2812,25 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
             trace_timing ? t_gpu_freq_end_us - t_gpu_freq_start_us : 0;
 
         if (trace_timing && hetero_phase_trace.active) {
-            hetero_phase_trace.route_applied = applied;
-            hetero_phase_trace.route_noop = true;
-            hetero_phase_trace.route_apply_us = 0;
+            if (should_apply_gpu_freq_state_only) {
+                hetero_phase_trace.route_applied = applied;
+                hetero_phase_trace.route_noop = true;
+                hetero_phase_trace.route_apply_us = 0;
+                hetero_phase_trace.route_label = decision.plan_label.empty() ? "decode" : decision.plan_label;
+                hetero_phase_trace.route_reason = applied ? "gpu-freq-only" : "gpu-freq-apply-failed";
+                hetero_phase_trace.source_route = source_route;
+                hetero_phase_trace.target_route = target_route;
+            }
             hetero_phase_trace.gpu_freq_apply_us = gpu_freq_apply_us;
             hetero_phase_trace.requested_gpu_freq_hz = target_freq_hz;
             hetero_phase_trace.actual_gpu_freq_hz = actual_freq_hz;
-            hetero_phase_trace.route_label = decision.plan_label.empty() ? "decode" : decision.plan_label;
-            hetero_phase_trace.route_reason = applied ? "gpu-freq-only" : "gpu-freq-apply-failed";
-            hetero_phase_trace.source_route = source_route;
-            hetero_phase_trace.target_route = target_route;
         }
 
         if (applied) {
             gpu_current_freq_hz = target_freq_hz;
-            dynamic_route_state.route_switches++;
+            if (should_apply_gpu_freq_state_only) {
+                dynamic_route_state.route_switches++;
+            }
             LLAMA_LOG_INFO("%s: applied GPU frequency switch to %" PRIu64 " Hz actual=%" PRIu64 "\n",
                     __func__,
                     target_freq_hz,
@@ -2781,10 +2869,12 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                     0,
                     false);
         }
-        return;
+        if (should_apply_gpu_freq_state_only || !applied) {
+            return;
+        }
     }
 
-    if (cpu_current_freq_khz == 0 && dynamic_route_config.decode_cpu_freq_khz > 0) {
+    if (cpu_current_freq_khz == 0 && target_cpu_freq_khz > 0) {
         uint64_t observed_cpu_freq_khz = 0;
         if (llama_context_read_u64_file(dynamic_route_config.cpu_cur_freq_path, observed_cpu_freq_khz) ||
             llama_context_read_u64_file(dynamic_route_config.cpu_min_freq_path, observed_cpu_freq_khz)) {
@@ -2792,15 +2882,23 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         }
     }
 
-    if (!decision.should_apply &&
+    const bool should_apply_cpu_freq_state_only =
+        !decision.should_apply &&
         decision.reason != "decode-switch-wait" &&
         llama_context_should_apply_cpu_freq_switch(
                 hetero_plan.route,
                 decision.plan.route,
                 n_tokens,
                 cpu_current_freq_khz,
-                dynamic_route_config.decode_cpu_freq_khz)) {
-        const uint64_t target_freq_khz = dynamic_route_config.decode_cpu_freq_khz;
+                target_cpu_freq_khz);
+    const bool should_apply_cpu_freq_before_route =
+        schedule_route_switch_pending &&
+        target_phase_backend == "cpu" &&
+        target_cpu_freq_khz > 0 &&
+        (cpu_current_freq_khz == 0 || cpu_current_freq_khz != target_cpu_freq_khz);
+
+    if (should_apply_cpu_freq_state_only || should_apply_cpu_freq_before_route) {
+        const uint64_t target_freq_khz = target_cpu_freq_khz;
         const uint64_t floor_freq_khz =
             cpu_current_freq_khz > 0 ? std::min(cpu_current_freq_khz, target_freq_khz) : target_freq_khz;
 
@@ -2839,21 +2937,25 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
             trace_timing ? t_cpu_freq_end_us - t_cpu_freq_start_us : 0;
 
         if (trace_timing && hetero_phase_trace.active) {
-            hetero_phase_trace.route_applied = applied;
-            hetero_phase_trace.route_noop = true;
-            hetero_phase_trace.route_apply_us = 0;
+            if (should_apply_cpu_freq_state_only) {
+                hetero_phase_trace.route_applied = applied;
+                hetero_phase_trace.route_noop = true;
+                hetero_phase_trace.route_apply_us = 0;
+                hetero_phase_trace.route_label = decision.plan_label.empty() ? "decode" : decision.plan_label;
+                hetero_phase_trace.route_reason = applied ? "cpu-freq-only" : "cpu-freq-apply-failed";
+                hetero_phase_trace.source_route = source_route;
+                hetero_phase_trace.target_route = target_route;
+            }
             hetero_phase_trace.cpu_freq_apply_us = cpu_freq_apply_us;
             hetero_phase_trace.requested_cpu_freq_khz = target_freq_khz;
             hetero_phase_trace.actual_cpu_freq_khz = actual_freq_khz;
-            hetero_phase_trace.route_label = decision.plan_label.empty() ? "decode" : decision.plan_label;
-            hetero_phase_trace.route_reason = applied ? "cpu-freq-only" : "cpu-freq-apply-failed";
-            hetero_phase_trace.source_route = source_route;
-            hetero_phase_trace.target_route = target_route;
         }
 
         if (applied) {
             cpu_current_freq_khz = target_freq_khz;
-            dynamic_route_state.route_switches++;
+            if (should_apply_cpu_freq_state_only) {
+                dynamic_route_state.route_switches++;
+            }
             LLAMA_LOG_INFO("%s: applied CPU frequency switch to %" PRIu64
                     " kHz actual=%" PRIu64 " min=%" PRIu64 " max=%" PRIu64 "\n",
                     __func__,
@@ -2895,20 +2997,22 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                     0,
                     false);
         }
-        return;
+        if (should_apply_cpu_freq_state_only || !applied) {
+            return;
+        }
     }
 
     std::string target_cpu_affinity_mask;
-    if (!dynamic_route_config.decode_cpu_affinity_mask.empty()) {
+    if (!configured_cpu_affinity_mask.empty()) {
         uint64_t parsed_cpu_mask = 0;
         std::string cpu_mask_error;
         if (llama_context_parse_cpu_mask(
-                    dynamic_route_config.decode_cpu_affinity_mask,
+                    configured_cpu_affinity_mask,
                     parsed_cpu_mask,
                     cpu_mask_error)) {
             target_cpu_affinity_mask = llama_context_format_cpu_mask(parsed_cpu_mask);
         } else {
-            target_cpu_affinity_mask = dynamic_route_config.decode_cpu_affinity_mask;
+            target_cpu_affinity_mask = configured_cpu_affinity_mask;
         }
     }
 
@@ -2916,8 +3020,9 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         cpu_current_affinity_mask = llama_context_read_current_cpu_affinity_mask();
     }
 
-    const bool should_apply_cpu_state_switch =
-        decision.reason != "decode-switch-wait" &&
+    const std::string current_phase_backend_for_cpu_state = current_phase_backend;
+    const std::string target_phase_backend_for_cpu_state = target_phase_backend;
+    const bool cpu_state_would_change =
         llama_context_should_apply_cpu_state_switch(
                 hetero_plan.route,
                 decision.plan.route,
@@ -2925,11 +3030,17 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                 cpu_current_affinity_mask,
                 target_cpu_affinity_mask.empty() ? nullptr : target_cpu_affinity_mask.c_str(),
                 cparams.n_threads,
-                dynamic_route_config.decode_cpu_threads);
-    const std::string current_phase_backend_for_cpu_state =
-        llama_hetero_canonical_backend(llama_hetero_phase_backend_for_route(hetero_plan.route));
-    const std::string target_phase_backend_for_cpu_state =
-        llama_hetero_canonical_backend(llama_hetero_phase_backend_for_route(decision.plan.route));
+                target_cpu_threads);
+    const bool current_phase_is_cpu_for_cpu_state =
+        current_phase_backend_for_cpu_state.empty() || current_phase_backend_for_cpu_state == "cpu";
+    const bool should_apply_cpu_state_before_route =
+        schedule_route_switch_pending &&
+        target_phase_backend_for_cpu_state == "cpu" &&
+        (!target_cpu_affinity_mask.empty() || target_cpu_threads > 0) &&
+        (!current_phase_is_cpu_for_cpu_state || cpu_state_would_change);
+    const bool should_apply_cpu_state_switch =
+        decision.reason != "decode-switch-wait" &&
+        (cpu_state_would_change || should_apply_cpu_state_before_route);
     const bool cpu_route_metadata_only =
         should_apply_cpu_state_switch &&
         decision.should_apply &&
@@ -2959,8 +3070,8 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
 
         const int64_t t_cpu_threads_start_us = trace_timing ? ggml_time_us() : 0;
         std::string cpu_threads_error;
-        if (dynamic_route_config.decode_cpu_threads > 0) {
-            const int32_t target_threads = dynamic_route_config.decode_cpu_threads;
+        if (target_cpu_threads > 0) {
+            const int32_t target_threads = target_cpu_threads;
             if (cparams.n_threads != target_threads) {
                 struct ggml_threadpool_params tpp = ggml_threadpool_params_default(target_threads);
                 tpp.strict_cpu = env_flag_enabled("GGML_HETERO_DYNAMIC_DECODE_CPU_STRICT");
@@ -3059,28 +3170,30 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
             hetero_phase_trace.cpu_threads_apply_us = cpu_threads_apply_us;
             hetero_phase_trace.requested_cpu_affinity_mask = target_cpu_affinity_mask;
             hetero_phase_trace.actual_cpu_affinity_mask = actual_cpu_affinity_mask;
-            hetero_phase_trace.requested_cpu_threads = dynamic_route_config.decode_cpu_threads;
+            hetero_phase_trace.requested_cpu_threads = target_cpu_threads;
             hetero_phase_trace.actual_cpu_threads = cparams.n_threads;
         }
 
         if (applied) {
-            dynamic_route_state.route_switches++;
+            if (state_only_trace || cpu_route_metadata_only) {
+                dynamic_route_state.route_switches++;
+            }
             LLAMA_LOG_INFO("%s: applied CPU state switch affinity=%s actual_affinity=%s threads=%d\n",
                     fn,
                     target_cpu_affinity_mask.empty() ? "<unchanged>" : target_cpu_affinity_mask.c_str(),
                     actual_cpu_affinity_mask.empty() ? "<unknown>" : actual_cpu_affinity_mask.c_str(),
                     cparams.n_threads);
-	        } else {
-	            LLAMA_LOG_ERROR("%s: failed to apply CPU state switch affinity=%s actual_affinity=%s "
-	                    "threads=%d target_threads=%d affinity_error=%s threads_error=%s\n",
-	                    fn,
-	                    target_cpu_affinity_mask.empty() ? "<unchanged>" : target_cpu_affinity_mask.c_str(),
-	                    actual_cpu_affinity_mask.empty() ? "<unknown>" : actual_cpu_affinity_mask.c_str(),
-	                    cparams.n_threads,
-	                    dynamic_route_config.decode_cpu_threads,
-	                    cpu_affinity_error.empty() ? "<none>" : cpu_affinity_error.c_str(),
-	                    cpu_threads_error.empty() ? "<none>" : cpu_threads_error.c_str());
-	        }
+        } else {
+            LLAMA_LOG_ERROR("%s: failed to apply CPU state switch affinity=%s actual_affinity=%s "
+                    "threads=%d target_threads=%d affinity_error=%s threads_error=%s\n",
+                    fn,
+                    target_cpu_affinity_mask.empty() ? "<unchanged>" : target_cpu_affinity_mask.c_str(),
+                    actual_cpu_affinity_mask.empty() ? "<unknown>" : actual_cpu_affinity_mask.c_str(),
+                    cparams.n_threads,
+                    target_cpu_threads,
+                    cpu_affinity_error.empty() ? "<none>" : cpu_affinity_error.c_str(),
+                    cpu_threads_error.empty() ? "<none>" : cpu_threads_error.c_str());
+        }
 
         if (trace_timing && hetero_dynamic_trace_timing_detail_enabled()) {
             LLAMA_LOG_INFO("%s: timing phase=%s n_tokens=%u cpu_state_apply=%s "
@@ -3094,7 +3207,7 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                     applied ? "true" : "false",
                     target_cpu_affinity_mask.empty() ? "<unchanged>" : target_cpu_affinity_mask.c_str(),
                     actual_cpu_affinity_mask.empty() ? "<unknown>" : actual_cpu_affinity_mask.c_str(),
-                    dynamic_route_config.decode_cpu_threads,
+                    target_cpu_threads,
                     cparams.n_threads,
                     t_decide_end_us - t_decide_start_us,
                     cpu_affinity_apply_us,
