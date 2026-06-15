@@ -19,6 +19,11 @@ struct llama_dynamic_route_candidate {
     bool                        configured = false;
 };
 
+struct llama_dynamic_cpu_policy_freq {
+    uint32_t policy = 0;
+    uint64_t freq_khz = 0;
+};
+
 struct llama_dynamic_backend_state {
     bool        has_qnn_workpoint = false;
     std::string qnn_workpoint;
@@ -28,6 +33,7 @@ struct llama_dynamic_backend_state {
 
     bool     has_cpu_freq_khz = false;
     uint64_t cpu_freq_khz = 0;
+    std::vector<llama_dynamic_cpu_policy_freq> cpu_policy_freqs;
 
     bool        has_cpu_affinity_mask = false;
     std::string cpu_affinity_mask;

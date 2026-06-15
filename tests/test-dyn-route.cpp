@@ -145,6 +145,19 @@ int main() {
         t.assert_equal("QNN workpoint", std::string("burst"), schedule[2].backend_state.qnn_workpoint);
     });
 
+    t.test("decode route schedule parser supports per-policy CPU frequencies", [](testing & t) {
+        const auto schedule = llama_dynamic_route_parse_decode_schedule(
+                "1:cpu{threads=6,affinity=FC,cpu_policy0_freq_khz=3532800,cpu_policy6_freq_khz=4320000}");
+
+        t.assert_equal("schedule entries", size_t(1), schedule.size());
+        t.assert_equal("CPU route", std::string("cpu"), llama_hetero_phase_backend_for_route(schedule[0].route.plan.route));
+        t.assert_equal("CPU policy frequency count", size_t(2), schedule[0].backend_state.cpu_policy_freqs.size());
+        t.assert_equal("CPU policy0 id", uint32_t(0), schedule[0].backend_state.cpu_policy_freqs[0].policy);
+        t.assert_equal("CPU policy0 frequency", uint64_t(3532800), schedule[0].backend_state.cpu_policy_freqs[0].freq_khz);
+        t.assert_equal("CPU policy6 id", uint32_t(6), schedule[0].backend_state.cpu_policy_freqs[1].policy);
+        t.assert_equal("CPU policy6 frequency", uint64_t(4320000), schedule[0].backend_state.cpu_policy_freqs[1].freq_khz);
+    });
+
     t.test("decode route schedule state is carried by selected decision", [](testing & t) {
         llama_dynamic_route_runtime_config config;
         config.mode = llama_dynamic_route_mode::PHASE_HEURISTIC;
@@ -177,6 +190,27 @@ int main() {
         t.assert_true("token 65 switches to QNN", token_65.should_apply);
         t.assert_true("token 65 carries QNN workpoint", token_65.backend_state.has_qnn_workpoint);
         t.assert_equal("token 65 QNN workpoint", std::string("burst"), token_65.backend_state.qnn_workpoint);
+    });
+
+    t.test("decode route schedule decision carries per-policy CPU frequencies", [](testing & t) {
+        llama_dynamic_route_runtime_config config;
+        config.mode = llama_dynamic_route_mode::PHASE_HEURISTIC;
+        config.decode_schedule = llama_dynamic_route_parse_decode_schedule(
+                "1:opencl;"
+                "33:cpu{threads=6,affinity=FC,cpu_policy0_freq_khz=3532800,cpu_policy6_freq_khz=4320000}");
+
+        const llama_hetero_execution_plan opencl_plan = llama_hetero_build_execution_plan("opencl", nullptr);
+        const llama_hetero_execution_plan base_plan = llama_hetero_build_execution_plan("opencl", nullptr);
+
+        llama_dynamic_route_decision token_33 = llama_dynamic_route_decide(
+                config,
+                decode_request(33, opencl_plan, base_plan));
+        t.assert_true("token 33 switches to CPU", token_33.should_apply);
+        t.assert_equal("token 33 CPU policy frequency count", size_t(2), token_33.backend_state.cpu_policy_freqs.size());
+        t.assert_equal("token 33 CPU policy0 id", uint32_t(0), token_33.backend_state.cpu_policy_freqs[0].policy);
+        t.assert_equal("token 33 CPU policy0 frequency", uint64_t(3532800), token_33.backend_state.cpu_policy_freqs[0].freq_khz);
+        t.assert_equal("token 33 CPU policy6 id", uint32_t(6), token_33.backend_state.cpu_policy_freqs[1].policy);
+        t.assert_equal("token 33 CPU policy6 frequency", uint64_t(4320000), token_33.backend_state.cpu_policy_freqs[1].freq_khz);
     });
 
     t.test("decode route schedule can switch cpu to qnn and back to cpu", [](testing & t) {

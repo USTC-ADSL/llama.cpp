@@ -96,6 +96,66 @@ bool parse_positive_i32(const std::string & value, int32_t & out) {
     return true;
 }
 
+bool parse_u32(const std::string & value, uint32_t & out) {
+    const std::string trimmed = llama_hetero_trim(value);
+    if (trimmed.empty()) {
+        return false;
+    }
+
+    errno = 0;
+    char * end = nullptr;
+    const unsigned long long parsed = std::strtoull(trimmed.c_str(), &end, 10);
+    if (errno == ERANGE ||
+        end == trimmed.c_str() ||
+        end == nullptr ||
+        *end != '\0' ||
+        parsed > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+
+    out = static_cast<uint32_t>(parsed);
+    return true;
+}
+
+bool parse_cpu_policy_freq_key(const std::string & key, uint32_t & policy) {
+    static constexpr const char * prefix = "cpu_policy";
+    static constexpr const char * suffix = "_freq_khz";
+    const size_t prefix_len = std::strlen(prefix);
+    const size_t suffix_len = std::strlen(suffix);
+    if (key.size() <= prefix_len + suffix_len ||
+        key.compare(0, prefix_len, prefix) != 0 ||
+        key.compare(key.size() - suffix_len, suffix_len, suffix) != 0) {
+        return false;
+    }
+
+    return parse_u32(key.substr(prefix_len, key.size() - prefix_len - suffix_len), policy);
+}
+
+void set_cpu_policy_freq(
+        llama_dynamic_backend_state & state,
+        uint32_t                       policy,
+        uint64_t                       freq_khz) {
+    auto existing = std::find_if(
+            state.cpu_policy_freqs.begin(),
+            state.cpu_policy_freqs.end(),
+            [policy](const llama_dynamic_cpu_policy_freq & entry) {
+                return entry.policy == policy;
+            });
+    if (existing != state.cpu_policy_freqs.end()) {
+        existing->freq_khz = freq_khz;
+    } else {
+        state.cpu_policy_freqs.push_back({ policy, freq_khz });
+    }
+
+    std::sort(
+            state.cpu_policy_freqs.begin(),
+            state.cpu_policy_freqs.end(),
+            [](const llama_dynamic_cpu_policy_freq & lhs,
+               const llama_dynamic_cpu_policy_freq & rhs) {
+                return lhs.policy < rhs.policy;
+            });
+}
+
 void parse_decode_schedule_backend_state(
         const std::string & state_spec,
         llama_dynamic_backend_state & state,
@@ -148,31 +208,45 @@ void parse_decode_schedule_backend_state(
                                 value.c_str(),
                                 entry.c_str());
                     }
-                } else if (key == "affinity" || key == "cpu_affinity_mask") {
-                    if (value.empty()) {
-                        std::fprintf(stderr,
-                                "llama_dynamic_route_config_from_env: ignoring empty CPU affinity mask in decode schedule entry '%s'\n",
-                                entry.c_str());
-                    } else {
-                        state.has_cpu_affinity_mask = true;
-                        state.cpu_affinity_mask = value;
-                    }
-                } else if (key == "threads" || key == "cpu_threads") {
-                    int32_t parsed = 0;
-                    if (parse_positive_i32(value, parsed)) {
-                        state.has_cpu_threads = true;
-                        state.cpu_threads = parsed;
-                    } else {
-                        std::fprintf(stderr,
-                                "llama_dynamic_route_config_from_env: ignoring invalid CPU threads='%s' in decode schedule entry '%s'\n",
-                                value.c_str(),
-                                entry.c_str());
-                    }
                 } else {
-                    std::fprintf(stderr,
-                            "llama_dynamic_route_config_from_env: ignoring unknown decode schedule state key '%s' in '%s'\n",
-                            key.c_str(),
-                            entry.c_str());
+                    uint32_t cpu_policy = 0;
+                    if (parse_cpu_policy_freq_key(key, cpu_policy)) {
+                        uint64_t parsed = 0;
+                        if (parse_positive_u64(value, parsed)) {
+                            set_cpu_policy_freq(state, cpu_policy, parsed);
+                        } else {
+                            std::fprintf(stderr,
+                                    "llama_dynamic_route_config_from_env: ignoring invalid %s='%s' in decode schedule entry '%s'\n",
+                                    key.c_str(),
+                                    value.c_str(),
+                                    entry.c_str());
+                        }
+                    } else if (key == "affinity" || key == "cpu_affinity_mask") {
+                        if (value.empty()) {
+                            std::fprintf(stderr,
+                                    "llama_dynamic_route_config_from_env: ignoring empty CPU affinity mask in decode schedule entry '%s'\n",
+                                    entry.c_str());
+                        } else {
+                            state.has_cpu_affinity_mask = true;
+                            state.cpu_affinity_mask = value;
+                        }
+                    } else if (key == "threads" || key == "cpu_threads") {
+                        int32_t parsed = 0;
+                        if (parse_positive_i32(value, parsed)) {
+                            state.has_cpu_threads = true;
+                            state.cpu_threads = parsed;
+                        } else {
+                            std::fprintf(stderr,
+                                    "llama_dynamic_route_config_from_env: ignoring invalid CPU threads='%s' in decode schedule entry '%s'\n",
+                                    value.c_str(),
+                                    entry.c_str());
+                        }
+                    } else {
+                        std::fprintf(stderr,
+                                "llama_dynamic_route_config_from_env: ignoring unknown decode schedule state key '%s' in '%s'\n",
+                                key.c_str(),
+                                entry.c_str());
+                    }
                 }
             }
         }

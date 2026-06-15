@@ -442,6 +442,7 @@ private:
     std::string qnn_htp_current_workpoint;
     uint64_t gpu_current_freq_hz = 0;
     uint64_t cpu_current_freq_khz = 0;
+    std::map<uint32_t, uint64_t> cpu_policy_current_freq_khz;
     std::string cpu_current_affinity_mask;
 
     struct hetero_phase_timing_trace {

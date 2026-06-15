@@ -24,12 +24,14 @@
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <map>
 #include <stdexcept>
 #include <system_error>
+#include <thread>
 
 #if defined(__linux__)
 #include <sched.h>
@@ -1067,6 +1069,203 @@ bool llama_context_write_u64_file(const std::string & path, uint64_t value) {
     const int written = std::fprintf(file, "%" PRIu64 "\n", value);
     const int close_rc = std::fclose(file);
     return written > 0 && close_rc == 0;
+}
+
+std::string llama_context_env_string(const std::string & name) {
+    const char * value = std::getenv(name.c_str());
+    return value != nullptr && value[0] != '\0' ? std::string(value) : std::string();
+}
+
+std::string llama_context_cpu_policy_freq_path(
+        uint32_t     policy,
+        const char * env_leaf,
+        const char * path_leaf) {
+    const std::string policy_text = std::to_string(policy);
+    const std::string primary_env =
+        std::string("GGML_HETERO_CPU_POLICY") + policy_text + "_" + env_leaf + "_FREQ_PATH";
+    std::string path = llama_context_env_string(primary_env);
+    if (!path.empty()) {
+        return path;
+    }
+
+    const std::string fallback_env =
+        std::string("GGML_HETERO_DYNAMIC_CPU_POLICY") + policy_text + "_" + env_leaf + "_FREQ_PATH";
+    path = llama_context_env_string(fallback_env);
+    if (!path.empty()) {
+        return path;
+    }
+
+    return std::string("/sys/devices/system/cpu/cpufreq/policy") +
+        policy_text + "/" + path_leaf;
+}
+
+bool llama_context_read_cpu_policy_freq_khz(uint32_t policy, uint64_t & value) {
+    return
+        llama_context_read_u64_file(
+                llama_context_cpu_policy_freq_path(policy, "CUR", "scaling_cur_freq"),
+                value) ||
+        llama_context_read_u64_file(
+                llama_context_cpu_policy_freq_path(policy, "MIN", "scaling_min_freq"),
+                value);
+}
+
+bool llama_context_read_cpu_policy_min_max_freq_khz(
+        uint32_t   policy,
+        uint64_t & min_freq_khz,
+        uint64_t & max_freq_khz) {
+    const bool have_min =
+        llama_context_read_u64_file(
+                llama_context_cpu_policy_freq_path(policy, "MIN", "scaling_min_freq"),
+                min_freq_khz);
+    const bool have_max =
+        llama_context_read_u64_file(
+                llama_context_cpu_policy_freq_path(policy, "MAX", "scaling_max_freq"),
+                max_freq_khz);
+    return have_min && have_max;
+}
+
+void llama_context_observe_cpu_policy_freqs(
+        const std::vector<llama_dynamic_cpu_policy_freq> & target_freqs,
+        std::map<uint32_t, uint64_t> &                     current_freqs) {
+    for (const auto & target : target_freqs) {
+        if (current_freqs.find(target.policy) != current_freqs.end()) {
+            continue;
+        }
+
+        uint64_t min_freq_khz = 0;
+        uint64_t max_freq_khz = 0;
+        if (llama_context_read_cpu_policy_min_max_freq_khz(
+                    target.policy,
+                    min_freq_khz,
+                    max_freq_khz)) {
+            current_freqs[target.policy] =
+                min_freq_khz == max_freq_khz ? min_freq_khz : uint64_t(0);
+            continue;
+        }
+
+        uint64_t observed_freq_khz = 0;
+        if (llama_context_read_cpu_policy_freq_khz(target.policy, observed_freq_khz)) {
+            current_freqs[target.policy] = observed_freq_khz;
+        }
+    }
+}
+
+bool llama_context_cpu_policy_freqs_would_change(
+        const std::vector<llama_dynamic_cpu_policy_freq> & target_freqs,
+        const std::map<uint32_t, uint64_t> &               current_freqs) {
+    for (const auto & target : target_freqs) {
+        const auto current = current_freqs.find(target.policy);
+        if (current == current_freqs.end() || current->second != target.freq_khz) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+struct llama_context_cpu_policy_freq_apply_result {
+    bool applied = false;
+    bool wrote = false;
+    uint64_t requested_cpu_freq_khz = 0;
+    uint64_t actual_cpu_freq_khz = 0;
+    std::string detail;
+};
+
+llama_context_cpu_policy_freq_apply_result llama_context_apply_cpu_policy_freqs(
+        const std::vector<llama_dynamic_cpu_policy_freq> & target_freqs,
+        std::map<uint32_t, uint64_t> &                     current_freqs) {
+    llama_context_cpu_policy_freq_apply_result result;
+    if (target_freqs.empty()) {
+        return result;
+    }
+
+    bool applied_all = true;
+    bool wrote_all = true;
+    for (const auto & target : target_freqs) {
+        uint64_t current_freq_khz = 0;
+        const auto current = current_freqs.find(target.policy);
+        if (current != current_freqs.end()) {
+            current_freq_khz = current->second;
+        } else {
+            llama_context_read_cpu_policy_freq_khz(target.policy, current_freq_khz);
+        }
+
+        const uint64_t floor_freq_khz =
+            current_freq_khz > 0 ? std::min(current_freq_khz, target.freq_khz) : target.freq_khz;
+        const std::string min_path =
+            llama_context_cpu_policy_freq_path(target.policy, "MIN", "scaling_min_freq");
+        const std::string max_path =
+            llama_context_cpu_policy_freq_path(target.policy, "MAX", "scaling_max_freq");
+        const std::string cur_path =
+            llama_context_cpu_policy_freq_path(target.policy, "CUR", "scaling_cur_freq");
+
+        const bool have_paths = !min_path.empty() && !max_path.empty();
+        const bool wrote =
+            have_paths &&
+            llama_context_write_u64_file(min_path, floor_freq_khz) &&
+            llama_context_write_u64_file(max_path, target.freq_khz) &&
+            llama_context_write_u64_file(min_path, target.freq_khz);
+
+        uint64_t readback_min_khz = 0;
+        uint64_t readback_max_khz = 0;
+        uint64_t actual_freq_khz = 0;
+        bool have_min = false;
+        bool have_max = false;
+        bool have_cur = false;
+        static constexpr int kCpuPolicyFreqReadbackAttempts = 20;
+        for (int attempt = 0; attempt < kCpuPolicyFreqReadbackAttempts; ++attempt) {
+            have_min = llama_context_read_u64_file(min_path, readback_min_khz);
+            have_max = llama_context_read_u64_file(max_path, readback_max_khz);
+            have_cur = llama_context_read_u64_file(cur_path, actual_freq_khz);
+            if (have_min &&
+                have_max &&
+                readback_min_khz == target.freq_khz &&
+                readback_max_khz == target.freq_khz) {
+                break;
+            }
+            if (attempt + 1 < kCpuPolicyFreqReadbackAttempts) {
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+        }
+        if (!have_cur && have_min) {
+            actual_freq_khz = readback_min_khz;
+        }
+
+        const bool applied =
+            wrote &&
+            have_min &&
+            have_max &&
+            readback_min_khz == target.freq_khz &&
+            readback_max_khz == target.freq_khz;
+
+        if (applied) {
+            current_freqs[target.policy] = target.freq_khz;
+        } else if (actual_freq_khz > 0) {
+            current_freqs[target.policy] = actual_freq_khz;
+        }
+
+        wrote_all = wrote_all && wrote;
+        applied_all = applied_all && applied;
+        result.requested_cpu_freq_khz = target.freq_khz;
+        result.actual_cpu_freq_khz = actual_freq_khz;
+
+        if (!result.detail.empty()) {
+            result.detail += ";";
+        }
+        result.detail += "policy" + std::to_string(target.policy);
+        result.detail += ":target=" + std::to_string(target.freq_khz);
+        result.detail += ",actual=" + std::to_string(actual_freq_khz);
+        result.detail += ",min=" + std::to_string(readback_min_khz);
+        result.detail += ",max=" + std::to_string(readback_max_khz);
+        result.detail += ",wrote=";
+        result.detail += wrote ? "true" : "false";
+        result.detail += ",applied=";
+        result.detail += applied ? "true" : "false";
+    }
+
+    result.applied = applied_all;
+    result.wrote = wrote_all;
+    return result;
 }
 
 bool seq0_prefix_tokens_from_memory(const llama_memory_i * memory, size_t & n_tokens) {
@@ -2664,6 +2863,9 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         llama_context_effective_decode_gpu_freq_hz(dynamic_route_config, decision);
     const uint64_t target_cpu_freq_khz =
         llama_context_effective_decode_cpu_freq_khz(dynamic_route_config, decision);
+    const std::vector<llama_dynamic_cpu_policy_freq> & target_cpu_policy_freqs =
+        decision.backend_state.cpu_policy_freqs;
+    const bool target_has_cpu_policy_freqs = !target_cpu_policy_freqs.empty();
     const std::string configured_cpu_affinity_mask =
         llama_context_effective_decode_cpu_affinity_mask(dynamic_route_config, decision);
     const int32_t target_cpu_threads =
@@ -2874,7 +3076,100 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         }
     }
 
-    if (cpu_current_freq_khz == 0 && target_cpu_freq_khz > 0) {
+    if (target_has_cpu_policy_freqs) {
+        llama_context_observe_cpu_policy_freqs(
+                target_cpu_policy_freqs,
+                cpu_policy_current_freq_khz);
+    }
+    const bool cpu_policy_freqs_would_change =
+        target_has_cpu_policy_freqs &&
+        llama_context_cpu_policy_freqs_would_change(
+                target_cpu_policy_freqs,
+                cpu_policy_current_freq_khz);
+    const bool current_phase_is_cpu_for_policy_freq =
+        current_phase_backend.empty() || current_phase_backend == "cpu";
+    const bool should_apply_cpu_policy_freq_state_only =
+        !decision.should_apply &&
+        decision.reason != "decode-switch-wait" &&
+        n_tokens == 1 &&
+        current_phase_is_cpu_for_policy_freq &&
+        target_phase_backend == "cpu" &&
+        cpu_policy_freqs_would_change;
+    const bool should_apply_cpu_policy_freq_before_route =
+        schedule_route_switch_pending &&
+        n_tokens == 1 &&
+        target_phase_backend == "cpu" &&
+        cpu_policy_freqs_would_change;
+
+    if (should_apply_cpu_policy_freq_state_only || should_apply_cpu_policy_freq_before_route) {
+        const int64_t t_cpu_policy_freq_start_us = trace_timing ? ggml_time_us() : 0;
+        const llama_context_cpu_policy_freq_apply_result policy_freq_result =
+            llama_context_apply_cpu_policy_freqs(
+                    target_cpu_policy_freqs,
+                    cpu_policy_current_freq_khz);
+        const int64_t t_cpu_policy_freq_end_us = trace_timing ? ggml_time_us() : 0;
+        const int64_t cpu_policy_freq_apply_us =
+            trace_timing ? t_cpu_policy_freq_end_us - t_cpu_policy_freq_start_us : 0;
+
+        if (trace_timing && hetero_phase_trace.active) {
+            if (should_apply_cpu_policy_freq_state_only) {
+                hetero_phase_trace.route_applied = policy_freq_result.applied;
+                hetero_phase_trace.route_noop = true;
+                hetero_phase_trace.route_apply_us = 0;
+                hetero_phase_trace.route_label = decision.plan_label.empty() ? "decode" : decision.plan_label;
+                hetero_phase_trace.route_reason =
+                    policy_freq_result.applied ? "cpu-policy-freq-only" : "cpu-policy-freq-apply-failed";
+                hetero_phase_trace.source_route = source_route;
+                hetero_phase_trace.target_route = target_route;
+            }
+            hetero_phase_trace.cpu_freq_apply_us = cpu_policy_freq_apply_us;
+            hetero_phase_trace.requested_cpu_freq_khz = policy_freq_result.requested_cpu_freq_khz;
+            hetero_phase_trace.actual_cpu_freq_khz = policy_freq_result.actual_cpu_freq_khz;
+        }
+
+        if (policy_freq_result.applied) {
+            cpu_current_freq_khz = 0;
+            if (should_apply_cpu_policy_freq_state_only) {
+                dynamic_route_state.route_switches++;
+            }
+            LLAMA_LOG_INFO("%s: applied CPU policy frequency switch %s\n",
+                    __func__,
+                    policy_freq_result.detail.empty() ? "<none>" : policy_freq_result.detail.c_str());
+        } else {
+            LLAMA_LOG_ERROR("%s: failed to apply CPU policy frequency switch wrote=%s detail=%s\n",
+                    __func__,
+                    policy_freq_result.wrote ? "true" : "false",
+                    policy_freq_result.detail.empty() ? "<none>" : policy_freq_result.detail.c_str());
+        }
+
+        if (trace_timing && hetero_dynamic_trace_timing_detail_enabled()) {
+            LLAMA_LOG_INFO("%s: timing phase=%s n_tokens=%u cpu_policy_freq_apply=%s "
+                    "requested_cpu_freq_khz=%" PRIu64 " actual_cpu_freq_khz=%" PRIu64
+                    " decide_us=%" PRId64 " cpu_freq_apply_us=%" PRId64 " detail=%s target=%s\n",
+                    __func__,
+                    hetero_phase_name(n_tokens),
+                    n_tokens,
+                    policy_freq_result.applied ? "true" : "false",
+                    policy_freq_result.requested_cpu_freq_khz,
+                    policy_freq_result.actual_cpu_freq_khz,
+                    t_decide_end_us - t_decide_start_us,
+                    cpu_policy_freq_apply_us,
+                    policy_freq_result.detail.empty() ? "<none>" : policy_freq_result.detail.c_str(),
+                    target_route.empty() ? "<default>" : target_route.c_str());
+        }
+        if (trace_timing && hetero_phase_trace.active) {
+            hetero_transition_trace_log(
+                    (t_decide_end_us - t_decide_start_us) + cpu_policy_freq_apply_us,
+                    0,
+                    0,
+                    false);
+        }
+        if (should_apply_cpu_policy_freq_state_only || !policy_freq_result.applied) {
+            return;
+        }
+    }
+
+    if (!target_has_cpu_policy_freqs && cpu_current_freq_khz == 0 && target_cpu_freq_khz > 0) {
         uint64_t observed_cpu_freq_khz = 0;
         if (llama_context_read_u64_file(dynamic_route_config.cpu_cur_freq_path, observed_cpu_freq_khz) ||
             llama_context_read_u64_file(dynamic_route_config.cpu_min_freq_path, observed_cpu_freq_khz)) {
@@ -2883,6 +3178,7 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
     }
 
     const bool should_apply_cpu_freq_state_only =
+        !target_has_cpu_policy_freqs &&
         !decision.should_apply &&
         decision.reason != "decode-switch-wait" &&
         llama_context_should_apply_cpu_freq_switch(
@@ -2892,6 +3188,7 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                 cpu_current_freq_khz,
                 target_cpu_freq_khz);
     const bool should_apply_cpu_freq_before_route =
+        !target_has_cpu_policy_freqs &&
         schedule_route_switch_pending &&
         target_phase_backend == "cpu" &&
         target_cpu_freq_khz > 0 &&
