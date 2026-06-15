@@ -1225,6 +1225,20 @@ bool llama_model_loader_requires_cpu_weight_residency(
            llama_model_loader_route_requires_cpu_weight_residency(dynamic_fallback_route);
 }
 
+static std::string llama_model_loader_strip_decode_schedule_state(std::string route_spec) {
+    route_spec = llama_hetero_trim(route_spec);
+    if (route_spec.empty() || route_spec.back() != '}') {
+        return route_spec;
+    }
+
+    const size_t open = route_spec.rfind('{');
+    if (open == std::string::npos) {
+        return route_spec;
+    }
+
+    return llama_hetero_trim(route_spec.substr(0, open));
+}
+
 bool llama_model_loader_decode_schedule_requires_cpu_weight_residency(
         const char * decode_schedule) {
     if (decode_schedule == nullptr || decode_schedule[0] == '\0') {
@@ -1240,7 +1254,8 @@ bool llama_model_loader_decode_schedule_requires_cpu_weight_residency(
         if (!entry.empty()) {
             const size_t split = entry.find(':');
             if (split != std::string::npos) {
-                const std::string route_spec = llama_hetero_trim(entry.substr(split + 1));
+                const std::string route_spec =
+                    llama_model_loader_strip_decode_schedule_state(entry.substr(split + 1));
                 if (llama_model_loader_route_requires_cpu_weight_residency(
                             llama_hetero_parse_route_spec(route_spec.c_str()))) {
                     return true;
@@ -1272,7 +1287,8 @@ bool llama_model_loader_decode_schedule_requires_opencl_weight_portability(
         if (!entry.empty()) {
             const size_t split = entry.find(':');
             if (split != std::string::npos) {
-                const std::string route_spec = llama_hetero_trim(entry.substr(split + 1));
+                const std::string route_spec =
+                    llama_model_loader_strip_decode_schedule_state(entry.substr(split + 1));
                 if (llama_model_loader_route_requires_opencl_weight_portability(
                             llama_hetero_parse_route_spec(route_spec.c_str()))) {
                     return true;

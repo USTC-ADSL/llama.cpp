@@ -162,6 +162,15 @@ int main() {
                 llama_model_loader_decode_schedule_requires_cpu_weight_residency("1:qnn-npu;65:cpu"));
     });
 
+    t.test("decode schedule with backend state cpu entries requires cpu weight residency", [](testing & t) {
+        t.assert_true(
+                "scheduled CPU decode slices with per-entry state should prepare CPU_REPACK-friendly weight residency",
+                llama_model_loader_decode_schedule_requires_cpu_weight_residency(
+                        "1:opencl{gpu_freq_hz=967000000};"
+                        "3:cpu{threads=6,affinity=FC,cpu_policy0_freq_khz=3532800,cpu_policy6_freq_khz=4320000};"
+                        "5:qnn-npu{workpoint=burst}"));
+    });
+
     t.test("decode schedule without cpu entries does not request cpu weight residency", [](testing & t) {
         t.assert_true(
                 "non-CPU decode schedules should not allocate CPU_REPACK duplicates",
@@ -172,6 +181,15 @@ int main() {
         t.assert_true(
                 "scheduled OpenCL decode slices should prepare OpenCL-capable primary weights",
                 llama_model_loader_decode_schedule_requires_opencl_weight_portability("1:qnn-npu;33:opencl;65:cpu"));
+    });
+
+    t.test("decode schedule with backend state opencl entries requires opencl weight portability", [](testing & t) {
+        t.assert_true(
+                "scheduled OpenCL decode slices with per-entry state should prepare OpenCL-capable primary weights",
+                llama_model_loader_decode_schedule_requires_opencl_weight_portability(
+                        "1:qnn-npu{workpoint=burst};"
+                        "33:opencl{gpu_freq_hz=967000000};"
+                        "65:cpu{threads=6,affinity=FC}"));
     });
 
     t.test("decode schedule without opencl entries does not request opencl weight portability", [](testing & t) {
