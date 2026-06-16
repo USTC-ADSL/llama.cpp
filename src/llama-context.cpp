@@ -2478,6 +2478,10 @@ void llama_context::clear_dynamic_seq0_token_history() {
     dynamic_seq0_token_history.clear();
 }
 
+void llama_context::reset_dynamic_route_runtime_state() {
+    dynamic_route_state = {};
+}
+
 void llama_context::record_dynamic_seq0_token_history(const llama_batch & batch_inp, size_t prefix_tokens_before_decode) {
     if (qnn_prefix_replay_active) {
         return;

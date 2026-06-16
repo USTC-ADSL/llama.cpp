@@ -206,6 +206,7 @@ struct llama_context {
     const std::vector<llama_token> & get_dynamic_seq0_token_history() const;
     void set_dynamic_seq0_token_history(const std::vector<llama_token> & tokens);
     void clear_dynamic_seq0_token_history();
+    void reset_dynamic_route_runtime_state();
 
     //
     // training

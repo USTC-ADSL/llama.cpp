@@ -2331,6 +2331,7 @@ int main(int argc, char ** argv) {
 
             llama_memory_clear(llama_get_memory(ctx), false);
             ctx->clear_dynamic_seq0_token_history();
+            ctx->reset_dynamic_route_runtime_state();
 
             if (llama_bench_should_run_qnn_decode_prewarm(
                         qnn_reset_entries,
@@ -2359,6 +2360,7 @@ int main(int argc, char ** argv) {
                 }
                 llama_memory_clear(llama_get_memory(ctx), false);
                 ctx->clear_dynamic_seq0_token_history();
+                ctx->reset_dynamic_route_runtime_state();
             }
 
             if (print_round_events) {
