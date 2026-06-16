@@ -61,6 +61,12 @@ struct llama_sched_reserve_timing {
     }
 };
 
+struct llama_context_freq_constraints {
+    bool     valid = false;
+    uint64_t min = 0;
+    uint64_t max = 0;
+};
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -443,7 +449,10 @@ private:
     std::string qnn_htp_current_workpoint;
     uint64_t gpu_current_freq_hz = 0;
     uint64_t cpu_current_freq_khz = 0;
+    llama_context_freq_constraints gpu_default_freq_hz;
+    llama_context_freq_constraints cpu_default_freq_khz;
     std::map<uint32_t, uint64_t> cpu_policy_current_freq_khz;
+    std::map<uint32_t, llama_context_freq_constraints> cpu_policy_default_freq_khz;
     std::string cpu_current_affinity_mask;
 
     struct hetero_phase_timing_trace {

@@ -168,6 +168,15 @@ bool llama_context_should_apply_gpu_freq_switch(
         uint64_t                        current_freq_hz,
         uint64_t                        target_freq_hz);
 
+bool llama_context_route_uses_opencl_backend(const llama_hetero_route_spec & route);
+
+bool llama_context_route_uses_cpu_backend(const llama_hetero_route_spec & route);
+
+bool llama_context_should_restore_gpu_freq(
+        const llama_hetero_route_spec & target_route,
+        uint32_t                        n_tokens,
+        bool                            gpu_freq_pinned);
+
 bool llama_context_should_apply_cpu_state_switch(
         const llama_hetero_route_spec & current_route,
         const llama_hetero_route_spec & target_route,
@@ -183,6 +192,11 @@ bool llama_context_should_apply_cpu_freq_switch(
         uint32_t                        n_tokens,
         uint64_t                        current_freq_khz,
         uint64_t                        target_freq_khz);
+
+bool llama_context_should_restore_cpu_freq(
+        const llama_hetero_route_spec & target_route,
+        uint32_t                        n_tokens,
+        bool                            cpu_freq_pinned);
 
 llama_hetero_kv_contract llama_dynamic_phase_migration_kv_contract(
         const std::string & producer_backend,
@@ -668,6 +682,70 @@ bool llama_context_should_apply_cpu_freq_switch(
     return current_freq_khz == 0 || current_freq_khz != target_freq_khz;
 }
 
+bool llama_context_route_uses_opencl_backend(const llama_hetero_route_spec & route) {
+    if (!route.has_any_route()) {
+        return false;
+    }
+
+    static constexpr std::array<llama_hetero_route_stage, 5> kStages = {{
+        llama_hetero_route_stage::ATTN_PROJ,
+        llama_hetero_route_stage::ATTN_CORE,
+        llama_hetero_route_stage::ATTN_OUT,
+        llama_hetero_route_stage::FFN,
+        llama_hetero_route_stage::OUTPUT,
+    }};
+
+    for (const auto stage : kStages) {
+        if (llama_hetero_is_opencl_backend(route.backend_for(stage))) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool llama_context_route_uses_cpu_backend(const llama_hetero_route_spec & route) {
+    if (!route.has_any_route()) {
+        return true;
+    }
+
+    static constexpr std::array<llama_hetero_route_stage, 5> kStages = {{
+        llama_hetero_route_stage::ATTN_PROJ,
+        llama_hetero_route_stage::ATTN_CORE,
+        llama_hetero_route_stage::ATTN_OUT,
+        llama_hetero_route_stage::FFN,
+        llama_hetero_route_stage::OUTPUT,
+    }};
+
+    for (const auto stage : kStages) {
+        const std::string backend =
+            llama_hetero_canonical_backend(route.backend_for(stage));
+        if (backend.empty() || backend == "cpu") {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool llama_context_should_restore_gpu_freq(
+        const llama_hetero_route_spec & target_route,
+        uint32_t                        n_tokens,
+        bool                            gpu_freq_pinned) {
+    return n_tokens == 1 &&
+        gpu_freq_pinned &&
+        !llama_context_route_uses_opencl_backend(target_route);
+}
+
+bool llama_context_should_restore_cpu_freq(
+        const llama_hetero_route_spec & target_route,
+        uint32_t                        n_tokens,
+        bool                            cpu_freq_pinned) {
+    return n_tokens == 1 &&
+        cpu_freq_pinned &&
+        !llama_context_route_uses_cpu_backend(target_route);
+}
+
 namespace {
 
 using ggml_backend_qnn_aot_has_pending_generic_kv_writeback_t = bool (*)(ggml_backend_t backend);
@@ -1071,6 +1149,172 @@ bool llama_context_write_u64_file(const std::string & path, uint64_t value) {
     return written > 0 && close_rc == 0;
 }
 
+bool llama_context_read_freq_constraints(
+        const std::string &               min_path,
+        const std::string &               max_path,
+        llama_context_freq_constraints &  constraints) {
+    uint64_t min_freq = 0;
+    uint64_t max_freq = 0;
+    if (!llama_context_read_u64_file(min_path, min_freq) ||
+        !llama_context_read_u64_file(max_path, max_freq) ||
+        min_freq == 0 ||
+        max_freq == 0) {
+        return false;
+    }
+
+    constraints.valid = true;
+    constraints.min = min_freq;
+    constraints.max = max_freq;
+    return true;
+}
+
+bool llama_context_capture_default_freq_constraints(
+        const std::string &               min_path,
+        const std::string &               max_path,
+        const char *                      label,
+        llama_context_freq_constraints &  constraints) {
+    if (constraints.valid) {
+        return true;
+    }
+
+    if (min_path.empty() || max_path.empty()) {
+        LLAMA_LOG_ERROR("%s: cannot capture %s default frequency constraints without min/max paths\n",
+                __func__,
+                label);
+        return false;
+    }
+
+    if (!llama_context_read_freq_constraints(min_path, max_path, constraints)) {
+        LLAMA_LOG_ERROR("%s: failed to capture %s default frequency constraints min_path=%s max_path=%s\n",
+                __func__,
+                label,
+                min_path.c_str(),
+                max_path.c_str());
+        return false;
+    }
+
+    LLAMA_LOG_INFO("%s: captured %s default frequency constraints min=%" PRIu64 " max=%" PRIu64 "\n",
+            __func__,
+            label,
+            constraints.min,
+            constraints.max);
+    return true;
+}
+
+struct llama_context_freq_write_result {
+    bool applied = false;
+    bool wrote = false;
+    bool any_write = false;
+    uint64_t actual = 0;
+    uint64_t readback_min = 0;
+    uint64_t readback_max = 0;
+};
+
+llama_context_freq_write_result llama_context_pin_freq_constraints(
+        const std::string & min_path,
+        const std::string & max_path,
+        const std::string & cur_path,
+        uint64_t            current_freq,
+        uint64_t            target_freq) {
+    llama_context_freq_write_result result;
+    if (min_path.empty() || max_path.empty() || target_freq == 0) {
+        return result;
+    }
+
+    const uint64_t floor_freq =
+        current_freq > 0 ? std::min(current_freq, target_freq) : target_freq;
+    const bool wrote_floor =
+        llama_context_write_u64_file(min_path, floor_freq);
+    const bool wrote_max =
+        wrote_floor &&
+        llama_context_write_u64_file(max_path, target_freq);
+    const bool wrote_min =
+        wrote_max &&
+        llama_context_write_u64_file(min_path, target_freq);
+
+    result.wrote = wrote_floor && wrote_max && wrote_min;
+    result.any_write = wrote_floor || wrote_max || wrote_min;
+
+    const bool have_min =
+        llama_context_read_u64_file(min_path, result.readback_min);
+    const bool have_max =
+        llama_context_read_u64_file(max_path, result.readback_max);
+    const bool have_cur =
+        llama_context_read_u64_file(cur_path, result.actual);
+    if (!have_cur && have_min) {
+        result.actual = result.readback_min;
+    }
+
+    result.applied =
+        result.wrote &&
+        have_min &&
+        have_max &&
+        result.readback_min == target_freq &&
+        result.readback_max == target_freq;
+    return result;
+}
+
+llama_context_freq_write_result llama_context_restore_freq_constraints(
+        const std::string &                     min_path,
+        const std::string &                     max_path,
+        const llama_context_freq_constraints &  constraints) {
+    llama_context_freq_write_result result;
+    if (!constraints.valid || min_path.empty() || max_path.empty()) {
+        return result;
+    }
+
+    const auto readback_matches = [&]() {
+        const bool have_min =
+            llama_context_read_u64_file(min_path, result.readback_min);
+        const bool have_max =
+            llama_context_read_u64_file(max_path, result.readback_max);
+        return have_min &&
+            have_max &&
+            result.readback_min == constraints.min &&
+            result.readback_max == constraints.max;
+    };
+
+    const auto try_write = [&](bool min_first) {
+        bool wrote_first = false;
+        bool wrote_second = false;
+        if (min_first) {
+            wrote_first =
+                llama_context_write_u64_file(min_path, constraints.min);
+            wrote_second =
+                wrote_first &&
+                llama_context_write_u64_file(max_path, constraints.max);
+        } else {
+            wrote_first =
+                llama_context_write_u64_file(max_path, constraints.max);
+            wrote_second =
+                wrote_first &&
+                llama_context_write_u64_file(min_path, constraints.min);
+        }
+
+        result.wrote = result.wrote || (wrote_first && wrote_second);
+        result.any_write = result.any_write || wrote_first || wrote_second;
+
+        static constexpr int kFreqRestoreReadbackAttempts = 20;
+        for (int attempt = 0; attempt < kFreqRestoreReadbackAttempts; ++attempt) {
+            if (readback_matches()) {
+                result.applied = true;
+                return true;
+            }
+            if (attempt + 1 < kFreqRestoreReadbackAttempts) {
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+        }
+
+        return false;
+    };
+
+    if (!try_write(/* min_first = */ true)) {
+        try_write(/* min_first = */ false);
+    }
+
+    return result;
+}
+
 std::string llama_context_env_string(const std::string & name) {
     const char * value = std::getenv(name.c_str());
     return value != nullptr && value[0] != '\0' ? std::string(value) : std::string();
@@ -1173,7 +1417,8 @@ struct llama_context_cpu_policy_freq_apply_result {
 
 llama_context_cpu_policy_freq_apply_result llama_context_apply_cpu_policy_freqs(
         const std::vector<llama_dynamic_cpu_policy_freq> & target_freqs,
-        std::map<uint32_t, uint64_t> &                     current_freqs) {
+        std::map<uint32_t, uint64_t> &                     current_freqs,
+        std::map<uint32_t, llama_context_freq_constraints> & default_constraints) {
     llama_context_cpu_policy_freq_apply_result result;
     if (target_freqs.empty()) {
         return result;
@@ -1200,11 +1445,29 @@ llama_context_cpu_policy_freq_apply_result llama_context_apply_cpu_policy_freqs(
             llama_context_cpu_policy_freq_path(target.policy, "CUR", "scaling_cur_freq");
 
         const bool have_paths = !min_path.empty() && !max_path.empty();
-        const bool wrote =
+        const bool had_default =
+            default_constraints.find(target.policy) != default_constraints.end();
+        bool captured_default = false;
+        if (have_paths) {
+            captured_default = had_default ||
+                llama_context_capture_default_freq_constraints(
+                        min_path,
+                        max_path,
+                        ("CPU policy" + std::to_string(target.policy)).c_str(),
+                        default_constraints[target.policy]);
+        }
+        const bool wrote_floor =
             have_paths &&
-            llama_context_write_u64_file(min_path, floor_freq_khz) &&
-            llama_context_write_u64_file(max_path, target.freq_khz) &&
+            captured_default &&
+            llama_context_write_u64_file(min_path, floor_freq_khz);
+        const bool wrote_max =
+            wrote_floor &&
+            llama_context_write_u64_file(max_path, target.freq_khz);
+        const bool wrote_min =
+            wrote_max &&
             llama_context_write_u64_file(min_path, target.freq_khz);
+        const bool wrote = wrote_floor && wrote_max && wrote_min;
+        const bool any_write = wrote_floor || wrote_max || wrote_min;
 
         uint64_t readback_min_khz = 0;
         uint64_t readback_max_khz = 0;
@@ -1242,6 +1505,9 @@ llama_context_cpu_policy_freq_apply_result llama_context_apply_cpu_policy_freqs(
             current_freqs[target.policy] = target.freq_khz;
         } else if (actual_freq_khz > 0) {
             current_freqs[target.policy] = actual_freq_khz;
+        }
+        if (!applied && !any_write && !had_default) {
+            default_constraints.erase(target.policy);
         }
 
         wrote_all = wrote_all && wrote;
@@ -2968,6 +3234,221 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         }
     }
 
+    const char * fn = __func__;
+    const auto restore_gpu_freq_constraints = [&]() -> bool {
+        const llama_context_freq_write_result result =
+            llama_context_restore_freq_constraints(
+                    dynamic_route_config.gpu_min_freq_path,
+                    dynamic_route_config.gpu_max_freq_path,
+                    gpu_default_freq_hz);
+
+        if (result.applied) {
+            LLAMA_LOG_INFO("%s: restored GPU frequency constraints min=%" PRIu64 " max=%" PRIu64 "\n",
+                    fn,
+                    gpu_default_freq_hz.min,
+                    gpu_default_freq_hz.max);
+            gpu_current_freq_hz = 0;
+            gpu_default_freq_hz = {};
+            return true;
+        }
+
+        LLAMA_LOG_ERROR("%s: failed to restore GPU frequency constraints wrote=%s min=%" PRIu64
+                " max=%" PRIu64 " target_min=%" PRIu64 " target_max=%" PRIu64 "\n",
+                fn,
+                result.wrote ? "true" : "false",
+                result.readback_min,
+                result.readback_max,
+                gpu_default_freq_hz.min,
+                gpu_default_freq_hz.max);
+        return false;
+    };
+
+    const auto restore_cpu_generic_freq_constraints = [&]() -> bool {
+        if (!cpu_default_freq_khz.valid) {
+            return true;
+        }
+
+        const llama_context_freq_write_result result =
+            llama_context_restore_freq_constraints(
+                    dynamic_route_config.cpu_min_freq_path,
+                    dynamic_route_config.cpu_max_freq_path,
+                    cpu_default_freq_khz);
+
+        if (result.applied) {
+            LLAMA_LOG_INFO("%s: restored CPU frequency constraints min=%" PRIu64 " max=%" PRIu64 "\n",
+                    fn,
+                    cpu_default_freq_khz.min,
+                    cpu_default_freq_khz.max);
+            cpu_current_freq_khz = 0;
+            cpu_default_freq_khz = {};
+            return true;
+        }
+
+        LLAMA_LOG_ERROR("%s: failed to restore CPU frequency constraints wrote=%s min=%" PRIu64
+                " max=%" PRIu64 " target_min=%" PRIu64 " target_max=%" PRIu64 "\n",
+                fn,
+                result.wrote ? "true" : "false",
+                result.readback_min,
+                result.readback_max,
+                cpu_default_freq_khz.min,
+                cpu_default_freq_khz.max);
+        return false;
+    };
+
+    const auto restore_cpu_policy_freq_constraints = [&]() -> bool {
+        if (cpu_policy_default_freq_khz.empty()) {
+            return true;
+        }
+
+        bool restored_all = true;
+        std::vector<uint32_t> policies;
+        policies.reserve(cpu_policy_default_freq_khz.size());
+        for (const auto & entry : cpu_policy_default_freq_khz) {
+            policies.push_back(entry.first);
+        }
+
+        for (const uint32_t policy : policies) {
+            const auto saved = cpu_policy_default_freq_khz.find(policy);
+            if (saved == cpu_policy_default_freq_khz.end()) {
+                continue;
+            }
+
+            const std::string min_path =
+                llama_context_cpu_policy_freq_path(policy, "MIN", "scaling_min_freq");
+            const std::string max_path =
+                llama_context_cpu_policy_freq_path(policy, "MAX", "scaling_max_freq");
+            const llama_context_freq_write_result result =
+                llama_context_restore_freq_constraints(
+                        min_path,
+                        max_path,
+                        saved->second);
+
+            if (result.applied) {
+                LLAMA_LOG_INFO("%s: restored CPU policy%u frequency constraints min=%" PRIu64
+                        " max=%" PRIu64 "\n",
+                        fn,
+                        policy,
+                        saved->second.min,
+                        saved->second.max);
+                cpu_policy_current_freq_khz.erase(policy);
+                cpu_policy_default_freq_khz.erase(policy);
+            } else {
+                restored_all = false;
+                LLAMA_LOG_ERROR("%s: failed to restore CPU policy%u frequency constraints wrote=%s "
+                        "min=%" PRIu64 " max=%" PRIu64 " target_min=%" PRIu64
+                        " target_max=%" PRIu64 "\n",
+                        fn,
+                        policy,
+                        result.wrote ? "true" : "false",
+                        result.readback_min,
+                        result.readback_max,
+                        saved->second.min,
+                        saved->second.max);
+            }
+        }
+
+        return restored_all;
+    };
+
+    const auto restore_cpu_freq_constraints = [&]() -> bool {
+        const bool generic_restored = restore_cpu_generic_freq_constraints();
+        const bool policy_restored = restore_cpu_policy_freq_constraints();
+        return generic_restored && policy_restored;
+    };
+
+    const bool gpu_freq_restore_needed =
+        decision.reason != "decode-switch-wait" &&
+        llama_context_should_restore_gpu_freq(
+                decision.plan.route,
+                n_tokens,
+                gpu_default_freq_hz.valid);
+    const bool cpu_freq_restore_needed =
+        decision.reason != "decode-switch-wait" &&
+        llama_context_should_restore_cpu_freq(
+                decision.plan.route,
+                n_tokens,
+                cpu_default_freq_khz.valid || !cpu_policy_default_freq_khz.empty());
+
+    if (gpu_freq_restore_needed || cpu_freq_restore_needed) {
+        bool restored = true;
+        bool restored_any = false;
+
+        const int64_t t_gpu_restore_start_us = trace_timing ? ggml_time_us() : 0;
+        if (gpu_freq_restore_needed) {
+            const bool ok = restore_gpu_freq_constraints();
+            restored = restored && ok;
+            restored_any = restored_any || ok;
+        }
+        const int64_t t_gpu_restore_end_us = trace_timing ? ggml_time_us() : 0;
+
+        const int64_t t_cpu_restore_start_us = trace_timing ? ggml_time_us() : 0;
+        if (cpu_freq_restore_needed) {
+            const bool ok = restore_cpu_freq_constraints();
+            restored = restored && ok;
+            restored_any = restored_any || ok;
+        }
+        const int64_t t_cpu_restore_end_us = trace_timing ? ggml_time_us() : 0;
+
+        const int64_t gpu_freq_restore_us =
+            trace_timing && gpu_freq_restore_needed
+                ? t_gpu_restore_end_us - t_gpu_restore_start_us
+                : int64_t(0);
+        const int64_t cpu_freq_restore_us =
+            trace_timing && cpu_freq_restore_needed
+                ? t_cpu_restore_end_us - t_cpu_restore_start_us
+                : int64_t(0);
+
+        if (trace_timing && hetero_phase_trace.active) {
+            if (!decision.should_apply) {
+                hetero_phase_trace.route_applied = restored;
+                hetero_phase_trace.route_noop = true;
+                hetero_phase_trace.route_apply_us = 0;
+                hetero_phase_trace.route_label = decision.plan_label.empty() ? "decode" : decision.plan_label;
+                hetero_phase_trace.route_reason = restored ? "freq-restore-only" : "freq-restore-failed";
+                hetero_phase_trace.source_route = source_route;
+                hetero_phase_trace.target_route = target_route;
+            }
+            hetero_phase_trace.gpu_freq_apply_us += gpu_freq_restore_us;
+            hetero_phase_trace.cpu_freq_apply_us += cpu_freq_restore_us;
+        }
+
+        if (trace_timing && hetero_dynamic_trace_timing_detail_enabled()) {
+            LLAMA_LOG_INFO("%s: timing phase=%s n_tokens=%u freq_restore=%s "
+                    "gpu_restore=%s cpu_restore=%s decide_us=%" PRId64
+                    " gpu_freq_apply_us=%" PRId64 " cpu_freq_apply_us=%" PRId64
+                    " target=%s\n",
+                    __func__,
+                    hetero_phase_name(n_tokens),
+                    n_tokens,
+                    restored ? "true" : "false",
+                    gpu_freq_restore_needed ? "true" : "false",
+                    cpu_freq_restore_needed ? "true" : "false",
+                    t_decide_end_us - t_decide_start_us,
+                    gpu_freq_restore_us,
+                    cpu_freq_restore_us,
+                    target_route.empty() ? "<default>" : target_route.c_str());
+        }
+
+        if (!decision.should_apply) {
+            if (restored_any) {
+                dynamic_route_state.route_switches++;
+            }
+            if (trace_timing && hetero_phase_trace.active) {
+                hetero_transition_trace_log(
+                        (t_decide_end_us - t_decide_start_us) +
+                            gpu_freq_restore_us +
+                            cpu_freq_restore_us,
+                        0,
+                        0,
+                        false);
+            }
+            return;
+        }
+        if (!restored) {
+            return;
+        }
+    }
+
     if (gpu_current_freq_hz == 0 && target_gpu_freq_hz > 0) {
         uint64_t observed_gpu_freq_hz = 0;
         if (llama_context_read_u64_file(dynamic_route_config.gpu_cur_freq_path, observed_gpu_freq_hz) ||
@@ -2993,25 +3474,35 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
 
     if (should_apply_gpu_freq_state_only || should_apply_gpu_freq_before_route) {
         const uint64_t target_freq_hz = target_gpu_freq_hz;
-        const uint64_t floor_freq_hz =
-            gpu_current_freq_hz > 0 ? std::min(gpu_current_freq_hz, target_freq_hz) : target_freq_hz;
 
-        bool applied = false;
-        uint64_t actual_freq_hz = 0;
         const int64_t t_gpu_freq_start_us = trace_timing ? ggml_time_us() : 0;
 
         const bool have_paths =
             !dynamic_route_config.gpu_min_freq_path.empty() &&
             !dynamic_route_config.gpu_max_freq_path.empty();
-        const bool wrote =
+        const bool had_default = gpu_default_freq_hz.valid;
+        const bool captured_default =
             have_paths &&
-            llama_context_write_u64_file(dynamic_route_config.gpu_min_freq_path, floor_freq_hz) &&
-            llama_context_write_u64_file(dynamic_route_config.gpu_max_freq_path, target_freq_hz) &&
-            llama_context_write_u64_file(dynamic_route_config.gpu_min_freq_path, target_freq_hz);
-        const bool have_actual =
-            llama_context_read_u64_file(dynamic_route_config.gpu_cur_freq_path, actual_freq_hz) ||
-            llama_context_read_u64_file(dynamic_route_config.gpu_min_freq_path, actual_freq_hz);
-        applied = wrote && (!have_actual || actual_freq_hz == target_freq_hz);
+            llama_context_capture_default_freq_constraints(
+                    dynamic_route_config.gpu_min_freq_path,
+                    dynamic_route_config.gpu_max_freq_path,
+                    "GPU",
+                    gpu_default_freq_hz);
+        const llama_context_freq_write_result freq_result =
+            captured_default
+                ? llama_context_pin_freq_constraints(
+                        dynamic_route_config.gpu_min_freq_path,
+                        dynamic_route_config.gpu_max_freq_path,
+                        dynamic_route_config.gpu_cur_freq_path,
+                        gpu_current_freq_hz,
+                        target_freq_hz)
+                : llama_context_freq_write_result{};
+        const bool wrote = freq_result.wrote;
+        const bool applied = freq_result.applied;
+        const uint64_t actual_freq_hz = freq_result.actual;
+        if (!applied && !freq_result.any_write && !had_default) {
+            gpu_default_freq_hz = {};
+        }
 
         const int64_t t_gpu_freq_end_us = trace_timing ? ggml_time_us() : 0;
         const int64_t gpu_freq_apply_us =
@@ -3110,7 +3601,8 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         const llama_context_cpu_policy_freq_apply_result policy_freq_result =
             llama_context_apply_cpu_policy_freqs(
                     target_cpu_policy_freqs,
-                    cpu_policy_current_freq_khz);
+                    cpu_policy_current_freq_khz,
+                    cpu_policy_default_freq_khz);
         const int64_t t_cpu_policy_freq_end_us = trace_timing ? ggml_time_us() : 0;
         const int64_t cpu_policy_freq_apply_us =
             trace_timing ? t_cpu_policy_freq_end_us - t_cpu_policy_freq_start_us : 0;
@@ -3200,38 +3692,37 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
 
     if (should_apply_cpu_freq_state_only || should_apply_cpu_freq_before_route) {
         const uint64_t target_freq_khz = target_cpu_freq_khz;
-        const uint64_t floor_freq_khz =
-            cpu_current_freq_khz > 0 ? std::min(cpu_current_freq_khz, target_freq_khz) : target_freq_khz;
 
-        bool applied = false;
-        uint64_t actual_freq_khz = 0;
-        uint64_t readback_min_khz = 0;
-        uint64_t readback_max_khz = 0;
         const int64_t t_cpu_freq_start_us = trace_timing ? ggml_time_us() : 0;
 
         const bool have_paths =
             !dynamic_route_config.cpu_min_freq_path.empty() &&
             !dynamic_route_config.cpu_max_freq_path.empty();
-        const bool wrote =
+        const bool had_default = cpu_default_freq_khz.valid;
+        const bool captured_default =
             have_paths &&
-            llama_context_write_u64_file(dynamic_route_config.cpu_min_freq_path, floor_freq_khz) &&
-            llama_context_write_u64_file(dynamic_route_config.cpu_max_freq_path, target_freq_khz) &&
-            llama_context_write_u64_file(dynamic_route_config.cpu_min_freq_path, target_freq_khz);
-        const bool have_min =
-            llama_context_read_u64_file(dynamic_route_config.cpu_min_freq_path, readback_min_khz);
-        const bool have_max =
-            llama_context_read_u64_file(dynamic_route_config.cpu_max_freq_path, readback_max_khz);
-        const bool have_cur =
-            llama_context_read_u64_file(dynamic_route_config.cpu_cur_freq_path, actual_freq_khz);
-        if (!have_cur && have_min) {
-            actual_freq_khz = readback_min_khz;
+            llama_context_capture_default_freq_constraints(
+                    dynamic_route_config.cpu_min_freq_path,
+                    dynamic_route_config.cpu_max_freq_path,
+                    "CPU",
+                    cpu_default_freq_khz);
+        const llama_context_freq_write_result freq_result =
+            captured_default
+                ? llama_context_pin_freq_constraints(
+                        dynamic_route_config.cpu_min_freq_path,
+                        dynamic_route_config.cpu_max_freq_path,
+                        dynamic_route_config.cpu_cur_freq_path,
+                        cpu_current_freq_khz,
+                        target_freq_khz)
+                : llama_context_freq_write_result{};
+        const bool wrote = freq_result.wrote;
+        const bool applied = freq_result.applied;
+        const uint64_t actual_freq_khz = freq_result.actual;
+        const uint64_t readback_min_khz = freq_result.readback_min;
+        const uint64_t readback_max_khz = freq_result.readback_max;
+        if (!applied && !freq_result.any_write && !had_default) {
+            cpu_default_freq_khz = {};
         }
-        applied =
-            wrote &&
-            have_min &&
-            have_max &&
-            readback_min_khz == target_freq_khz &&
-            readback_max_khz == target_freq_khz;
 
         const int64_t t_cpu_freq_end_us = trace_timing ? ggml_time_us() : 0;
         const int64_t cpu_freq_apply_us =
@@ -3348,7 +3839,6 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         (current_phase_backend_for_cpu_state.empty() || current_phase_backend_for_cpu_state == "cpu") &&
         target_phase_backend_for_cpu_state == "cpu";
 
-    const char * fn = __func__;
     const auto apply_cpu_state_switch = [&](bool state_only_trace) -> bool {
         bool affinity_applied = true;
         bool threads_applied = true;
