@@ -198,6 +198,28 @@ bool llama_context_should_restore_cpu_freq(
         uint32_t                        n_tokens,
         bool                            cpu_freq_pinned);
 
+bool llama_context_should_continue_dynamic_route_after_state_apply(
+        bool state_only_transition,
+        bool route_switch_pending,
+        bool state_applied);
+
+bool llama_context_should_restore_freq_constraints_on_destroy(
+        bool gpu_freq_pinned,
+        bool cpu_freq_pinned,
+        bool cpu_policy_freq_pinned);
+
+uint64_t llama_context_tracked_freq_after_state_apply(
+        uint64_t current_freq,
+        uint64_t target_freq,
+        bool     state_attempted,
+        bool     state_applied);
+
+bool llama_context_freq_restore_readback_matches(
+        uint64_t target_min,
+        uint64_t target_max,
+        uint64_t readback_min,
+        uint64_t readback_max);
+
 llama_hetero_kv_contract llama_dynamic_phase_migration_kv_contract(
         const std::string & producer_backend,
         const std::string & consumer_backend,
@@ -746,6 +768,50 @@ bool llama_context_should_restore_cpu_freq(
         !llama_context_route_uses_cpu_backend(target_route);
 }
 
+bool llama_context_should_continue_dynamic_route_after_state_apply(
+        bool state_only_transition,
+        bool route_switch_pending,
+        bool state_applied) {
+    if (state_only_transition) {
+        return false;
+    }
+
+    return state_applied || route_switch_pending;
+}
+
+bool llama_context_should_restore_freq_constraints_on_destroy(
+        bool gpu_freq_pinned,
+        bool cpu_freq_pinned,
+        bool cpu_policy_freq_pinned) {
+    return gpu_freq_pinned || cpu_freq_pinned || cpu_policy_freq_pinned;
+}
+
+uint64_t llama_context_tracked_freq_after_state_apply(
+        uint64_t current_freq,
+        uint64_t target_freq,
+        bool     state_attempted,
+        bool     state_applied) {
+    if (target_freq > 0 && (state_attempted || state_applied)) {
+        return target_freq;
+    }
+
+    return current_freq;
+}
+
+bool llama_context_freq_restore_readback_matches(
+        uint64_t target_min,
+        uint64_t target_max,
+        uint64_t readback_min,
+        uint64_t readback_max) {
+    if (target_min == 0 || target_max == 0 || readback_min == 0 || readback_max == 0) {
+        return false;
+    }
+
+    return readback_min == target_min &&
+        readback_max >= readback_min &&
+        readback_max <= target_max;
+}
+
 namespace {
 
 using ggml_backend_qnn_aot_has_pending_generic_kv_writeback_t = bool (*)(ggml_backend_t backend);
@@ -1270,8 +1336,11 @@ llama_context_freq_write_result llama_context_restore_freq_constraints(
             llama_context_read_u64_file(max_path, result.readback_max);
         return have_min &&
             have_max &&
-            result.readback_min == constraints.min &&
-            result.readback_max == constraints.max;
+            llama_context_freq_restore_readback_matches(
+                    constraints.min,
+                    constraints.max,
+                    result.readback_min,
+                    result.readback_max);
     };
 
     const auto try_write = [&](bool min_first) {
@@ -1501,10 +1570,14 @@ llama_context_cpu_policy_freq_apply_result llama_context_apply_cpu_policy_freqs(
             readback_min_khz == target.freq_khz &&
             readback_max_khz == target.freq_khz;
 
-        if (applied) {
-            current_freqs[target.policy] = target.freq_khz;
-        } else if (actual_freq_khz > 0) {
-            current_freqs[target.policy] = actual_freq_khz;
+        const uint64_t tracked_freq_khz =
+            llama_context_tracked_freq_after_state_apply(
+                    actual_freq_khz > 0 ? actual_freq_khz : current_freq_khz,
+                    target.freq_khz,
+                    have_paths && captured_default,
+                    applied);
+        if (tracked_freq_khz > 0) {
+            current_freqs[target.policy] = tracked_freq_khz;
         }
         if (!applied && !any_write && !had_default) {
             default_constraints.erase(target.policy);
@@ -3444,7 +3517,10 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
             }
             return;
         }
-        if (!restored) {
+        if (!llama_context_should_continue_dynamic_route_after_state_apply(
+                    /* state_only_transition = */ false,
+                    /* route_switch_pending  = */ true,
+                    restored)) {
             return;
         }
     }
@@ -3541,6 +3617,12 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                     wrote ? "true" : "false",
                     actual_freq_hz);
         }
+        gpu_current_freq_hz =
+            llama_context_tracked_freq_after_state_apply(
+                    gpu_current_freq_hz,
+                    target_freq_hz,
+                    captured_default,
+                    applied);
 
         if (trace_timing && hetero_dynamic_trace_timing_detail_enabled()) {
             LLAMA_LOG_INFO("%s: timing phase=%s n_tokens=%u gpu_freq_apply=%s requested_gpu_freq_hz=%" PRIu64
@@ -3566,7 +3648,10 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                     0,
                     false);
         }
-        if (should_apply_gpu_freq_state_only || !applied) {
+        if (!llama_context_should_continue_dynamic_route_after_state_apply(
+                    should_apply_gpu_freq_state_only,
+                    should_apply_gpu_freq_before_route,
+                    applied)) {
             return;
         }
     }
@@ -3660,7 +3745,10 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                     0,
                     false);
         }
-        if (should_apply_cpu_policy_freq_state_only || !policy_freq_result.applied) {
+        if (!llama_context_should_continue_dynamic_route_after_state_apply(
+                    should_apply_cpu_policy_freq_state_only,
+                    should_apply_cpu_policy_freq_before_route,
+                    policy_freq_result.applied)) {
             return;
         }
     }
@@ -3767,6 +3855,12 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                     readback_min_khz,
                     readback_max_khz);
         }
+        cpu_current_freq_khz =
+            llama_context_tracked_freq_after_state_apply(
+                    cpu_current_freq_khz,
+                    target_freq_khz,
+                    captured_default,
+                    applied);
 
         if (trace_timing && hetero_dynamic_trace_timing_detail_enabled()) {
             LLAMA_LOG_INFO("%s: timing phase=%s n_tokens=%u cpu_freq_apply=%s requested_cpu_freq_khz=%" PRIu64
@@ -3789,7 +3883,10 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                     0,
                     false);
         }
-        if (should_apply_cpu_freq_state_only || !applied) {
+        if (!llama_context_should_continue_dynamic_route_after_state_apply(
+                    should_apply_cpu_freq_state_only,
+                    should_apply_cpu_freq_before_route,
+                    applied)) {
             return;
         }
     }
@@ -4569,6 +4666,112 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
 
 llama_context::~llama_context() {
     hetero_decode_token_trace_dump();
+
+    if (llama_context_should_restore_freq_constraints_on_destroy(
+                gpu_default_freq_hz.valid,
+                cpu_default_freq_khz.valid,
+                !cpu_policy_default_freq_khz.empty())) {
+        if (gpu_default_freq_hz.valid) {
+            const llama_context_freq_write_result result =
+                llama_context_restore_freq_constraints(
+                        dynamic_route_config.gpu_min_freq_path,
+                        dynamic_route_config.gpu_max_freq_path,
+                        gpu_default_freq_hz);
+            if (result.applied) {
+                LLAMA_LOG_INFO("%s: restored GPU frequency constraints on destroy min=%" PRIu64
+                        " max=%" PRIu64 "\n",
+                        __func__,
+                        gpu_default_freq_hz.min,
+                        gpu_default_freq_hz.max);
+                gpu_current_freq_hz = 0;
+                gpu_default_freq_hz = {};
+            } else {
+                LLAMA_LOG_ERROR("%s: failed to restore GPU frequency constraints on destroy wrote=%s "
+                        "min=%" PRIu64 " max=%" PRIu64 " target_min=%" PRIu64
+                        " target_max=%" PRIu64 "\n",
+                        __func__,
+                        result.wrote ? "true" : "false",
+                        result.readback_min,
+                        result.readback_max,
+                        gpu_default_freq_hz.min,
+                        gpu_default_freq_hz.max);
+            }
+        }
+
+        if (cpu_default_freq_khz.valid) {
+            const llama_context_freq_write_result result =
+                llama_context_restore_freq_constraints(
+                        dynamic_route_config.cpu_min_freq_path,
+                        dynamic_route_config.cpu_max_freq_path,
+                        cpu_default_freq_khz);
+            if (result.applied) {
+                LLAMA_LOG_INFO("%s: restored CPU frequency constraints on destroy min=%" PRIu64
+                        " max=%" PRIu64 "\n",
+                        __func__,
+                        cpu_default_freq_khz.min,
+                        cpu_default_freq_khz.max);
+                cpu_current_freq_khz = 0;
+                cpu_default_freq_khz = {};
+            } else {
+                LLAMA_LOG_ERROR("%s: failed to restore CPU frequency constraints on destroy wrote=%s "
+                        "min=%" PRIu64 " max=%" PRIu64 " target_min=%" PRIu64
+                        " target_max=%" PRIu64 "\n",
+                        __func__,
+                        result.wrote ? "true" : "false",
+                        result.readback_min,
+                        result.readback_max,
+                        cpu_default_freq_khz.min,
+                        cpu_default_freq_khz.max);
+            }
+        }
+
+        if (!cpu_policy_default_freq_khz.empty()) {
+            std::vector<uint32_t> policies;
+            policies.reserve(cpu_policy_default_freq_khz.size());
+            for (const auto & entry : cpu_policy_default_freq_khz) {
+                policies.push_back(entry.first);
+            }
+
+            for (const uint32_t policy : policies) {
+                const auto saved = cpu_policy_default_freq_khz.find(policy);
+                if (saved == cpu_policy_default_freq_khz.end()) {
+                    continue;
+                }
+
+                const std::string min_path =
+                    llama_context_cpu_policy_freq_path(policy, "MIN", "scaling_min_freq");
+                const std::string max_path =
+                    llama_context_cpu_policy_freq_path(policy, "MAX", "scaling_max_freq");
+                const llama_context_freq_write_result result =
+                    llama_context_restore_freq_constraints(
+                            min_path,
+                            max_path,
+                            saved->second);
+
+                if (result.applied) {
+                    LLAMA_LOG_INFO("%s: restored CPU policy%u frequency constraints on destroy min=%" PRIu64
+                            " max=%" PRIu64 "\n",
+                            __func__,
+                            policy,
+                            saved->second.min,
+                            saved->second.max);
+                    cpu_policy_current_freq_khz.erase(policy);
+                    cpu_policy_default_freq_khz.erase(policy);
+                } else {
+                    LLAMA_LOG_ERROR("%s: failed to restore CPU policy%u frequency constraints on destroy wrote=%s "
+                            "min=%" PRIu64 " max=%" PRIu64 " target_min=%" PRIu64
+                            " target_max=%" PRIu64 "\n",
+                            __func__,
+                            policy,
+                            result.wrote ? "true" : "false",
+                            result.readback_min,
+                            result.readback_max,
+                            saved->second.min,
+                            saved->second.max);
+                }
+            }
+        }
+    }
 
     if (owned_dynamic_decode_threadpool != nullptr) {
         if (backend_cpu != nullptr) {
