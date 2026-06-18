@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -11,6 +13,32 @@ from typing import Any, Iterable
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_VERSION = "system_benefit_simulation.v1"
+PROFILE_FIELDS = [
+    "phase",
+    "backend",
+    "state_name",
+    "state_group",
+    "bucket_lo",
+    "bucket_hi",
+    "bucket_tokens",
+    "throughput_tps",
+    "power_mw",
+    "energy_mj_per_token",
+    "energy_mj_per_bucket",
+]
+DEFAULT_BASELINE_DECODE_STATES = {
+    "CPU": "B2S4_4320000_3532800",
+    "GPU": "1100",
+    "NPU": "burst",
+}
+DEFAULT_BACKEND_TRANSITION_LATENCY_MS = {
+    ("NPU", "CPU"): 5.0,
+    ("GPU", "CPU"): 15.0,
+    ("CPU", "GPU"): 50.0,
+    ("NPU", "GPU"): 50.0,
+    ("CPU", "NPU"): 50.0,
+    ("GPU", "NPU"): 50.0,
+}
 
 
 @dataclass(frozen=True)
@@ -69,9 +97,31 @@ class SegmentCandidate:
 @dataclass
 class DpNode:
     total_energy_mj: float
+    total_latency_ms: float
+    total_slo_violations: int
+    total_slo_miss_ms: float
     prev_state: str | None
     candidate: SegmentCandidate
     transition: TransitionCost
+    step_latency_ms: float
+    step_energy_mj: float
+    step_slo_deadline_ms: float
+    step_slo_ok: bool
+    step_slo_miss_ms: float
+
+
+def dp_key(node: DpNode) -> tuple[int, float, float]:
+    # SLO is the hard preference: first minimize missed steps, then miss distance,
+    # then energy. This implements "lowest energy under SLO; closest if no SLO path".
+    return (node.total_slo_violations, node.total_slo_miss_ms, node.total_energy_mj)
+
+
+def backend_transition_latency_ms(from_backend: str | None, to_backend: str | None) -> float | None:
+    if not from_backend or not to_backend:
+        return None
+    if from_backend == to_backend:
+        return 0.0
+    return DEFAULT_BACKEND_TRANSITION_LATENCY_MS.get((from_backend, to_backend))
 
 
 class Scheduler:
@@ -89,23 +139,28 @@ class EnergyDpScheduler(Scheduler):
         records: list[ProfileRecord],
         transitions: list[dict[str, Any]],
         *,
-        slo_tps: float,
+        slo_tbt_ms: float,
         context_match: str,
         allowed_backends: set[str],
         fixed_backend: str | None = None,
         fixed_state: str | None = None,
+        initial_state: str | None = None,
         default_transition_latency_ms: float = 0.0,
         default_transition_energy_mj: float = 0.0,
     ) -> None:
         self.records = records
         self.transitions = transitions
-        self.slo_tps = slo_tps
+        self.slo_tbt_ms = slo_tbt_ms
         self.context_match = context_match
         self.allowed_backends = allowed_backends
         self.fixed_backend = fixed_backend
         self.fixed_state = fixed_state
+        self.initial_state = initial_state
         self.default_transition_latency_ms = default_transition_latency_ms
         self.default_transition_energy_mj = default_transition_energy_mj
+        self.backend_by_state: dict[str, str] = {}
+        for record in records:
+            self.backend_by_state.setdefault(record.state_name, record.backend)
 
     def plan_decode(self, input_len: int, output_len: int, bucket_size: int) -> dict[str, Any]:
         if output_len <= 0:
@@ -134,16 +189,17 @@ class EnergyDpScheduler(Scheduler):
             for candidate in candidates:
                 state = candidate.record.state_name
                 if index == 0:
-                    transition = TransitionCost(0.0, 0.0, "initial")
-                    layer[state] = DpNode(candidate.energy_mj, None, candidate, transition)
+                    prev_state = self.initial_state
+                    transition = self.lookup_transition(prev_state, state) if prev_state else TransitionCost(0.0, 0.0, "initial")
+                    node = self.make_node(None, prev_state, candidate, transition)
+                    layer[state] = node
                     continue
 
                 best_node: DpNode | None = None
                 for prev_state, prev_node in dp[index - 1].items():
                     transition = self.lookup_transition(prev_state, state)
-                    total = prev_node.total_energy_mj + transition.energy_mj + candidate.energy_mj
-                    node = DpNode(total, prev_state, candidate, transition)
-                    if best_node is None or node.total_energy_mj < best_node.total_energy_mj:
+                    node = self.make_node(prev_node, prev_state, candidate, transition)
+                    if best_node is None or dp_key(node) < dp_key(best_node):
                         best_node = node
                 if best_node:
                     layer[state] = best_node
@@ -152,7 +208,7 @@ class EnergyDpScheduler(Scheduler):
         if not dp or not dp[-1]:
             raise ValueError("DP failed to produce a decode plan")
 
-        final_state, final_node = min(dp[-1].items(), key=lambda item: item[1].total_energy_mj)
+        final_state, final_node = min(dp[-1].items(), key=lambda item: dp_key(item[1]))
         del final_node
         chosen: list[DpNode] = []
         current_state: str | None = final_state
@@ -166,23 +222,42 @@ class EnergyDpScheduler(Scheduler):
 
         segment_rows = []
         decode_latency_ms = 0.0
+        decode_compute_latency_ms = 0.0
+        decode_transition_latency_ms = 0.0
         decode_energy_mj = 0.0
-        all_segments_profile_slo_met = True
+        decode_compute_energy_mj = 0.0
+        decode_transition_energy_mj = 0.0
+        profile_slo_met = True
+        slo_satisfied_steps = 0
         notes: set[str] = set()
         for node in chosen:
             candidate = node.candidate
             transition = node.transition
-            segment_latency = transition.latency_ms + candidate.latency_ms
-            segment_energy = transition.energy_mj + candidate.energy_mj
+            switch_reason = self.switch_reason(node)
+            segment_latency = node.step_latency_ms
+            segment_energy = node.step_energy_mj
             decode_latency_ms += segment_latency
+            decode_compute_latency_ms += candidate.latency_ms
+            decode_transition_latency_ms += transition.latency_ms
             decode_energy_mj += segment_energy
-            all_segments_profile_slo_met = all_segments_profile_slo_met and candidate.feasible_for_slo
+            decode_compute_energy_mj += candidate.energy_mj
+            decode_transition_energy_mj += transition.energy_mj
+            profile_slo_met = profile_slo_met and candidate.feasible_for_slo
+            if node.step_slo_ok:
+                slo_satisfied_steps += 1
             if transition.source == "default":
                 notes.add("missing_transition_profile")
             if candidate.match_kind != "exact":
                 notes.add(f"context_match_{candidate.match_kind}")
-            if not candidate.feasible_for_slo:
+            if not node.step_slo_ok:
                 notes.add("best_effort_bucket_below_slo")
+            step_achieved_tps = candidate.num_tokens / (segment_latency / 1000.0) if segment_latency > 0 else math.inf
+            energy_saving_vs_prev_mj = self.energy_saving_vs_prev_state(node)
+            energy_saving_vs_prev_pct = (
+                energy_saving_vs_prev_mj / (energy_saving_vs_prev_mj + segment_energy) * 100.0
+                if energy_saving_vs_prev_mj is not None and energy_saving_vs_prev_mj > 0
+                else None
+            )
             segment_rows.append(
                 {
                     "segment_id": candidate.segment_id,
@@ -202,29 +277,89 @@ class EnergyDpScheduler(Scheduler):
                     "mean_tbt_ms": candidate.record.mean_tbt_ms,
                     "energy_mj_per_token": candidate.record.energy_mj_per_token,
                     "transition_from_prev": node.prev_state or "",
+                    "switch_reason": switch_reason,
                     "transition_latency_ms": transition.latency_ms,
                     "transition_energy_mj": transition.energy_mj,
                     "transition_source": transition.source,
+                    "transition_energy_source": "target_power" if transition.source == "backend_default" else transition.source,
                     "segment_decode_latency_ms": candidate.latency_ms,
                     "segment_decode_energy_mj": candidate.energy_mj,
                     "segment_total_latency_ms": segment_latency,
                     "segment_total_energy_mj": segment_energy,
-                    "feasible_for_slo": candidate.feasible_for_slo,
-                    "selection_mode": candidate.selection_mode,
+                    "step_slo_deadline_ms": node.step_slo_deadline_ms,
+                    "step_latency_ms": segment_latency,
+                    "step_mean_tbt_ms": segment_latency / candidate.num_tokens,
+                    "step_achieved_tps": step_achieved_tps,
+                    "step_slo_ok": node.step_slo_ok,
+                    "step_slo_miss_ms": node.step_slo_miss_ms,
+                    "step_slo_margin_ms": node.step_slo_deadline_ms - segment_latency,
+                    "profile_feasible_for_slo": candidate.feasible_for_slo,
+                    "feasible_for_slo": node.step_slo_ok,
+                    "selection_mode": "feasible" if node.step_slo_ok else "best_effort_closest_to_slo",
+                    "energy_saving_vs_prev_mj": energy_saving_vs_prev_mj,
+                    "energy_saving_vs_prev_pct": energy_saving_vs_prev_pct,
                 }
             )
 
         achieved_decode_tps = output_len / (decode_latency_ms / 1000.0) if decode_latency_ms > 0 else math.inf
+        slo_total_steps = len(chosen)
+        all_steps_slo_met = slo_satisfied_steps == slo_total_steps
         return {
             "scheduler": self.name,
             "decode_latency_ms": decode_latency_ms,
+            "decode_compute_latency_ms": decode_compute_latency_ms,
+            "decode_transition_latency_ms": decode_transition_latency_ms,
             "decode_energy_mj": decode_energy_mj,
+            "decode_compute_energy_mj": decode_compute_energy_mj,
+            "decode_transition_energy_mj": decode_transition_energy_mj,
             "decode_throughput_tps": achieved_decode_tps,
-            "all_segments_profile_slo_met": all_segments_profile_slo_met,
-            "slo_met": all_segments_profile_slo_met,
+            "slo_satisfied_steps": slo_satisfied_steps,
+            "slo_total_steps": slo_total_steps,
+            "slo_satisfaction_rate": slo_satisfied_steps / slo_total_steps if slo_total_steps else 1.0,
+            "all_segments_profile_slo_met": profile_slo_met,
+            "all_steps_slo_met": all_steps_slo_met,
+            "slo_met": all_steps_slo_met,
             "segments": segment_rows,
+            "decode_schedule_env": build_decode_schedule_env(segment_rows, bucket_size),
             "notes": sorted(notes),
         }
+
+    def make_node(
+        self,
+        prev_node: DpNode | None,
+        prev_state: str | None,
+        candidate: SegmentCandidate,
+        transition: TransitionCost,
+    ) -> DpNode:
+        if transition.source == "backend_default":
+            transition = TransitionCost(
+                transition.latency_ms,
+                candidate.record.power_mw * transition.latency_ms / 1000.0,
+                transition.source,
+            )
+        step_latency_ms = transition.latency_ms + candidate.latency_ms
+        step_energy_mj = transition.energy_mj + candidate.energy_mj
+        step_slo_deadline_ms = self.slo_tbt_ms * candidate.num_tokens
+        step_slo_miss_ms = max(0.0, step_latency_ms - step_slo_deadline_ms)
+        step_slo_ok = step_slo_miss_ms <= 1e-9
+        prev_energy = prev_node.total_energy_mj if prev_node else 0.0
+        prev_latency = prev_node.total_latency_ms if prev_node else 0.0
+        prev_violations = prev_node.total_slo_violations if prev_node else 0
+        prev_miss = prev_node.total_slo_miss_ms if prev_node else 0.0
+        return DpNode(
+            total_energy_mj=prev_energy + step_energy_mj,
+            total_latency_ms=prev_latency + step_latency_ms,
+            total_slo_violations=prev_violations + (0 if step_slo_ok else 1),
+            total_slo_miss_ms=prev_miss + step_slo_miss_ms,
+            prev_state=prev_state,
+            candidate=candidate,
+            transition=transition,
+            step_latency_ms=step_latency_ms,
+            step_energy_mj=step_energy_mj,
+            step_slo_deadline_ms=step_slo_deadline_ms,
+            step_slo_ok=step_slo_ok,
+            step_slo_miss_ms=step_slo_miss_ms,
+        )
 
     def candidates_for_segment(
         self,
@@ -241,7 +376,7 @@ class EnergyDpScheduler(Scheduler):
                 continue
             if self.fixed_backend and record.backend != self.fixed_backend:
                 continue
-            if self.fixed_state and record.state_name != self.fixed_state:
+            if self.fixed_state and not state_matches(record.backend, record.state_name, self.fixed_state):
                 continue
             match = bucket_match(record, context_bucket_lo, context_bucket_hi, self.context_match)
             if match is None:
@@ -262,42 +397,95 @@ class EnergyDpScheduler(Scheduler):
                     matched_profile_bucket_lo=record.bucket_lo,
                     matched_profile_bucket_hi=record.bucket_hi,
                     match_kind=match_kind,
-                    feasible_for_slo=record.throughput_tps >= self.slo_tps,
+                    feasible_for_slo=record.mean_tbt_ms <= self.slo_tbt_ms,
                     selection_mode="feasible",
                 )
             )
         if not raw:
             return []
 
-        feasible = [candidate for candidate in raw if candidate.feasible_for_slo]
-        if feasible:
-            return feasible
+        return raw
 
-        best_throughput = max(candidate.record.throughput_tps for candidate in raw)
-        return [
-            SegmentCandidate(
-                segment_id=candidate.segment_id,
-                context_bucket_lo=candidate.context_bucket_lo,
-                context_bucket_hi=candidate.context_bucket_hi,
-                num_tokens=candidate.num_tokens,
-                record=candidate.record,
-                matched_profile_bucket_lo=candidate.matched_profile_bucket_lo,
-                matched_profile_bucket_hi=candidate.matched_profile_bucket_hi,
-                match_kind=candidate.match_kind,
-                feasible_for_slo=False,
-                selection_mode="best_effort_closest_to_slo",
+    def raw_candidate_for_state(
+        self,
+        state_name: str,
+        context_bucket_lo: int,
+        context_bucket_hi: int,
+        num_tokens: int,
+    ) -> SegmentCandidate | None:
+        best: tuple[float, SegmentCandidate] | None = None
+        for record in self.records:
+            if record.phase != "decode":
+                continue
+            if record.backend not in self.allowed_backends:
+                continue
+            if self.fixed_backend and record.backend != self.fixed_backend:
+                continue
+            if not state_matches(record.backend, record.state_name, state_name):
+                continue
+            match = bucket_match(record, context_bucket_lo, context_bucket_hi, self.context_match)
+            if match is None:
+                continue
+            candidate = SegmentCandidate(
+                segment_id=-1,
+                context_bucket_lo=context_bucket_lo,
+                context_bucket_hi=context_bucket_hi,
+                num_tokens=num_tokens,
+                record=record,
+                matched_profile_bucket_lo=record.bucket_lo,
+                matched_profile_bucket_hi=record.bucket_hi,
+                match_kind=match[1],
+                feasible_for_slo=record.mean_tbt_ms <= self.slo_tbt_ms,
+                selection_mode="candidate_probe",
             )
-            for candidate in raw
-            if candidate.record.throughput_tps == best_throughput
-        ]
+            item = (match[0], candidate)
+            if best is None or item[0] < best[0]:
+                best = item
+        return best[1] if best else None
+
+    def switch_reason(self, node: DpNode) -> str:
+        prev_state = node.prev_state
+        current = node.candidate
+        if not prev_state or state_matches(current.record.backend, current.record.state_name, prev_state):
+            return ""
+        previous_candidate = self.raw_candidate_for_state(
+            prev_state,
+            current.context_bucket_lo,
+            current.context_bucket_hi,
+            current.num_tokens,
+        )
+        if previous_candidate is None or not previous_candidate.feasible_for_slo:
+            return "slo"
+        if node.step_energy_mj < previous_candidate.energy_mj:
+            return "energy"
+        return ""
+
+    def energy_saving_vs_prev_state(self, node: DpNode) -> float | None:
+        prev_state = node.prev_state
+        current = node.candidate
+        if not prev_state or state_matches(current.record.backend, current.record.state_name, prev_state):
+            return None
+        previous_candidate = self.raw_candidate_for_state(
+            prev_state,
+            current.context_bucket_lo,
+            current.context_bucket_hi,
+            current.num_tokens,
+        )
+        if previous_candidate is None:
+            return None
+        return previous_candidate.energy_mj - node.step_energy_mj
 
     def lookup_transition(self, from_state: str, to_state: str) -> TransitionCost:
-        if from_state == to_state:
-            return TransitionCost(0.0, 0.0, "same_state")
-        from_backend = backend_for_state(self.records, from_state)
-        to_backend = backend_for_state(self.records, to_state)
+        from_backend = self.backend_by_state.get(from_state) or backend_for_state(self.records, from_state)
+        to_backend = self.backend_by_state.get(to_state) or backend_for_state(self.records, to_state)
         for row in self.transitions:
-            if str(row.get("from_state", "")) == from_state and str(row.get("to_state", "")) == to_state:
+            row_from_state = str(row.get("from_state", ""))
+            row_to_state = str(row.get("to_state", ""))
+            if transition_state_matches(row_from_state, from_state, from_backend) and transition_state_matches(
+                row_to_state,
+                to_state,
+                to_backend,
+            ):
                 return TransitionCost(
                     parse_float(row.get("latency_ms"), 0.0),
                     parse_float(row.get("energy_mj"), 0.0),
@@ -316,6 +504,11 @@ class EnergyDpScheduler(Scheduler):
                     parse_float(row.get("energy_mj"), 0.0),
                     "backend_profile",
                 )
+        if from_state == to_state or (from_backend and to_backend and from_backend == to_backend):
+            return TransitionCost(0.0, 0.0, "same_state")
+        backend_latency = backend_transition_latency_ms(from_backend, to_backend)
+        if backend_latency is not None:
+            return TransitionCost(backend_latency, 0.0, "backend_default")
         return TransitionCost(self.default_transition_latency_ms, self.default_transition_energy_mj, "default")
 
 
@@ -351,41 +544,109 @@ def normalize_backend(value: str) -> str:
     return upper
 
 
-def load_profile(path: Path, allow_unstable: bool) -> tuple[list[ProfileRecord], list[dict[str, Any]], dict[str, Any]]:
+def state_aliases(backend: str, state_name: str) -> set[str]:
+    backend = normalize_backend(backend)
+    clean = state_name.strip()
+    aliases = {clean}
+    if backend == "GPU":
+        suffix = clean.removeprefix("gpu_")
+        aliases.update({suffix, f"gpu_{suffix}"})
+    elif backend == "NPU":
+        suffix = clean.removeprefix("npu_")
+        aliases.update({suffix, f"npu_{suffix}"})
+    elif backend == "CPU":
+        suffix = clean.removeprefix("cpu_")
+        aliases.update({suffix, f"cpu_{suffix}"})
+        simple = re.match(r"(?P<class>[A-Za-z0-9]+)_(?P<big>\d+)_(?P<little>\d+)$", suffix)
+        if simple:
+            group = simple.group("class")
+            big = simple.group("big")
+            little = simple.group("little")
+            aliases.update(
+                {
+                    f"{group}_big{big}_little{little}",
+                    f"cpu_{group}_big{big}_little{little}",
+                }
+            )
+        verbose = re.match(r"(?P<class>[A-Za-z0-9]+)_big(?P<big>\d+)_little(?P<little>\d+)$", suffix)
+        if verbose:
+            group = verbose.group("class")
+            big = verbose.group("big")
+            little = verbose.group("little")
+            aliases.update({f"{group}_{big}_{little}", f"cpu_{group}_{big}_{little}"})
+    return aliases
+
+
+def state_matches(backend: str, profile_state_name: str, requested_state: str) -> bool:
+    return bool(state_aliases(backend, profile_state_name) & state_aliases(backend, requested_state))
+
+
+def default_baseline_decode_state(backend: str) -> str:
+    normalized = normalize_backend(backend)
+    try:
+        return DEFAULT_BASELINE_DECODE_STATES[normalized]
+    except KeyError as exc:
+        raise ValueError(f"no default baseline decode state configured for backend={backend!r}") from exc
+
+
+def profile_record_from_mapping(item: dict[str, Any], allow_unstable: bool) -> ProfileRecord | None:
+    status = str(item.get("status", "ok")).lower()
+    stable = bool(item.get("stable", True))
+    if not allow_unstable and (status != "ok" or not stable):
+        return None
+    throughput = parse_float(item.get("throughput_tps"), 0.0)
+    power = parse_float(item.get("power_mw"), 0.0)
+    bucket_hi = int(parse_float(item.get("bucket_hi") or item.get("length"), 0.0))
+    bucket_lo = int(parse_float(item.get("bucket_lo") or item.get("length"), float(bucket_hi)))
+    length = int(parse_float(item.get("length") or item.get("bucket_hi"), float(bucket_hi)))
+    state_name = str(item.get("state_name") or "")
+    if not state_name or throughput <= 0 or power < 0 or length <= 0 or bucket_lo <= 0 or bucket_hi <= 0:
+        return None
+    return ProfileRecord(
+        phase=str(item.get("phase") or "").lower(),
+        backend=normalize_backend(str(item.get("backend") or "")),
+        state_name=state_name,
+        state_group=str(item.get("state_group") or ""),
+        length=length,
+        bucket_lo=bucket_lo,
+        bucket_hi=bucket_hi,
+        throughput_tps=throughput,
+        power_mw=power,
+        stable=stable,
+        status=status,
+        metadata=dict(item.get("metadata") or {}),
+    )
+
+
+def load_csv_profile(path: Path, allow_unstable: bool) -> tuple[list[ProfileRecord], list[dict[str, Any]], dict[str, Any]]:
+    records: list[ProfileRecord] = []
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames != PROFILE_FIELDS:
+            raise ValueError(f"profile CSV schema mismatch in {path}; got {reader.fieldnames}, expected {PROFILE_FIELDS}")
+        for row in reader:
+            record = profile_record_from_mapping(row, allow_unstable)
+            if record:
+                records.append(record)
+    return records, [], {"schema_version": "system_benefit_profile.csv.v1"}
+
+
+def load_json_profile(path: Path, allow_unstable: bool) -> tuple[list[ProfileRecord], list[dict[str, Any]], dict[str, Any]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     records: list[ProfileRecord] = []
     for item in payload.get("records", []):
         if not isinstance(item, dict):
             continue
-        status = str(item.get("status", "ok")).lower()
-        stable = bool(item.get("stable", True))
-        if not allow_unstable and (status != "ok" or not stable):
-            continue
-        throughput = parse_float(item.get("throughput_tps"), 0.0)
-        power = parse_float(item.get("power_mw"), 0.0)
-        length = int(parse_float(item.get("length"), 0.0))
-        bucket_lo = int(parse_float(item.get("bucket_lo"), float(length)))
-        bucket_hi = int(parse_float(item.get("bucket_hi"), float(length)))
-        state_name = str(item.get("state_name") or "")
-        if not state_name or throughput <= 0 or power < 0 or length <= 0 or bucket_lo <= 0 or bucket_hi <= 0:
-            continue
-        records.append(
-            ProfileRecord(
-                phase=str(item.get("phase") or "").lower(),
-                backend=normalize_backend(str(item.get("backend") or "")),
-                state_name=state_name,
-                state_group=str(item.get("state_group") or ""),
-                length=length,
-                bucket_lo=bucket_lo,
-                bucket_hi=bucket_hi,
-                throughput_tps=throughput,
-                power_mw=power,
-                stable=stable,
-                status=status,
-                metadata=dict(item.get("metadata") or {}),
-            )
-        )
+        record = profile_record_from_mapping(item, allow_unstable)
+        if record:
+            records.append(record)
     return records, list(payload.get("transitions", [])), payload
+
+
+def load_profile(path: Path, allow_unstable: bool) -> tuple[list[ProfileRecord], list[dict[str, Any]], dict[str, Any]]:
+    if path.suffix.lower() == ".json":
+        return load_json_profile(path, allow_unstable)
+    return load_csv_profile(path, allow_unstable)
 
 
 def length_distance(length: int, target: int) -> int:
@@ -434,10 +695,10 @@ def bucket_match(record: ProfileRecord, query_lo: int, query_hi: int, mode: str)
 
     if record.bucket_lo == query_lo and record.bucket_hi == query_hi:
         return 0.0, "exact"
+    if record.bucket_lo <= query_lo and record.bucket_hi >= query_hi:
+        return 0.0, "covering_partial_bucket" if mode == "exact" else "covering_bucket"
     if mode == "exact":
         return None
-    if record.bucket_lo <= query_lo and record.bucket_hi >= query_hi:
-        return 0.0, "covering_bucket"
     if mode == "floor" and record.bucket_hi <= query_hi:
         return bucket_match_distance(record, query_lo, query_hi), "floor"
     if mode == "ceil" and record.bucket_lo >= query_lo:
@@ -449,9 +710,78 @@ def bucket_match(record: ProfileRecord, query_lo: int, query_hi: int, mode: str)
 
 def backend_for_state(records: Iterable[ProfileRecord], state_name: str) -> str | None:
     for record in records:
-        if record.state_name == state_name:
+        if state_matches(record.backend, record.state_name, state_name):
             return record.backend
     return None
+
+
+def transition_state_matches(row_state: str, query_state: str, backend: str | None) -> bool:
+    if not row_state:
+        return False
+    if row_state == query_state:
+        return True
+    return state_matches(backend, row_state, query_state) if backend else False
+
+
+def route_spec_for_state(backend: str, state_name: str, state_group: str = "") -> str:
+    backend = normalize_backend(backend)
+    text = f"{state_name} {state_group}".strip()
+    if backend == "GPU":
+        numbers = [int(item) for item in re.findall(r"\d+", text)]
+        if not numbers:
+            return "opencl"
+        freq_mhz = numbers[-1]
+        return f"opencl{{gpu_freq_hz={freq_mhz * 1_000_000}}}"
+    if backend == "NPU":
+        lowered = text.lower()
+        workpoint = state_name.removeprefix("npu_")
+        for candidate in ["low_balanced", "balanced", "burst", "low_power_saver", "power_saver", "low", "native"]:
+            if candidate in lowered:
+                workpoint = candidate
+                break
+        return f"qnn-npu{{workpoint={workpoint}}}"
+    if backend == "CPU":
+        return cpu_route_spec_for_state(state_name, state_group)
+    return state_name
+
+
+def cpu_route_spec_for_state(state_name: str, state_group: str = "") -> str:
+    suffix = state_name.removeprefix("cpu_")
+    text = f"{suffix} {state_group}"
+    numbers = [int(item) for item in re.findall(r"\d+", text)]
+    freqs = [item for item in numbers if item >= 100000]
+    group = state_group or suffix.split("_", 1)[0]
+    group_upper = group.upper()
+    if "B2S4" in group_upper and len(freqs) >= 2:
+        big, little = freqs[0], freqs[1]
+        return f"cpu{{threads=6,affinity=FC,cpu_policy0_freq_khz={little},cpu_policy6_freq_khz={big}}}"
+    if "B2S2" in group_upper and len(freqs) >= 2:
+        big, little = freqs[0], freqs[1]
+        return f"cpu{{threads=4,affinity=CC,cpu_policy0_freq_khz={little},cpu_policy6_freq_khz={big}}}"
+    if "S6" in group_upper and freqs:
+        return f"cpu{{threads=6,affinity=3F,cpu_policy0_freq_khz={freqs[-1]}}}"
+    if "B2" in group_upper and freqs:
+        return f"cpu{{threads=2,affinity=C0,cpu_policy6_freq_khz={freqs[0]}}}"
+    if "B1" in group_upper and freqs:
+        return f"cpu{{threads=1,affinity=40,cpu_policy6_freq_khz={freqs[0]}}}"
+    return "cpu"
+
+
+def build_decode_schedule_env(segments: list[dict[str, Any]], bucket_size: int) -> str:
+    entries: list[str] = []
+    previous_spec: str | None = None
+    for index, segment in enumerate(segments):
+        spec = route_spec_for_state(
+            str(segment.get("backend") or ""),
+            str(segment.get("selected_state") or ""),
+            str(segment.get("state_group") or ""),
+        )
+        if spec == previous_spec:
+            continue
+        start_token = index * bucket_size + 1
+        entries.append(f"{start_token}:{spec}")
+        previous_spec = spec
+    return ";".join(entries)
 
 
 def empty_decode_plan(scheduler_name: str) -> dict[str, Any]:
@@ -598,12 +928,27 @@ def optional_float(value: str | None) -> float | None:
     return parse_float(value)
 
 
+def resolve_slo_tbt_ms(args: argparse.Namespace) -> float:
+    if args.slo_tbt_ms is not None:
+        value = parse_float(args.slo_tbt_ms)
+        if value <= 0:
+            raise ValueError("--slo-tbt-ms must be positive")
+        return value
+    if args.slo_tps is not None:
+        value = parse_float(args.slo_tps)
+        if value <= 0:
+            raise ValueError("--slo-tps must be positive")
+        return 1000.0 / value
+    raise ValueError("missing required SLO: pass --slo-tbt-ms")
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Simulate bucketed CPU/GPU/NPU decode planning from an offline profile JSON.")
-    parser.add_argument("--profile", default="profiles/system_benefit_offline_profile.json")
+    parser = argparse.ArgumentParser(description="Simulate bucketed CPU/GPU/NPU decode planning from an offline profile CSV.")
+    parser.add_argument("--profile", default="profiles/system_benefit_offline_profile.csv")
     parser.add_argument("--input-len", type=int, required=True)
     parser.add_argument("--output-len", type=int, required=True)
-    parser.add_argument("--slo-tps", type=float, required=True, help="Per-bucket decode throughput SLO in tokens/s.")
+    parser.add_argument("--slo-tbt-ms", default=None, help="Per-bucket decode mean TBT SLO in milliseconds. Lower is stricter.")
+    parser.add_argument("--slo-tps", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--bucket-size", type=int, default=32)
     parser.add_argument("--scheduler", choices=["energy-dp"], default="energy-dp")
     parser.add_argument("--allowed-backends", default="CPU,GPU,NPU")
@@ -611,6 +956,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-unstable", action="store_true")
     parser.add_argument("--default-transition-latency-ms", type=float, default=0.0)
     parser.add_argument("--default-transition-energy-mj", type=float, default=0.0)
+    parser.add_argument(
+        "--initial-decode-state",
+        "--current-state",
+        dest="initial_decode_state",
+        default=None,
+        help="Current state before scheduled decode starts; first step includes current->selected transition.",
+    )
 
     parser.add_argument("--prefill-backend", default="NPU")
     parser.add_argument("--prefill-state", default=None)
@@ -625,7 +977,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline-prefill-power-mw", default=None)
     parser.add_argument("--baseline-prefill-energy-mj", default=None)
     parser.add_argument("--baseline-decode-backend", default="CPU")
-    parser.add_argument("--baseline-decode-state", default=None)
+    parser.add_argument(
+        "--baseline-decode-state",
+        default=None,
+        help="Fixed baseline decode state. Defaults by backend: CPU=B2S4_4320000_3532800, GPU=1100, NPU=burst.",
+    )
+    parser.add_argument(
+        "--baseline-initial-decode-state",
+        default=None,
+        help="Current state before baseline decode starts. Omit to keep baseline decode transition-free.",
+    )
 
     parser.add_argument("--output", default=None, help="Write JSON result. If omitted, only a text summary is printed.")
     parser.add_argument("--dry-run", action="store_true", help="Validate inputs and print the simulation request without writing output.")
@@ -639,6 +1000,7 @@ def build_decode_scheduler(
     *,
     fixed_backend: str | None = None,
     fixed_state: str | None = None,
+    initial_state: str | None = None,
 ) -> EnergyDpScheduler:
     allowed = parse_backend_set(args.allowed_backends)
     if fixed_backend:
@@ -646,11 +1008,12 @@ def build_decode_scheduler(
     return EnergyDpScheduler(
         records,
         transitions,
-        slo_tps=args.slo_tps,
+        slo_tbt_ms=args.slo_tbt_ms,
         context_match=args.context_match,
         allowed_backends=allowed,
         fixed_backend=normalize_backend(fixed_backend) if fixed_backend else None,
         fixed_state=fixed_state,
+        initial_state=initial_state,
         default_transition_latency_ms=args.default_transition_latency_ms,
         default_transition_energy_mj=args.default_transition_energy_mj,
     )
@@ -658,12 +1021,20 @@ def build_decode_scheduler(
 
 def main() -> int:
     args = parse_args()
+    try:
+        args.slo_tbt_ms = resolve_slo_tbt_ms(args)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     profile_path = Path(args.profile)
     if not profile_path.is_absolute():
         profile_path = ROOT / profile_path
     records, transitions, profile_payload = load_profile(profile_path, args.allow_unstable)
     if not records:
         raise SystemExit(f"profile has no usable records: {profile_path}")
+    try:
+        baseline_decode_state = args.baseline_decode_state or default_baseline_decode_state(args.baseline_decode_backend)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     if args.dry_run:
         decode_records = [record for record in records if record.phase == "decode"]
         prefill_records = [record for record in records if record.phase == "prefill"]
@@ -672,17 +1043,20 @@ def main() -> int:
         print(
             "request="
             f"input_len={args.input_len} output_len={args.output_len} "
-            f"slo_tps={args.slo_tps} bucket_size={args.bucket_size}"
+            f"slo_tbt_ms={args.slo_tbt_ms} bucket_size={args.bucket_size}"
         )
         print(
             "scheduled="
             f"prefill_backend={normalize_backend(args.prefill_backend)} "
-            f"allowed_backends={','.join(sorted(parse_backend_set(args.allowed_backends)))}"
+            f"allowed_backends={','.join(sorted(parse_backend_set(args.allowed_backends)))} "
+            f"initial_decode_state={args.initial_decode_state or ''}"
         )
         print(
             "baseline="
             f"prefill_backend={normalize_backend(args.baseline_prefill_backend)} "
-            f"decode_backend={normalize_backend(args.baseline_decode_backend)}"
+            f"decode_backend={normalize_backend(args.baseline_decode_backend)} "
+            f"decode_state={baseline_decode_state} "
+            f"initial_decode_state={args.baseline_initial_decode_state or ''}"
         )
         print(f"dry-run: would write {args.output}" if args.output else "dry-run: no output path requested")
         return 0
@@ -698,7 +1072,7 @@ def main() -> int:
         energy_override_mj=optional_float(args.prefill_energy_mj),
         missing_policy=args.missing_prefill_policy,
     )
-    scheduled_decode = build_decode_scheduler(records, transitions, args).plan_decode(
+    scheduled_decode = build_decode_scheduler(records, transitions, args, initial_state=args.initial_decode_state).plan_decode(
         args.input_len,
         args.output_len,
         args.bucket_size,
@@ -721,7 +1095,8 @@ def main() -> int:
         transitions,
         args,
         fixed_backend=args.baseline_decode_backend,
-        fixed_state=args.baseline_decode_state,
+        fixed_state=baseline_decode_state,
+        initial_state=args.baseline_initial_decode_state,
     ).plan_decode(args.input_len, args.output_len, args.bucket_size)
     baseline = merge_prefill_decode(baseline_prefill, baseline_decode, args.output_len)
 
@@ -743,10 +1118,14 @@ def main() -> int:
         "request": {
             "input_len": args.input_len,
             "output_len": args.output_len,
-            "slo_tps": args.slo_tps,
+            "slo_tbt_ms": args.slo_tbt_ms,
             "bucket_size": args.bucket_size,
             "context_match": args.context_match,
             "allowed_backends": sorted(parse_backend_set(args.allowed_backends)),
+            "baseline_decode_backend": normalize_backend(args.baseline_decode_backend),
+            "baseline_decode_state": baseline_decode_state,
+            "initial_decode_state": args.initial_decode_state,
+            "baseline_initial_decode_state": args.baseline_initial_decode_state,
             "transition_default_latency_ms": args.default_transition_latency_ms,
             "transition_default_energy_mj": args.default_transition_energy_mj,
         },
@@ -769,6 +1148,7 @@ def main() -> int:
     print(f"  e2e_output_throughput_tps={scheduled['e2e_output_throughput_tps']:.3f}")
     print(f"  total_energy_mj={scheduled['total_energy_mj']:.3f}")
     print(f"  decode_slo_met={scheduled['slo_met']}")
+    print(f"  decode_slo_satisfaction_rate={scheduled['slo_satisfaction_rate']:.3f}")
     print("baseline:")
     print(f"  total_latency_ms={baseline['total_latency_ms']:.3f}")
     print(f"  e2e_output_throughput_tps={baseline['e2e_output_throughput_tps']:.3f}")

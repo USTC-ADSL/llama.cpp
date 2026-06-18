@@ -1,0 +1,58 @@
+model_path: ""
+tokenizer_path: ""
+output_dir: "."
+idle_power_mw: 0.0
+repeat: 3
+decode_probe_tokens: 64
+context_points: [512, 1024, 1536, 2048, 3072, 4096, 5120, 6144]
+prefill_points: [256, 512, 1024, 2048, 4096]
+buckets:
+  - [0, 512]
+  - [512, 1024]
+  - [1024, 1536]
+  - [1536, 2048]
+  - [2048, 3072]
+  - [3072, 4096]
+  - [4096, 5120]
+  - [5120, 6144]
+npu_workpoints: [low_balanced, balanced, burst]
+qnn_graphs:
+  - capacity: 2048
+    tier: normal
+    notes: "cap2048 representative graph for capacity-feasible sub-2048 contexts"
+  - capacity: 4096
+    tier: large
+    notes: "large graph tier"
+  - capacity: 6144
+    tier: xlarge
+    notes: "xlarge graph tier"
+cpu_affinity_classes:
+  - name: B1
+    affinity: B1
+    notes: "1 big core; sweep big-cluster frequency"
+  - name: B2
+    affinity: B2
+    notes: "2 big cores; sweep big-cluster frequency"
+  - name: S4
+    affinity: S4
+    notes: "small-core-only reference"
+  - name: B2+S2
+    affinity: B2+S2
+    notes: "hybrid reference or limited sweep"
+  - name: allcore
+    affinity: allcore
+    notes: "default governor reference"
+cpu_frequencies: [1804, 2208, 2649]
+prefill_cpu_frequency_mhz: 2649
+gpu_frequencies: [305, 587, 734]
+thermal_policy: "log_only"
+power_sampling_command: ""
+device_command_prefix: ""
+decode_command_template: ""
+prefill_command_template: ""
+transition_command_template: ""
+dry_run: true
+resume: true
+fail_fast: false
+alpha_levels: [1.0, 0.9, 0.8, 0.7]
+refinement_points: [768, 1280, 1792, 2560, 3584, 4608, 5632]

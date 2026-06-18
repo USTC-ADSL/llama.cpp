@@ -247,12 +247,17 @@ target_batches = {
 with open(path, "r", encoding="utf-8") as f:
     data = json.load(f)
 
-graphs = [
+graphs_with_sizes = [
     g for g in data.get("graphs", [])
-    if g.get("type") == "transformers"
-    and "cache_size" in g
+    if "cache_size" in g
     and "context_size" in g
 ]
+graphs = [
+    g for g in graphs_with_sizes
+    if g.get("type") == "transformers"
+]
+if not graphs:
+    graphs = graphs_with_sizes
 selected = [
     g for g in graphs
     if not target_batches or int(g.get("batch_size", -1)) in target_batches
@@ -932,7 +937,6 @@ append_skipped_qnn_row() {
         "${support_status}" \
         '0' \
         "${raw_log}" \
-        '' \
         ''
 }
 

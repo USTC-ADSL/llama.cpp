@@ -1,0 +1,22 @@
+state_name,backend,cpu_affinity,cpu_freq_mhz,gpu_freq_mhz,npu_workpoint,qnn_graph_capacity,notes
+npu_low_balanced_cap2048,NPU,,,,low_balanced,2048,cap2048 representative graph for capacity-feasible sub-2048 contexts
+npu_balanced_cap2048,NPU,,,,balanced,2048,cap2048 representative graph for capacity-feasible sub-2048 contexts
+npu_burst_cap2048,NPU,,,,burst,2048,cap2048 representative graph for capacity-feasible sub-2048 contexts
+npu_low_balanced_cap4096,NPU,,,,low_balanced,4096,large graph tier
+npu_balanced_cap4096,NPU,,,,balanced,4096,large graph tier
+npu_burst_cap4096,NPU,,,,burst,4096,large graph tier
+npu_low_balanced_cap6144,NPU,,,,low_balanced,6144,xlarge graph tier
+npu_balanced_cap6144,NPU,,,,balanced,6144,xlarge graph tier
+npu_burst_cap6144,NPU,,,,burst,6144,xlarge graph tier
+cpu_B1_1804,CPU,B1,1804,,,,1 big core locked frequency
+cpu_B1_2208,CPU,B1,2208,,,,1 big core locked frequency
+cpu_B1_2649,CPU,B1,2649,,,,1 big core locked frequency
+cpu_B2_1804,CPU,B2,1804,,,,2 big cores locked frequency
+cpu_B2_2208,CPU,B2,2208,,,,2 big cores locked frequency
+cpu_B2_2649,CPU,B2,2649,,,,2 big cores locked frequency
+cpu_S4_default,CPU,S4,,,,,small-core-only reference
+cpu_B2S2_default,CPU,B2+S2,,,,,hybrid reference
+cpu_allcore_default,CPU,allcore,,,,,default governor reference
+gpu_305,GPU,,,305,,,locked GPU frequency if available; otherwise TODO
+gpu_587,GPU,,,587,,,locked GPU frequency if available; otherwise TODO
+gpu_734,GPU,,,734,,,locked GPU frequency if available; otherwise TODO

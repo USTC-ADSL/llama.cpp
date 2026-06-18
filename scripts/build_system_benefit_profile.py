@@ -8,13 +8,26 @@ import math
 import re
 import statistics
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_VERSION = "system_benefit_profile.v1"
+POWER_SKIP_HEAD_ROWS = 10
+POWER_SKIP_TAIL_ROWS = 3
+PROFILE_FIELDS = [
+    "phase",
+    "backend",
+    "state_name",
+    "state_group",
+    "bucket_lo",
+    "bucket_hi",
+    "bucket_tokens",
+    "throughput_tps",
+    "power_mw",
+    "energy_mj_per_token",
+    "energy_mj_per_bucket",
+]
 
 
 @dataclass
@@ -339,7 +352,12 @@ def load_power_average(path: Path) -> float | None:
             return None
     if not values:
         return None
-    return statistics.mean(values)
+    if len(values) <= POWER_SKIP_HEAD_ROWS + POWER_SKIP_TAIL_ROWS:
+        return None
+    trimmed = values[POWER_SKIP_HEAD_ROWS : len(values) - POWER_SKIP_TAIL_ROWS]
+    if not trimmed:
+        return None
+    return statistics.mean(trimmed)
 
 
 def find_power_pair(tbt_path: Path) -> Path | None:
@@ -415,6 +433,8 @@ def build_manual_bucket_samples(
             "power_file": str(resolved_power_csv) if resolved_power_csv else "",
             "power_basis": "idle_subtracted" if idle_power_mw else "as_reported",
             "power_bucket_policy": "same_average_power_for_each_context_bucket",
+            "power_skip_head_rows": POWER_SKIP_HEAD_ROWS,
+            "power_skip_tail_rows": POWER_SKIP_TAIL_ROWS,
             "max_context_len": max_context_len,
         }
     )
@@ -648,38 +668,48 @@ def default_input_dir() -> Path:
     return ROOT / "Paper_writing_offline_Log"
 
 
-def empty_payload(args: argparse.Namespace, source_mode: str, source_dirs: list[str]) -> dict[str, Any]:
+def compact_record(record: dict[str, Any]) -> dict[str, Any]:
     return {
-        "schema_version": SCHEMA_VERSION,
-        "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "bucket_size_tokens": args.bucket_size,
-        "source_dirs": source_dirs,
-        "source_mode": source_mode,
-        "idle_power_mw": args.idle_power_mw,
-        "aggregation": {
-            "throughput": "arithmetic_mean",
-            "power": "arithmetic_mean",
-            "stable_if_throughput_cv_lte": args.throughput_cv_threshold,
-            "stable_if_power_cv_lte": args.power_cv_threshold,
-        },
-        "record_count_by_phase_backend": {},
-        "notes": [
-            "Energy is computed as power_mw * elapsed_ms / 1000.0.",
-            "Decode records may be context buckets. For decode, bucket_lo/bucket_hi are inclusive context lengths.",
-            "Prefill length is prompt length.",
-            "Transition records are intentionally empty until measured or supplied.",
-        ],
-        "records": [],
-        "transitions": [],
+        "phase": record["phase"],
+        "backend": record["backend"],
+        "state_name": record["state_name"],
+        "state_group": record["state_group"],
+        "bucket_lo": int(record["bucket_lo"]),
+        "bucket_hi": int(record["bucket_hi"]),
+        "bucket_tokens": int(record["bucket_tokens"]),
+        "throughput_tps": float(record["throughput_tps"]),
+        "power_mw": float(record["power_mw"]),
+        "energy_mj_per_token": float(record["energy_mj_per_token"]),
+        "energy_mj_per_bucket": float(record["energy_mj_per_bucket"]),
     }
 
 
-def update_counts(payload: dict[str, Any]) -> dict[str, int]:
+def compact_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [compact_record(record) for record in records]
+
+
+def read_profile_csv(path: Path) -> list[dict[str, Any]]:
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames != PROFILE_FIELDS:
+            raise ValueError(f"profile CSV schema mismatch in {path}; got {reader.fieldnames}, expected {PROFILE_FIELDS}")
+        return [dict(row) for row in reader]
+
+
+def write_profile_csv(path: Path, records: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=PROFILE_FIELDS)
+        writer.writeheader()
+        for record in records:
+            writer.writerow({field: record[field] for field in PROFILE_FIELDS})
+
+
+def count_records(records: list[dict[str, Any]]) -> dict[str, int]:
     counts: dict[str, int] = {}
-    for record in payload.get("records", []):
+    for record in records:
         key = f"{record.get('phase')}:{record.get('backend')}"
         counts[key] = counts.get(key, 0) + 1
-    payload["record_count_by_phase_backend"] = counts
     return counts
 
 
@@ -713,10 +743,10 @@ def merge_records(existing_records: list[dict[str, Any]], new_records: list[dict
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build one JSON offline profile for system benefit simulation from Paper_Writing/test-hz logs."
+        description="Build one compact CSV offline profile for system benefit simulation from Paper_Writing/test-hz logs."
     )
     parser.add_argument("--input-dir", default=None, help="Default tries Paper_Writing/offline/Log, Paper_writing_offline_Log, Paper_Writing/offline, then test-hz.")
-    parser.add_argument("--output", default="profiles/system_benefit_offline_profile.json")
+    parser.add_argument("--output", default="profiles/system_benefit_offline_profile.csv")
     parser.add_argument("--bucket-size", type=int, default=32)
     parser.add_argument("--idle-power-mw", type=float, default=0.0)
     parser.add_argument("--throughput-cv-threshold", type=float, default=0.10)
@@ -765,32 +795,29 @@ def main() -> int:
             throughput_cv_threshold=args.throughput_cv_threshold,
             power_cv_threshold=args.power_cv_threshold,
         )
+        compact_new_records = compact_records(records)
         if output.exists():
-            payload = json.loads(output.read_text(encoding="utf-8"))
-            if payload.get("schema_version") != SCHEMA_VERSION:
-                raise SystemExit(f"refusing to update incompatible profile schema in {output}")
+            try:
+                existing_records = read_profile_csv(output)
+            except ValueError as exc:
+                raise SystemExit(str(exc)) from exc
         else:
-            payload = empty_payload(args, source_mode=source_mode, source_dirs=[str(csv_path.parent)])
-        payload["created_at_utc"] = datetime.now(timezone.utc).isoformat()
-        payload["bucket_size_tokens"] = args.bucket_size
-        payload["source_mode"] = source_mode
-        payload["source_dirs"] = sorted(set(list(payload.get("source_dirs", [])) + [str(csv_path.parent)]))
-        payload["records"] = merge_records(list(payload.get("records", [])), records)
-        counts = update_counts(payload)
+            existing_records = []
+        merged_records = merge_records(existing_records, compact_new_records)
+        counts = count_records(merged_records)
 
         if args.dry_run:
             print(f"manual_csv={csv_path}")
             print(f"backend={normalize_backend(str(args.backend))} state={args.state} max_context_len={args.max_context_len}")
-            print(f"samples={len(all_samples)} records_to_add={len(records)} output_records_after_merge={len(payload['records'])}")
+            print(f"samples={len(all_samples)} records_to_add={len(compact_new_records)} output_records_after_merge={len(merged_records)}")
             for key in sorted(counts):
                 print(f"{key}: {counts[key]}")
             print(f"dry-run: would write {output}")
             return 0
 
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        write_profile_csv(output, merged_records)
         print(f"wrote {output}")
-        print(f"samples={len(all_samples)} records_added_or_updated={len(records)} total_records={len(payload['records'])}")
+        print(f"samples={len(all_samples)} records_added_or_updated={len(compact_new_records)} total_records={len(merged_records)}")
         for key in sorted(counts):
             print(f"{key}: {counts[key]}")
         return 0
@@ -820,23 +847,21 @@ def main() -> int:
         power_cv_threshold=args.power_cv_threshold,
     )
 
-    payload = empty_payload(args, source_mode=source_mode, source_dirs=[str(input_dir)])
-    payload["records"] = records
-    counts = update_counts(payload)
+    compact_output_records = compact_records(records)
+    counts = count_records(compact_output_records)
 
     if args.dry_run:
         print(f"input_dir={input_dir}")
         print(f"source_mode={source_mode}")
-        print(f"samples={len(all_samples)} records={len(records)}")
+        print(f"samples={len(all_samples)} records={len(compact_output_records)}")
         for key in sorted(counts):
             print(f"{key}: {counts[key]}")
         print(f"dry-run: would write {output}")
         return 0
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    write_profile_csv(output, compact_output_records)
     print(f"wrote {output}")
-    print(f"samples={len(all_samples)} records={len(records)}")
+    print(f"samples={len(all_samples)} records={len(compact_output_records)}")
     for key in sorted(counts):
         print(f"{key}: {counts[key]}")
     return 0

@@ -1,0 +1,6 @@
+state_name,backend,cpu_affinity,cpu_freq_mhz,gpu_freq_mhz,npu_workpoint,qnn_graph_capacity,notes
+npu_burst_cap2048,NPU,,,,burst,2048,normal-tier representative graph
+npu_balanced_cap2048,NPU,,,,balanced,2048,normal-tier representative graph
+cpu_B2_2649,CPU,B2,2649,,,,2 big cores locked frequency
+cpu_allcore_default,CPU,allcore,,,,,default governor reference
+gpu_734,GPU,,,734,,,locked GPU frequency if available

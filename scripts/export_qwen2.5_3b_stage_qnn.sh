@@ -34,6 +34,8 @@ DOWNLOAD_MODEL="${DOWNLOAD_MODEL:-0}"
 BUILD_QNN="${BUILD_QNN:-1}"
 ONNX_ONLY="${ONNX_ONLY:-0}"
 COMBINE_BATCH_BIN="${COMBINE_BATCH_BIN:-0}"
+GROUP_STAGE_BIN="${GROUP_STAGE_BIN:-0}"
+GROUP_LAYER_SIZE="${GROUP_LAYER_SIZE:-4}"
 PRUNE_RUNTIME="${PRUNE_RUNTIME:-0}"
 HF_MODEL_ID="${HF_MODEL_ID:-Qwen/Qwen2.5-3B-Instruct}"
 HF_HOME="${HF_HOME:-$REPO_ROOT/tmp/huggingface}"
@@ -49,6 +51,10 @@ fi
 
 if [[ "$ONNX_ONLY" == "1" ]]; then
   BUILD_QNN=0
+fi
+
+if [[ "$GROUP_STAGE_BIN" == "1" ]]; then
+  COMBINE_BATCH_BIN=1
 fi
 
 if [[ "$COMBINE_BATCH_BIN" == "1" && "$BUILD_QNN" != "1" ]]; then
@@ -103,6 +109,16 @@ fi
 
 if [[ ! "$QNN_MAX_SAMPLES" =~ ^[0-9]+$ ]]; then
   echo "QNN_MAX_SAMPLES must be a non-negative integer, got: $QNN_MAX_SAMPLES" >&2
+  exit 1
+fi
+
+if [[ "$GROUP_STAGE_BIN" != "0" && "$GROUP_STAGE_BIN" != "1" ]]; then
+  echo "GROUP_STAGE_BIN must be 0 or 1, got: $GROUP_STAGE_BIN" >&2
+  exit 1
+fi
+
+if [[ ! "$GROUP_LAYER_SIZE" =~ ^[1-9][0-9]*$ ]]; then
+  echo "GROUP_LAYER_SIZE must be a positive integer, got: $GROUP_LAYER_SIZE" >&2
   exit 1
 fi
 
@@ -247,6 +263,46 @@ with (output_dir / "config.json").open("w") as f:
 PY
 }
 
+merge_grouped_stage_configs() {
+  python - "$OUTPUT_DIR" "$EXPORT_WORK_DIR" "$BATCH_SIZES" "$STAGES" "$GROUP_LAYER_SIZE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+output_dir = Path(sys.argv[1])
+export_work_dir = Path(sys.argv[2])
+batch_sizes = sys.argv[3].split()
+stages = sys.argv[4].split()
+group_layer_size = int(sys.argv[5])
+
+merged = {"model_parameters": {}, "qnn_parameters": {}, "graphs": [], "embeddings": []}
+
+for batch in batch_sizes:
+    for stage in stages:
+        cfg_path = export_work_dir / f"batch_{batch}" / stage / f"config_batch_{batch}.json"
+        if not cfg_path.exists():
+            continue
+        with cfg_path.open("r") as f:
+            data = json.load(f)
+        if not merged["model_parameters"]:
+            merged["model_parameters"] = data.get("model_parameters", {})
+        if not merged["qnn_parameters"]:
+            merged["qnn_parameters"] = data.get("qnn_parameters", {})
+        n_layers = int(merged["model_parameters"].get("n_layers", 36))
+        for graph in data.get("graphs", []):
+            graph = dict(graph)
+            layer = int(graph.get("start_layer_id", 0))
+            group_start = (layer // group_layer_size) * group_layer_size
+            group_end = min(n_layers, group_start + group_layer_size)
+            group_name = f"stage_group_layers_{group_start}_{group_end}"
+            graph["model_path"] = f"groups/{group_name}/{group_name}.bin"
+            merged["graphs"].append(graph)
+
+with (output_dir / "config.json").open("w") as f:
+    json.dump(merged, f, indent=2)
+PY
+}
+
 copy_qnn_runtime_libs() {
   run_cmd cp "$QNN_SDK/lib/aarch64-android/libQnnSystem.so" "$OUTPUT_DIR/"
   run_cmd cp "$QNN_SDK/lib/aarch64-android/libQnnHtp.so" "$OUTPUT_DIR/"
@@ -297,7 +353,7 @@ build_layer_qnn_binary() {
 stage_output_dir_for() {
   local stage="$1"
   local batch="$2"
-  if [[ "$COMBINE_BATCH_BIN" == "1" ]]; then
+  if [[ "$COMBINE_BATCH_BIN" == "1" || "$GROUP_STAGE_BIN" == "1" ]]; then
     echo "$EXPORT_WORK_DIR/batch_${batch}/${stage}"
   else
     echo "$OUTPUT_DIR/batch_${batch}/${stage}"
@@ -353,6 +409,25 @@ generate_combined_layer_qnn_binary() {
     --build-folder "$combined_layer_out" \
     --artifact-name "$layer_name" \
     --graph-names "${graph_names[@]}" \
+    --soc "$SOC"
+}
+
+group_name_for_range() {
+  local start="$1"
+  local end="$2"
+  echo "stage_group_layers_${start}_${end}"
+}
+
+generate_grouped_stage_qnn_binary() {
+  local group_name="$1"
+  local group_out="$2"
+  shift 2
+
+  run_cmd python "$REPO_ROOT/ref/PowerServe/tools/qnn_converter/generate_binary.py" \
+    --silent \
+    --build-folder "$group_out" \
+    --artifact-name "$group_name" \
+    --graph-names "$@" \
     --soc "$SOC"
 }
 
@@ -430,6 +505,8 @@ mkdir -p "$OUTPUT_DIR" "$LOG_DIR" "$BUILD_DIR"
   printf 'qnn_max_samples=%s\n' "$QNN_MAX_SAMPLES"
   printf 'build_qnn=%s\n' "$BUILD_QNN"
   printf 'combine_batch_bin=%s\n' "$COMBINE_BATCH_BIN"
+  printf 'group_stage_bin=%s\n' "$GROUP_STAGE_BIN"
+  printf 'group_layer_size=%s\n' "$GROUP_LAYER_SIZE"
   printf 'prune_runtime=%s\n' "$PRUNE_RUNTIME"
   printf 'export_work_dir=%s\n' "$EXPORT_WORK_DIR"
   printf 'log_dir=%s\n' "$LOG_DIR"
@@ -465,7 +542,44 @@ for batch in $BATCH_SIZES; do
   done
 done
 
-if [[ "$COMBINE_BATCH_BIN" == "1" ]]; then
+if [[ "$GROUP_STAGE_BIN" == "1" ]]; then
+  model_n_layers=36
+  group_start=0
+  while (( group_start < model_n_layers )); do
+    group_end=$((group_start + GROUP_LAYER_SIZE))
+    if (( group_end > model_n_layers )); then
+      group_end="$model_n_layers"
+    fi
+
+    group_layers=()
+    for layer in "${SELECTED_LAYERS[@]}"; do
+      if (( layer >= group_start && layer < group_end )); then
+        group_layers+=("$layer")
+      fi
+    done
+
+    if (( ${#group_layers[@]} > 0 )); then
+      group_name="$(group_name_for_range "$group_start" "$group_end")"
+      group_out="$OUTPUT_DIR/groups/$group_name"
+      mkdir -p "$group_out"
+      graph_names=()
+      for stage in $STAGES; do
+        for layer in "${group_layers[@]}"; do
+          for batch in $BATCH_SIZES; do
+            build_log="$LOG_DIR/build_${stage}_group_${group_start}_${group_end}_b${batch}_l${layer}.log"
+            build_layer_qnn_library_into "$stage" "$batch" "$layer" "$group_out" 2>&1 | tee "$build_log"
+            graph_names+=("$(graph_prefix "$stage" "$layer")_batch_${batch}")
+          done
+        done
+      done
+      build_log="$LOG_DIR/build_group_${group_start}_${group_end}.log"
+      generate_grouped_stage_qnn_binary "$group_name" "$group_out" "${graph_names[@]}" 2>&1 | tee "$build_log"
+    fi
+
+    group_start="$group_end"
+  done
+  merge_grouped_stage_configs
+elif [[ "$COMBINE_BATCH_BIN" == "1" ]]; then
   for stage in $STAGES; do
     for layer in "${SELECTED_LAYERS[@]}"; do
       layer_name="$(layer_dir_name "$stage" "$layer")"
@@ -503,6 +617,8 @@ cat > "$OUTPUT_DIR/summary.md" <<EOF
 - Layers: \`$LAYERS\`
 - QNN binaries built: \`$BUILD_QNN\`
 - Combined batch binaries: \`$COMBINE_BATCH_BIN\`
+- Grouped stage binaries: \`$GROUP_STAGE_BIN\`
+- Group layer size: \`$GROUP_LAYER_SIZE\`
 - Runtime package pruned: \`$PRUNE_RUNTIME\`
 - Config: \`$OUTPUT_DIR/config.json\`
 - Logs: \`$LOG_DIR\`
