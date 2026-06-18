@@ -22,7 +22,8 @@ int main() {
         const char * argv[] = {
             "llama-e2e-bench", "-m", "model.gguf", "-t", "3", "-p", "64", "-n", "9", "-d", "7",
             "-pg", "128,32", "-c", "256", "-b", "16", "-ub", "4", "-r", "2", "--no-warmup",
-            "--mmap", "0", "--dataset", "sharegpt.jsonl", "--limit", "10", "--no-wait-start",
+            "--mmap", "0", "--dataset", "sharegpt.jsonl", "--limit", "10", "--dataset-output-tokens",
+            "--no-wait-start",
         };
 
         e2e_bench_params params;
@@ -41,6 +42,7 @@ int main() {
         t.assert_true("mmap disabled", !params.use_mmap);
         t.assert_equal("dataset path", std::string("sharegpt.jsonl"), params.dataset);
         t.assert_equal("limit", 10, params.limit);
+        t.assert_true("dataset output tokens enabled", params.dataset_output_tokens);
         t.assert_true("wait disabled", !params.wait_start);
     });
 
@@ -58,6 +60,27 @@ int main() {
         t.assert_equal("prompt count", 2, (int) prompts.size());
         t.assert_equal("first prompt", std::string("hello"), prompts[0]);
         t.assert_equal("second prompt", std::string("second prompt"), prompts[1]);
+    });
+
+    t.test("load sharegpt jsonl samples with first assistant output", [](testing & t) {
+        const std::string path = write_temp_file(
+            "e2e-bench-sharegpt-samples.jsonl",
+            "{\"conversations\":[{\"from\":\"human\",\"value\":\"hello\"},{\"from\":\"gpt\",\"value\":\"hi there\"}]}\n"
+            "{\"messages\":[{\"role\":\"user\",\"content\":\"question\"},{\"role\":\"assistant\",\"content\":\"answer text\"}]}\n"
+            "{\"prompt\":\"plain prompt\",\"text\":\"plain output\"}\n");
+
+        std::string err;
+        const std::vector<e2e_bench_sample> samples = e2e_bench_load_samples(path, 0, err);
+
+        std::remove(path.c_str());
+
+        t.assert_equal("sample count", 3, (int) samples.size());
+        t.assert_equal("first prompt", std::string("hello"), samples[0].prompt);
+        t.assert_equal("first output", std::string("hi there"), samples[0].output);
+        t.assert_equal("second prompt", std::string("question"), samples[1].prompt);
+        t.assert_equal("second output", std::string("answer text"), samples[1].output);
+        t.assert_equal("plain prompt", std::string("plain prompt"), samples[2].prompt);
+        t.assert_equal("plain output", std::string("plain output"), samples[2].output);
     });
 
     t.test("select default sharegpt file when dataset argument is a directory", [](testing & t) {

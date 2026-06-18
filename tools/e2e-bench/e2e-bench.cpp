@@ -56,6 +56,7 @@ static void print_usage(int, char ** argv) {
             "e2e options:\n"
             "  --dataset PATH           JSONL file or directory; ShareGPT conversations are supported\n"
             "  --limit N, --samples N   max dataset samples; 0 means all\n"
+            "  --dataset-output-tokens  generate the same token count as each dataset assistant output\n"
             "  --no-wait-start          do not wait at READY before MEASURE_BEGIN\n",
             argv[0]);
 }
@@ -170,9 +171,10 @@ static bool decode_one(llama_context * ctx, llama_token token, int pos) {
 static bool run_sample(
         llama_context * ctx,
         llama_sampler * sampler,
-        const std::string & prompt,
+        const e2e_bench_sample & sample,
         const e2e_bench_params & params,
         bool dataset_prompt,
+        int target_gen_tokens,
         sample_result & result) {
     llama_memory_clear(llama_get_memory(ctx), true);
     ctx->clear_dynamic_seq0_token_history();
@@ -190,8 +192,8 @@ static bool run_sample(
         return false;
     }
 
-    std::vector<llama_token> prompt_tokens = common_tokenize(vocab, prompt, true, true);
-    const int max_prompt_tokens = std::max(1, (int) llama_n_ctx(ctx) - params.n_depth - params.n_gen);
+    std::vector<llama_token> prompt_tokens = common_tokenize(vocab, sample.prompt, true, true);
+    const int max_prompt_tokens = std::max(1, (int) llama_n_ctx(ctx) - params.n_depth - target_gen_tokens);
     int prompt_cap = max_prompt_tokens;
     if (params.n_prompt > 0) {
         prompt_cap = std::min(prompt_cap, params.n_prompt);
@@ -203,7 +205,7 @@ static bool run_sample(
         prompt_tokens.clear();
     }
 
-    if (prompt_tokens.empty() && params.n_gen > 0) {
+    if (prompt_tokens.empty() && target_gen_tokens > 0) {
         prompt_tokens.push_back(llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : (llama_token) 1);
     }
 
@@ -212,7 +214,7 @@ static bool run_sample(
     }
 
     int generated = 0;
-    for (; generated < params.n_gen; ++generated) {
+    for (; generated < target_gen_tokens; ++generated) {
         llama_token token = llama_sampler_sample(sampler, ctx, -1);
         llama_sampler_accept(sampler, token);
         if (!decode_one(ctx, token, n_past)) {
@@ -228,11 +230,39 @@ static bool run_sample(
     return true;
 }
 
-static bool run_warmup(llama_context * ctx, llama_sampler * sampler, const std::vector<std::string> & prompts, const e2e_bench_params & params, bool dataset_prompt) {
-    e2e_bench_params warmup_params = params;
-    warmup_params.n_gen = std::min(params.n_gen, 1);
+static int e2e_bench_sample_target_gen_tokens(
+        const llama_vocab *      vocab,
+        const e2e_bench_sample & sample,
+        const e2e_bench_params & params) {
+    if (params.dataset_output_tokens && !sample.output.empty()) {
+        const std::vector<llama_token> output_tokens = common_tokenize(vocab, sample.output, false, true);
+        return (int) output_tokens.size();
+    }
+    return params.n_gen;
+}
+
+static std::vector<int> e2e_bench_resolve_sample_gen_tokens(
+        const llama_vocab *                    vocab,
+        const std::vector<e2e_bench_sample> &  samples,
+        const e2e_bench_params &               params) {
+    std::vector<int> targets;
+    targets.reserve(samples.size());
+    for (const auto & sample : samples) {
+        targets.push_back(std::max(0, e2e_bench_sample_target_gen_tokens(vocab, sample, params)));
+    }
+    return targets;
+}
+
+static bool run_warmup(
+        llama_context *                       ctx,
+        llama_sampler *                       sampler,
+        const std::vector<e2e_bench_sample> & samples,
+        const std::vector<int> &              sample_gen_tokens,
+        const e2e_bench_params &              params,
+        bool                                  dataset_prompt) {
+    const int warmup_gen_tokens = sample_gen_tokens.empty() ? 0 : std::min(sample_gen_tokens.front(), 1);
     sample_result ignored;
-    return run_sample(ctx, sampler, prompts.front(), warmup_params, dataset_prompt, ignored);
+    return run_sample(ctx, sampler, samples.front(), params, dataset_prompt, warmup_gen_tokens, ignored);
 }
 
 int main(int argc, char ** argv) {
@@ -265,16 +295,18 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    std::vector<std::string> prompts;
+    std::vector<e2e_bench_sample> samples;
     bool dataset_prompt = !params.dataset.empty();
     if (dataset_prompt) {
-        prompts = e2e_bench_load_prompts(params.dataset, params.limit, err);
+        samples = e2e_bench_load_samples(params.dataset, params.limit, err);
         if (!err.empty()) {
             std::fprintf(stderr, "llama-e2e-bench: error: %s\n", err.c_str());
             return 1;
         }
     } else {
-        prompts.push_back(make_synthetic_prompt(params.n_prompt));
+        e2e_bench_sample sample;
+        sample.prompt = make_synthetic_prompt(params.n_prompt);
+        samples.push_back(sample);
     }
 
     llama_model_params mparams = llama_model_default_params();
@@ -289,9 +321,15 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "llama-e2e-bench: error: failed to load model: %s\n", params.model.c_str());
         return 1;
     }
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const std::vector<int> sample_gen_tokens =
+        e2e_bench_resolve_sample_gen_tokens(vocab, samples, params);
+    const int max_gen_tokens =
+        sample_gen_tokens.empty() ? params.n_gen :
+        *std::max_element(sample_gen_tokens.begin(), sample_gen_tokens.end());
 
     llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx           = params.n_ctx > 0 ? params.n_ctx : std::max(512, params.n_depth + params.n_prompt + params.n_gen + 8);
+    cparams.n_ctx           = params.n_ctx > 0 ? params.n_ctx : std::max(512, params.n_depth + params.n_prompt + max_gen_tokens + 8);
     cparams.n_batch         = params.n_batch;
     cparams.n_ubatch        = params.n_ubatch;
     cparams.n_threads       = params.n_threads;
@@ -313,7 +351,7 @@ int main(int argc, char ** argv) {
 
     if (!params.no_warmup) {
         std::fprintf(stderr, "llama-e2e-bench: warmup begin\n");
-        if (!run_warmup(ctx, sampler, prompts, params, dataset_prompt)) {
+        if (!run_warmup(ctx, sampler, samples, sample_gen_tokens, params, dataset_prompt)) {
             std::fprintf(stderr, "llama-e2e-bench: error: warmup failed\n");
             llama_sampler_free(sampler);
             llama_free(ctx);
@@ -330,10 +368,12 @@ int main(int argc, char ** argv) {
     llama_perf_sampler_reset(sampler);
 
     std::fprintf(stderr,
-            "llama-e2e-bench: READY prompts=%zu reps=%d n_gen=%d n_ctx=%u n_batch=%d n_ubatch=%d dataset=%s\n",
-            prompts.size(),
+            "llama-e2e-bench: READY prompts=%zu reps=%d n_gen=%d max_gen=%d dataset_output_tokens=%d n_ctx=%u n_batch=%d n_ubatch=%d dataset=%s\n",
+            samples.size(),
             params.reps,
             params.n_gen,
+            max_gen_tokens,
+            params.dataset_output_tokens ? 1 : 0,
             llama_n_ctx(ctx),
             params.n_batch,
             params.n_ubatch,
@@ -354,16 +394,16 @@ int main(int argc, char ** argv) {
     const int64_t measure_start_us = llama_time_us();
 
     std::vector<sample_result> results;
-    results.reserve((size_t) params.reps * prompts.size());
+    results.reserve((size_t) params.reps * samples.size());
 
     for (int rep = 0; rep < params.reps; ++rep) {
-        for (size_t i = 0; i < prompts.size(); ++i) {
+        for (size_t i = 0; i < samples.size(); ++i) {
             sample_result result;
             result.rep    = rep + 1;
             result.sample = (int) i + 1;
-            std::fprintf(stderr, "llama-e2e-bench: SAMPLE_BEGIN rep=%d sample=%zu/%zu\n", rep + 1, i + 1, prompts.size());
+            std::fprintf(stderr, "llama-e2e-bench: SAMPLE_BEGIN rep=%d sample=%zu/%zu\n", rep + 1, i + 1, samples.size());
             std::fflush(stderr);
-            if (!run_sample(ctx, sampler, prompts[i], params, dataset_prompt, result)) {
+            if (!run_sample(ctx, sampler, samples[i], params, dataset_prompt, sample_gen_tokens[i], result)) {
                 std::fprintf(stderr, "llama-e2e-bench: error: sample failed rep=%d sample=%zu\n", rep + 1, i + 1);
                 llama_sampler_free(sampler);
                 llama_free(ctx);
@@ -383,7 +423,7 @@ int main(int argc, char ** argv) {
                     "llama-e2e-bench: SAMPLE_END rep=%d sample=%zu/%zu elapsed_ms=%.3f\n",
                     rep + 1,
                     i + 1,
-                    prompts.size(),
+                    samples.size(),
                     result.elapsed_us / 1000.0);
         }
     }
@@ -397,7 +437,7 @@ int main(int argc, char ** argv) {
     });
 
     std::printf("summary,samples=%zu,reps=%d,total_prompt_tokens=%d,total_gen_tokens=%d,elapsed_ms=%.3f,tok_s=%.3f\n",
-            prompts.size(),
+            samples.size(),
             params.reps,
             total_prompt_tokens,
             total_gen_tokens,

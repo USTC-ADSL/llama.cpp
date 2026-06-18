@@ -34,6 +34,12 @@ struct e2e_bench_params {
     bool wait_start = true;
     bool verbose    = false;
     bool help       = false;
+    bool dataset_output_tokens = false;
+};
+
+struct e2e_bench_sample {
+    std::string prompt;
+    std::string output;
 };
 
 static inline std::string e2e_bench_trim(const std::string & s) {
@@ -199,6 +205,8 @@ static inline bool e2e_bench_parse_args(int argc, char ** argv, e2e_bench_params
             if (!parse_int_arg(params.limit)) {
                 return false;
             }
+        } else if (arg == "--dataset-output-tokens") {
+            params.dataset_output_tokens = true;
         } else if (arg == "--no-wait-start") {
             params.wait_start = false;
         } else if (arg == "--wait-start") {
@@ -304,37 +312,39 @@ static inline std::string e2e_bench_resolve_dataset_path(const std::string & dat
     return e2e_bench_resolve_dataset_path(dataset, names, err);
 }
 
-static inline std::string e2e_bench_prompt_from_json(const nlohmann::ordered_json & item) {
-    auto first_text_from_array = [](const nlohmann::ordered_json & arr) -> std::string {
-        if (!arr.is_array()) {
-            return {};
-        }
-        for (const auto & msg : arr) {
-            if (!msg.is_object()) {
-                continue;
-            }
-            const std::string role = msg.value("from", msg.value("role", ""));
-            if (role != "human" && role != "user") {
-                continue;
-            }
-            if (msg.contains("value") && msg["value"].is_string()) {
-                return msg["value"].get<std::string>();
-            }
-            if (msg.contains("content") && msg["content"].is_string()) {
-                return msg["content"].get<std::string>();
-            }
-        }
+static inline std::string e2e_bench_first_text_from_array(
+        const nlohmann::ordered_json &   arr,
+        const std::vector<std::string> & roles) {
+    if (!arr.is_array()) {
         return {};
-    };
+    }
+    for (const auto & msg : arr) {
+        if (!msg.is_object()) {
+            continue;
+        }
+        const std::string role = msg.value("from", msg.value("role", ""));
+        if (std::find(roles.begin(), roles.end(), role) == roles.end()) {
+            continue;
+        }
+        if (msg.contains("value") && msg["value"].is_string()) {
+            return msg["value"].get<std::string>();
+        }
+        if (msg.contains("content") && msg["content"].is_string()) {
+            return msg["content"].get<std::string>();
+        }
+    }
+    return {};
+}
 
+static inline std::string e2e_bench_prompt_from_json(const nlohmann::ordered_json & item) {
     if (item.contains("conversations")) {
-        std::string prompt = first_text_from_array(item["conversations"]);
+        std::string prompt = e2e_bench_first_text_from_array(item["conversations"], {"human", "user"});
         if (!prompt.empty()) {
             return prompt;
         }
     }
     if (item.contains("messages")) {
-        std::string prompt = first_text_from_array(item["messages"]);
+        std::string prompt = e2e_bench_first_text_from_array(item["messages"], {"human", "user"});
         if (!prompt.empty()) {
             return prompt;
         }
@@ -348,20 +358,56 @@ static inline std::string e2e_bench_prompt_from_json(const nlohmann::ordered_jso
     return {};
 }
 
-static inline std::vector<std::string> e2e_bench_load_prompts(
+static inline std::string e2e_bench_output_from_json(const nlohmann::ordered_json & item) {
+    if (item.contains("conversations")) {
+        std::string output = e2e_bench_first_text_from_array(item["conversations"], {"gpt", "assistant"});
+        if (!output.empty()) {
+            return output;
+        }
+    }
+    if (item.contains("messages")) {
+        std::string output = e2e_bench_first_text_from_array(item["messages"], {"assistant", "gpt"});
+        if (!output.empty()) {
+            return output;
+        }
+    }
+    if (item.contains("output") && item["output"].is_string()) {
+        return item["output"].get<std::string>();
+    }
+    if (item.contains("response") && item["response"].is_string()) {
+        return item["response"].get<std::string>();
+    }
+    if (item.contains("completion") && item["completion"].is_string()) {
+        return item["completion"].get<std::string>();
+    }
+    if (item.contains("prompt") && item["prompt"].is_string() &&
+        item.contains("text") && item["text"].is_string()) {
+        return item["text"].get<std::string>();
+    }
+    return {};
+}
+
+static inline e2e_bench_sample e2e_bench_sample_from_json(const nlohmann::ordered_json & item) {
+    e2e_bench_sample sample;
+    sample.prompt = e2e_bench_prompt_from_json(item);
+    sample.output = e2e_bench_output_from_json(item);
+    return sample;
+}
+
+static inline std::vector<e2e_bench_sample> e2e_bench_load_samples(
         const std::string & dataset,
         int limit,
         std::string & err) {
-    std::vector<std::string> prompts;
+    std::vector<e2e_bench_sample> samples;
     std::string path = e2e_bench_resolve_dataset_path(dataset, err);
     if (!err.empty()) {
-        return prompts;
+        return samples;
     }
 
     std::ifstream in(path);
     if (!in) {
         err = "failed to open dataset file: " + path;
-        return prompts;
+        return samples;
     }
 
     std::string line;
@@ -373,22 +419,38 @@ static inline std::vector<std::string> e2e_bench_load_prompts(
         }
         try {
             nlohmann::ordered_json item = nlohmann::ordered_json::parse(line);
-            std::string prompt = e2e_bench_prompt_from_json(item);
-            if (!prompt.empty()) {
-                prompts.push_back(prompt);
-                if (limit > 0 && (int) prompts.size() >= limit) {
+            e2e_bench_sample sample = e2e_bench_sample_from_json(item);
+            if (!sample.prompt.empty()) {
+                samples.push_back(sample);
+                if (limit > 0 && (int) samples.size() >= limit) {
                     break;
                 }
             }
         } catch (const std::exception & e) {
             err = "failed to parse dataset line " + std::to_string(line_no) + ": " + e.what();
-            prompts.clear();
-            return prompts;
+            samples.clear();
+            return samples;
         }
     }
 
-    if (prompts.empty()) {
+    if (samples.empty()) {
         err = "no usable prompts found in dataset: " + path;
+    }
+    return samples;
+}
+
+static inline std::vector<std::string> e2e_bench_load_prompts(
+        const std::string & dataset,
+        int limit,
+        std::string & err) {
+    std::vector<std::string> prompts;
+    const std::vector<e2e_bench_sample> samples = e2e_bench_load_samples(dataset, limit, err);
+    if (!err.empty()) {
+        return prompts;
+    }
+    prompts.reserve(samples.size());
+    for (const auto & sample : samples) {
+        prompts.push_back(sample.prompt);
     }
     return prompts;
 }
