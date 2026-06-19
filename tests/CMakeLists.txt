@@ -219,6 +219,7 @@ llama_build_and_test(test-opencl-extra-metadata.cpp)
 llama_build_and_test(test-opencl-external-host-alias.cpp)
 llama_build_and_test(test-qnn-aot-pos-utils.cpp)
 llama_build_and_test(test-qnn-aot-kv-utils.cpp)
+llama_build_and_test(test-qnn-aot-capacity-utils.cpp)
 llama_build_and_test(test-qnn-aot-lazy-transformer-init.cpp)
 llama_build_and_test(
     test-peg-parser.cpp

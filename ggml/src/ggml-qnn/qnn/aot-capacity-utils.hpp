@@ -1,0 +1,128 @@
+#pragma once
+
+#include <cstddef>
+#include <string>
+#include <vector>
+
+namespace qnn {
+
+struct qnn_aot_capacity_identity {
+    std::string model_path;
+    size_t      cache_size = 0;
+    size_t      context_size = 0;
+};
+
+struct qnn_aot_capacity_request {
+    size_t n_tokens = 1;
+    size_t required_kv_slots = 0;
+    size_t preferred_context_size = 0;
+};
+
+struct qnn_aot_graph_capacity_view {
+    size_t      batch_size = 0;
+    size_t      cache_size = 0;
+    size_t      context_size = 0;
+    std::string model_path;
+};
+
+inline bool qnn_aot_capacity_identity_matches(
+        const qnn_aot_graph_capacity_view & view,
+        const qnn_aot_capacity_identity &   identity) {
+    return view.model_path == identity.model_path &&
+           view.cache_size == identity.cache_size &&
+           view.context_size == identity.context_size;
+}
+
+inline size_t qnn_aot_select_batch_size(
+        const std::vector<qnn_aot_graph_capacity_view> & graphs,
+        size_t                                           n_tokens) {
+    const size_t target_tokens = n_tokens > 0 ? n_tokens : 1;
+
+    bool   have_ge = false;
+    bool   have_lt = false;
+    size_t best_ge = 0;
+    size_t best_lt = 0;
+
+    for (const auto & graph : graphs) {
+        if (graph.batch_size == 0) {
+            continue;
+        }
+
+        if (graph.batch_size >= target_tokens) {
+            if (!have_ge || graph.batch_size < best_ge) {
+                best_ge = graph.batch_size;
+                have_ge = true;
+            }
+            continue;
+        }
+
+        if (!have_lt || graph.batch_size > best_lt) {
+            best_lt = graph.batch_size;
+            have_lt = true;
+        }
+    }
+
+    if (have_ge) {
+        return best_ge;
+    }
+
+    if (have_lt) {
+        return best_lt;
+    }
+
+    return 0;
+}
+
+inline bool qnn_aot_select_capacity_identity(
+        const std::vector<qnn_aot_graph_capacity_view> & graphs,
+        const qnn_aot_capacity_request &                 request,
+        qnn_aot_capacity_identity &                      out_identity) {
+    const size_t batch_size = qnn_aot_select_batch_size(graphs, request.n_tokens);
+    if (batch_size == 0) {
+        return false;
+    }
+
+    const qnn_aot_graph_capacity_view * preferred = nullptr;
+    const qnn_aot_graph_capacity_view * fallback = nullptr;
+    const auto is_better = [](const qnn_aot_graph_capacity_view & lhs,
+                              const qnn_aot_graph_capacity_view & rhs) {
+        if (lhs.cache_size != rhs.cache_size) {
+            return lhs.cache_size < rhs.cache_size;
+        }
+        if (lhs.context_size != rhs.context_size) {
+            return lhs.context_size < rhs.context_size;
+        }
+        return lhs.model_path < rhs.model_path;
+    };
+
+    for (const auto & graph : graphs) {
+        if (graph.batch_size != batch_size) {
+            continue;
+        }
+        if (graph.cache_size < request.required_kv_slots) {
+            continue;
+        }
+
+        if (request.preferred_context_size > 0 &&
+            graph.context_size == request.preferred_context_size &&
+            (preferred == nullptr || is_better(graph, *preferred))) {
+            preferred = &graph;
+        }
+
+        if (fallback == nullptr || is_better(graph, *fallback)) {
+            fallback = &graph;
+        }
+    }
+
+    const qnn_aot_graph_capacity_view * selected = preferred != nullptr ? preferred : fallback;
+    if (selected == nullptr) {
+        return false;
+    }
+
+    out_identity.model_path = selected->model_path;
+    out_identity.cache_size = selected->cache_size;
+    out_identity.context_size = selected->context_size;
+    return true;
+}
+
+} // namespace qnn
