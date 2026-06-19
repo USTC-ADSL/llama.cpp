@@ -2523,6 +2523,8 @@ bool qnn_aot_runtime::initialize(const std::string & config_path, const std::str
     _seed_kv_loaded         = false;
     _seed_kv_size           = 0;
     _seed_kv_missing_warned = false;
+    _has_capacity_request   = false;
+    _capacity_request       = qnn_aot_capacity_request{};
     _config_path            = config_path;
     _model_dir              = model_dir;
     _transformer_graphs.clear();
@@ -4084,6 +4086,29 @@ bool qnn_aot_runtime::preload_decode_graphs(size_t n_tokens) {
     }
 
     return requested && ok;
+}
+
+bool qnn_aot_runtime::set_required_kv_capacity(size_t required_kv_slots, size_t preferred_context_size) {
+    if (!_enabled) {
+        return false;
+    }
+
+    _has_capacity_request = required_kv_slots > 0 || preferred_context_size > 0;
+    _capacity_request.required_kv_slots = required_kv_slots;
+    _capacity_request.preferred_context_size = preferred_context_size;
+    return true;
+}
+
+bool qnn_aot_runtime::preload_decode_graphs_for_capacity(
+        size_t n_tokens,
+        size_t required_kv_slots,
+        size_t preferred_context_size) {
+    if (!set_required_kv_capacity(required_kv_slots, preferred_context_size)) {
+        return false;
+    }
+
+    _capacity_request.n_tokens = n_tokens > 0 ? n_tokens : 1;
+    return preload_decode_graphs(n_tokens);
 }
 
 qnn_aot_graph * qnn_aot_runtime::ensure_graph_loaded(const qnn_aot_graph_config & graph_config,

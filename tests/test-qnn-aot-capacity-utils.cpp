@@ -1,8 +1,21 @@
 #include "../ggml/src/ggml-qnn/qnn/aot-capacity-utils.hpp"
 
+#include "ggml-backend.h"
+
 #include <cstdio>
 #include <string>
 #include <vector>
+
+bool ggml_backend_qnn_aot_set_required_kv_capacity(
+        ggml_backend_t backend,
+        size_t         required_kv_slots,
+        size_t         preferred_context_size);
+
+bool ggml_backend_qnn_aot_preload_decode_graphs_for_capacity(
+        ggml_backend_t backend,
+        size_t         n_tokens,
+        size_t         required_kv_slots,
+        size_t         preferred_context_size);
 
 static bool expect_true(bool condition, const char * label) {
     if (condition) {
@@ -68,6 +81,13 @@ static bool expect_identity(
 
 int main(void) {
     bool ok = true;
+
+    ok &= expect_false(
+        ggml_backend_qnn_aot_set_required_kv_capacity(nullptr, 2500, 4096),
+        "capacity setter backend proc should reject null backend");
+    ok &= expect_false(
+        ggml_backend_qnn_aot_preload_decode_graphs_for_capacity(nullptr, 1, 2500, 4096),
+        "capacity preload backend proc should reject null backend");
 
     const std::vector<qnn::qnn_aot_graph_capacity_view> graphs = {
         graph_view(1,   1920, 2048, "qnn-2k.bin"),

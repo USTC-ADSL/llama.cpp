@@ -13,6 +13,17 @@
 #include <memory>
 #include <vector>
 
+bool ggml_backend_qnn_aot_set_required_kv_capacity(
+        ggml_backend_t backend,
+        size_t         required_kv_slots,
+        size_t         preferred_context_size);
+
+bool ggml_backend_qnn_aot_preload_decode_graphs_for_capacity(
+        ggml_backend_t backend,
+        size_t         n_tokens,
+        size_t         required_kv_slots,
+        size_t         preferred_context_size);
+
 namespace {
 
 const char * ggml_backend_qnn_device_get_name(ggml_backend_dev_t dev);
@@ -298,6 +309,42 @@ bool ggml_backend_qnn_aot_preload_decode_graphs(ggml_backend_t backend, size_t n
     }
 
     return device_ctx->aot_runtime->preload_decode_graphs(n_tokens);
+}
+
+bool ggml_backend_qnn_aot_set_required_kv_capacity(
+        ggml_backend_t backend,
+        size_t         required_kv_slots,
+        size_t         preferred_context_size) {
+    if (backend == nullptr) {
+        return false;
+    }
+
+    auto * device_ctx = get_device_context(backend->device);
+    if (device_ctx == nullptr || device_ctx->aot_runtime == nullptr) {
+        return false;
+    }
+
+    return device_ctx->aot_runtime->set_required_kv_capacity(required_kv_slots, preferred_context_size);
+}
+
+bool ggml_backend_qnn_aot_preload_decode_graphs_for_capacity(
+        ggml_backend_t backend,
+        size_t         n_tokens,
+        size_t         required_kv_slots,
+        size_t         preferred_context_size) {
+    if (backend == nullptr) {
+        return false;
+    }
+
+    auto * device_ctx = get_device_context(backend->device);
+    if (device_ctx == nullptr || device_ctx->aot_runtime == nullptr) {
+        return false;
+    }
+
+    return device_ctx->aot_runtime->preload_decode_graphs_for_capacity(
+            n_tokens,
+            required_kv_slots,
+            preferred_context_size);
 }
 
 ggml_guid_t ggml_backend_qnn_guid() {
@@ -702,6 +749,42 @@ bool ggml_backend_qnn_aot_preload_decode_graphs(ggml_backend_t backend, size_t n
     }
 
     return device_ctx->aot_runtime->preload_decode_graphs(n_tokens);
+}
+
+bool ggml_backend_qnn_aot_set_required_kv_capacity(
+        ggml_backend_t backend,
+        size_t         required_kv_slots,
+        size_t         preferred_context_size) {
+    if (backend == nullptr || backend->device == nullptr) {
+        return false;
+    }
+
+    auto * device_ctx = reinterpret_cast<qnn::ggml_backend_qnn_device_context *>(backend->device->context);
+    if (device_ctx == nullptr || device_ctx->aot_runtime == nullptr) {
+        return false;
+    }
+
+    return device_ctx->aot_runtime->set_required_kv_capacity(required_kv_slots, preferred_context_size);
+}
+
+bool ggml_backend_qnn_aot_preload_decode_graphs_for_capacity(
+        ggml_backend_t backend,
+        size_t         n_tokens,
+        size_t         required_kv_slots,
+        size_t         preferred_context_size) {
+    if (backend == nullptr || backend->device == nullptr) {
+        return false;
+    }
+
+    auto * device_ctx = reinterpret_cast<qnn::ggml_backend_qnn_device_context *>(backend->device->context);
+    if (device_ctx == nullptr || device_ctx->aot_runtime == nullptr) {
+        return false;
+    }
+
+    return device_ctx->aot_runtime->preload_decode_graphs_for_capacity(
+            n_tokens,
+            required_kv_slots,
+            preferred_context_size);
 }
 
 bool ggml_backend_qnn_set_htp_workpoint(ggml_backend_t backend, const char * workpoint) {

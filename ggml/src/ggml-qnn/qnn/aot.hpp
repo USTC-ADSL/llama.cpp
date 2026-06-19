@@ -11,6 +11,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "aot-capacity-utils.hpp"
 #include "buffer.hpp"
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -143,6 +144,8 @@ class qnn_aot_runtime {
     bool prefers_cpu_op(const ggml_tensor * op) const;
     bool maybe_execute(ggml_cgraph * cgraph);
     bool preload_decode_graphs(size_t n_tokens);
+    bool set_required_kv_capacity(size_t required_kv_slots, size_t preferred_context_size);
+    bool preload_decode_graphs_for_capacity(size_t n_tokens, size_t required_kv_slots, size_t preferred_context_size);
     bool has_pending_generic_kv_writeback() const;
     bool flush_pending_generic_kv_writeback();
     void reset_state();
@@ -301,6 +304,8 @@ class qnn_aot_runtime {
     size_t _kv_position = 0;
     size_t _seed_kv_size = 0;
     bool _seed_kv_missing_warned = false;
+    bool _has_capacity_request = false;
+    qnn_aot_capacity_request _capacity_request;
     std::vector<pending_generic_kv_writeback_layer> _pending_generic_kv_writeback;
     std::unordered_map<std::string, size_t> _graph_kv_positions;
 };
