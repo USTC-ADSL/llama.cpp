@@ -162,7 +162,7 @@ int main() {
         const auto schedule = llama_dynamic_route_parse_decode_schedule(
                 "1:cpu{threads=6,affinity=FC,cpu_freq_khz=4320000};"
                 "33:opencl{gpu_freq_hz=660000000};"
-                "65:qnn-npu{qnn_workpoint=burst}");
+                "65:qnn-npu{qnn_workpoint=burst,qnn_context_size=4096,qnn_required_kv_slots=2500}");
 
         t.assert_equal("schedule entries", size_t(3), schedule.size());
         t.assert_equal("CPU route", std::string("cpu"), llama_hetero_phase_backend_for_route(schedule[0].route.plan.route));
@@ -180,6 +180,10 @@ int main() {
         t.assert_equal("QNN route", std::string("qnn-npu"), llama_hetero_phase_backend_for_route(schedule[2].route.plan.route));
         t.assert_true("QNN workpoint configured", schedule[2].backend_state.has_qnn_workpoint);
         t.assert_equal("QNN workpoint", std::string("burst"), schedule[2].backend_state.qnn_workpoint);
+        t.assert_true("QNN context size configured", schedule[2].backend_state.has_qnn_context_size);
+        t.assert_equal("QNN context size", uint64_t(4096), schedule[2].backend_state.qnn_context_size);
+        t.assert_true("QNN required KV slots configured", schedule[2].backend_state.has_qnn_required_kv_slots);
+        t.assert_equal("QNN required KV slots", uint64_t(2500), schedule[2].backend_state.qnn_required_kv_slots);
     });
 
     t.test("decode route schedule parser supports per-policy CPU frequencies", [](testing & t) {

@@ -186,6 +186,28 @@ void parse_decode_schedule_backend_state(
                         state.has_qnn_workpoint = true;
                         state.qnn_workpoint = value;
                     }
+                } else if (key == "qnn_context_size" || key == "context_size") {
+                    uint64_t parsed = 0;
+                    if (parse_positive_u64(value, parsed)) {
+                        state.has_qnn_context_size = true;
+                        state.qnn_context_size = parsed;
+                    } else {
+                        std::fprintf(stderr,
+                                "llama_dynamic_route_config_from_env: ignoring invalid qnn_context_size='%s' in decode schedule entry '%s'\n",
+                                value.c_str(),
+                                entry.c_str());
+                    }
+                } else if (key == "qnn_required_kv_slots" || key == "required_kv_slots") {
+                    uint64_t parsed = 0;
+                    if (parse_positive_u64(value, parsed)) {
+                        state.has_qnn_required_kv_slots = true;
+                        state.qnn_required_kv_slots = parsed;
+                    } else {
+                        std::fprintf(stderr,
+                                "llama_dynamic_route_config_from_env: ignoring invalid qnn_required_kv_slots='%s' in decode schedule entry '%s'\n",
+                                value.c_str(),
+                                entry.c_str());
+                    }
                 } else if (key == "gpu_freq_hz") {
                     uint64_t parsed = 0;
                     if (parse_positive_u64(value, parsed)) {

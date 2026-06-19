@@ -28,6 +28,12 @@ struct llama_dynamic_backend_state {
     bool        has_qnn_workpoint = false;
     std::string qnn_workpoint;
 
+    bool     has_qnn_context_size = false;
+    uint64_t qnn_context_size = 0;
+
+    bool     has_qnn_required_kv_slots = false;
+    uint64_t qnn_required_kv_slots = 0;
+
     bool     has_gpu_freq_hz = false;
     uint64_t gpu_freq_hz = 0;
 
