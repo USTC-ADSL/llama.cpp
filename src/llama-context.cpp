@@ -136,6 +136,13 @@ bool llama_context_should_preload_dynamic_qnn_decode_graphs(
         bool dynamic_decode_uses_qnn,
         bool preload_enabled);
 
+std::vector<size_t> llama_context_dynamic_qnn_preload_token_sizes(
+        bool   dynamic_route_enabled,
+        bool   dynamic_prefill_uses_qnn,
+        bool   dynamic_decode_uses_qnn,
+        bool   preload_enabled,
+        size_t prefill_tokens);
+
 bool llama_context_should_try_cpu_opencl_uma_kv_handoff(
         const std::string & current_attn_backend,
         const std::string & target_attn_backend,
@@ -155,6 +162,13 @@ int64_t llama_context_decode_token_gap_us(
         int64_t current_decode_done_us);
 
 bool llama_context_should_apply_qnn_workpoint_switch(
+        const llama_hetero_route_spec & current_route,
+        const llama_hetero_route_spec & target_route,
+        uint32_t                        n_tokens,
+        const std::string &             current_workpoint,
+        const char *                    target_workpoint);
+
+bool llama_context_should_apply_prefill_qnn_workpoint(
         const llama_hetero_route_spec & current_route,
         const llama_hetero_route_spec & target_route,
         uint32_t                        n_tokens,
@@ -507,6 +521,36 @@ bool llama_context_should_preload_dynamic_qnn_decode_graphs(
     return preload_enabled && dynamic_route_enabled && dynamic_decode_uses_qnn;
 }
 
+std::vector<size_t> llama_context_dynamic_qnn_preload_token_sizes(
+        bool   dynamic_route_enabled,
+        bool   dynamic_prefill_uses_qnn,
+        bool   dynamic_decode_uses_qnn,
+        bool   preload_enabled,
+        size_t prefill_tokens) {
+    std::vector<size_t> token_sizes;
+    if (!preload_enabled || !dynamic_route_enabled) {
+        return token_sizes;
+    }
+
+    const auto append_unique = [&token_sizes](size_t n_tokens) {
+        if (n_tokens == 0) {
+            return;
+        }
+        if (std::find(token_sizes.begin(), token_sizes.end(), n_tokens) == token_sizes.end()) {
+            token_sizes.push_back(n_tokens);
+        }
+    };
+
+    if (dynamic_decode_uses_qnn) {
+        append_unique(1);
+    }
+    if (dynamic_prefill_uses_qnn) {
+        append_unique(prefill_tokens > 1 ? prefill_tokens : 128);
+    }
+
+    return token_sizes;
+}
+
 bool llama_context_should_try_cpu_opencl_uma_kv_handoff(
         const std::string & current_attn_backend,
         const std::string & target_attn_backend,
@@ -614,6 +658,29 @@ bool llama_context_should_apply_qnn_workpoint_switch(
     const std::string target_backend =
         llama_hetero_canonical_backend(llama_hetero_phase_backend_for_route(target_route));
     if (current_backend != "qnn-npu" || target_backend != "qnn-npu") {
+        return false;
+    }
+
+    const std::string current = llama_context_canonical_qnn_workpoint(current_workpoint.c_str());
+    const std::string target  = llama_context_canonical_qnn_workpoint(target_workpoint);
+    return !target.empty() && current != target;
+}
+
+bool llama_context_should_apply_prefill_qnn_workpoint(
+        const llama_hetero_route_spec & current_route,
+        const llama_hetero_route_spec & target_route,
+        uint32_t                        n_tokens,
+        const std::string &             current_workpoint,
+        const char *                    target_workpoint) {
+    (void) current_route;
+
+    if (n_tokens <= 1 || target_workpoint == nullptr || target_workpoint[0] == '\0') {
+        return false;
+    }
+
+    const std::string target_backend =
+        llama_hetero_canonical_backend(llama_hetero_phase_backend_for_route(target_route));
+    if (target_backend != "qnn-npu") {
         return false;
     }
 
@@ -876,6 +943,17 @@ const char * llama_context_effective_decode_qnn_workpoint(
     }
 
     return std::getenv("GGML_HETERO_DYNAMIC_DECODE_QNN_WORKPOINT");
+}
+
+const char * llama_context_effective_prefill_qnn_workpoint(
+        const llama_dynamic_route_decision & decision,
+        std::string &                        owned_workpoint) {
+    if (decision.backend_state.has_qnn_workpoint) {
+        owned_workpoint = decision.backend_state.qnn_workpoint;
+        return owned_workpoint.c_str();
+    }
+
+    return std::getenv("GGML_HETERO_DYNAMIC_PREFILL_QNN_WORKPOINT");
 }
 
 std::string llama_context_format_cpu_mask(uint64_t mask) {
@@ -2727,6 +2805,8 @@ void llama_context::maybe_preload_dynamic_qnn_decode_graphs() {
         return;
     }
 
+    const bool prefill_uses_qnn =
+        llama_dynamic_route_uses_qnn(dynamic_route_config.prefill.plan);
     bool decode_uses_qnn =
         llama_dynamic_route_uses_qnn(dynamic_route_config.decode.plan) ||
         llama_dynamic_route_uses_qnn(dynamic_route_config.fallback.plan);
@@ -2734,16 +2814,19 @@ void llama_context::maybe_preload_dynamic_qnn_decode_graphs() {
         decode_uses_qnn = decode_uses_qnn || llama_dynamic_route_uses_qnn(entry.route.plan);
     }
 
-    if (!llama_context_should_preload_dynamic_qnn_decode_graphs(
+    const std::vector<size_t> preload_token_sizes = llama_context_dynamic_qnn_preload_token_sizes(
                 dynamic_route_config.enabled(),
+                prefill_uses_qnn,
                 decode_uses_qnn,
-                env_flag_enabled("GGML_HETERO_DYNAMIC_PRELOAD_QNN_DECODE"))) {
+                env_flag_enabled("GGML_HETERO_DYNAMIC_PRELOAD_QNN_DECODE"),
+                128);
+    if (preload_token_sizes.empty()) {
         return;
     }
 
     ggml_backend_t qnn_backend = find_backend_for_route("qnn-npu");
     if (qnn_backend == nullptr) {
-        LLAMA_LOG_WARN("%s: skipping QNN decode graph preload because the qnn-npu backend is unavailable\n",
+        LLAMA_LOG_WARN("%s: skipping QNN AoT graph preload because the qnn-npu backend is unavailable\n",
                 __func__);
         return;
     }
@@ -2756,23 +2839,27 @@ void llama_context::maybe_preload_dynamic_qnn_decode_graphs() {
                   ggml_backend_reg_get_proc_address(qnn_reg, "ggml_backend_qnn_aot_preload_decode_graphs")
             : nullptr;
     if (preload_fn == nullptr) {
-        LLAMA_LOG_WARN("%s: qnn backend does not expose AoT decode graph preload support\n", __func__);
+        LLAMA_LOG_WARN("%s: qnn backend does not expose AoT graph preload support\n", __func__);
         return;
     }
 
-    const int64_t t_start_us = ggml_time_us();
-    const bool preloaded = preload_fn(qnn_backend, 1);
-    const int64_t preload_us = ggml_time_us() - t_start_us;
-    if (!preloaded) {
-        LLAMA_LOG_WARN("%s: QNN decode graph preload failed preload_us=%" PRId64 "\n",
+    for (const size_t n_tokens : preload_token_sizes) {
+        const int64_t t_start_us = ggml_time_us();
+        const bool preloaded = preload_fn(qnn_backend, n_tokens);
+        const int64_t preload_us = ggml_time_us() - t_start_us;
+        if (!preloaded) {
+            LLAMA_LOG_WARN("%s: QNN AoT graph preload failed batch=%zu preload_us=%" PRId64 "\n",
+                    __func__,
+                    n_tokens,
+                    preload_us);
+            continue;
+        }
+
+        LLAMA_LOG_INFO("%s: preloaded QNN AoT graphs for batch=%zu preload_us=%" PRId64 "\n",
                 __func__,
+                n_tokens,
                 preload_us);
-        return;
     }
-
-    LLAMA_LOG_INFO("%s: preloaded QNN decode AoT graphs for batch=1 preload_us=%" PRId64 "\n",
-            __func__,
-            preload_us);
 }
 
 void llama_context::validate_dynamic_seq0_token_history() {
@@ -3199,9 +3286,11 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
 
     const std::string source_route = llama_hetero_format_route_spec(hetero_plan.route);
     const std::string target_route = llama_hetero_format_route_spec(decision.plan.route);
-    std::string decode_qnn_workpoint_storage;
-    const char * decode_qnn_workpoint =
-        llama_context_effective_decode_qnn_workpoint(decision, decode_qnn_workpoint_storage);
+    std::string target_qnn_workpoint_storage;
+    const char * target_qnn_workpoint =
+        n_tokens > 1
+            ? llama_context_effective_prefill_qnn_workpoint(decision, target_qnn_workpoint_storage)
+            : llama_context_effective_decode_qnn_workpoint(decision, target_qnn_workpoint_storage);
     const uint64_t target_gpu_freq_hz =
         llama_context_effective_decode_gpu_freq_hz(dynamic_route_config, decision);
     const uint64_t target_cpu_freq_khz =
@@ -3219,6 +3308,8 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         llama_hetero_canonical_backend(llama_hetero_phase_backend_for_route(decision.plan.route));
     const bool schedule_route_switch_pending =
         decision.should_apply && decision.decode_schedule_active;
+    const bool prefill_route_switch_pending =
+        decision.should_apply && n_tokens > 1;
     if (qnn_htp_current_workpoint.empty()) {
         const char * initial_workpoint = std::getenv("GGML_QNN_HTP_WORKPOINT");
         if (initial_workpoint == nullptr || initial_workpoint[0] == '\0') {
@@ -3227,7 +3318,7 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         qnn_htp_current_workpoint = llama_context_canonical_qnn_workpoint(initial_workpoint);
     }
 
-    const bool should_apply_qnn_workpoint_state_only =
+    const bool should_apply_decode_qnn_workpoint_state_only =
         !decision.should_apply &&
         decision.reason != "decode-switch-wait" &&
         llama_context_should_apply_qnn_workpoint_switch(
@@ -3235,14 +3326,26 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                 decision.plan.route,
                 n_tokens,
                 qnn_htp_current_workpoint,
-                decode_qnn_workpoint);
+                target_qnn_workpoint);
+    const bool should_apply_prefill_qnn_workpoint_state_only =
+        !decision.should_apply &&
+        decision.reason == "already-active" &&
+        llama_context_should_apply_prefill_qnn_workpoint(
+                hetero_plan.route,
+                decision.plan.route,
+                n_tokens,
+                qnn_htp_current_workpoint,
+                target_qnn_workpoint);
+    const bool should_apply_qnn_workpoint_state_only =
+        should_apply_decode_qnn_workpoint_state_only ||
+        should_apply_prefill_qnn_workpoint_state_only;
     const bool should_apply_qnn_workpoint_before_route =
-        schedule_route_switch_pending &&
+        (schedule_route_switch_pending || prefill_route_switch_pending) &&
         target_phase_backend == "qnn-npu" &&
-        decode_qnn_workpoint != nullptr &&
-        decode_qnn_workpoint[0] != '\0' &&
+        target_qnn_workpoint != nullptr &&
+        target_qnn_workpoint[0] != '\0' &&
         llama_context_canonical_qnn_workpoint(qnn_htp_current_workpoint.c_str()) !=
-            llama_context_canonical_qnn_workpoint(decode_qnn_workpoint);
+            llama_context_canonical_qnn_workpoint(target_qnn_workpoint);
 
     if (should_apply_qnn_workpoint_state_only || should_apply_qnn_workpoint_before_route) {
         ggml_backend_t qnn_backend = find_backend_for_route("qnn-npu");
@@ -3256,7 +3359,7 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                           ggml_backend_reg_get_proc_address(reg, "ggml_backend_qnn_set_htp_workpoint")
                     : nullptr;
             if (set_workpoint_fn != nullptr) {
-                applied = set_workpoint_fn(qnn_backend, decode_qnn_workpoint);
+                applied = set_workpoint_fn(qnn_backend, target_qnn_workpoint);
             } else {
                 LLAMA_LOG_ERROR("%s: qnn backend does not expose ggml_backend_qnn_set_htp_workpoint\n", __func__);
             }
@@ -3281,13 +3384,13 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         }
 
         if (applied) {
-            qnn_htp_current_workpoint = llama_context_canonical_qnn_workpoint(decode_qnn_workpoint);
+            qnn_htp_current_workpoint = llama_context_canonical_qnn_workpoint(target_qnn_workpoint);
             if (should_apply_qnn_workpoint_state_only) {
                 dynamic_route_state.route_switches++;
             }
-            LLAMA_LOG_INFO("%s: applied qnn HTP workpoint switch to %s\n", __func__, decode_qnn_workpoint);
+            LLAMA_LOG_INFO("%s: applied qnn HTP workpoint switch to %s\n", __func__, target_qnn_workpoint);
         } else {
-            LLAMA_LOG_ERROR("%s: failed to apply qnn HTP workpoint switch to %s\n", __func__, decode_qnn_workpoint);
+            LLAMA_LOG_ERROR("%s: failed to apply qnn HTP workpoint switch to %s\n", __func__, target_qnn_workpoint);
         }
 
         if (trace_timing && hetero_dynamic_trace_timing_detail_enabled()) {
@@ -3297,7 +3400,7 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
                     hetero_phase_name(n_tokens),
                     n_tokens,
                     applied ? "true" : "false",
-                    decode_qnn_workpoint,
+                    target_qnn_workpoint,
                     t_decide_end_us - t_decide_start_us,
                     qnn_workpoint_apply_us,
                     target_route.empty() ? "<default>" : target_route.c_str());

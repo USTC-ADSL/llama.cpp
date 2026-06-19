@@ -20,6 +20,19 @@ llama_dynamic_route_request decode_request(
     return request;
 }
 
+llama_dynamic_route_request prefill_request(
+        uint32_t n_tokens,
+        const llama_hetero_execution_plan & current_plan,
+        const llama_hetero_execution_plan & base_plan) {
+    llama_dynamic_route_request request;
+    request.n_tokens = n_tokens;
+    request.opencl_backend_available = true;
+    request.qnn_backend_available = true;
+    request.current_plan = &current_plan;
+    request.base_plan = &base_plan;
+    return request;
+}
+
 std::string route_string(const llama_dynamic_route_decision & decision) {
     return llama_hetero_phase_backend_for_route(decision.plan.route);
 }
@@ -108,6 +121,30 @@ int main() {
         t.assert_equal("third start", uint64_t(65), config.decode_schedule[2].start_token);
 
         unsetenv("GGML_HETERO_DYNAMIC_DECODE_SCHEDULE");
+        unsetenv("GGML_HETERO_DYNAMIC_MODE");
+    });
+
+    t.test("env config can parse prefill qnn workpoint", [](testing & t) {
+        setenv("GGML_HETERO_DYNAMIC_MODE", "phase", 1);
+        setenv("GGML_HETERO_DYNAMIC_PREFILL_ROUTE", "qnn-npu", 1);
+        setenv("GGML_HETERO_DYNAMIC_PREFILL_QNN_WORKPOINT", "low_balanced", 1);
+
+        const llama_dynamic_route_runtime_config config = llama_dynamic_route_config_from_env();
+
+        t.assert_true("prefill QNN workpoint configured", config.prefill_backend_state.has_qnn_workpoint);
+        t.assert_equal("prefill QNN workpoint", std::string("low_balanced"), config.prefill_backend_state.qnn_workpoint);
+
+        const llama_hetero_execution_plan cpu_plan = llama_hetero_build_execution_plan("cpu", nullptr);
+        const llama_dynamic_route_decision prefill = llama_dynamic_route_decide(
+                config,
+                prefill_request(128, cpu_plan, cpu_plan));
+
+        t.assert_true("prefill should switch to QNN", prefill.should_apply);
+        t.assert_true("prefill decision carries QNN workpoint", prefill.backend_state.has_qnn_workpoint);
+        t.assert_equal("prefill decision QNN workpoint", std::string("low_balanced"), prefill.backend_state.qnn_workpoint);
+
+        unsetenv("GGML_HETERO_DYNAMIC_PREFILL_QNN_WORKPOINT");
+        unsetenv("GGML_HETERO_DYNAMIC_PREFILL_ROUTE");
         unsetenv("GGML_HETERO_DYNAMIC_MODE");
     });
 

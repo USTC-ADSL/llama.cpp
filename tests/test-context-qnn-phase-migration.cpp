@@ -94,6 +94,13 @@ bool llama_context_should_preload_dynamic_qnn_decode_graphs(
         bool dynamic_route_uses_qnn,
         bool preload_enabled);
 
+std::vector<size_t> llama_context_dynamic_qnn_preload_token_sizes(
+        bool   dynamic_route_enabled,
+        bool   dynamic_prefill_uses_qnn,
+        bool   dynamic_decode_uses_qnn,
+        bool   preload_enabled,
+        size_t prefill_tokens);
+
 bool llama_context_should_try_cpu_opencl_uma_kv_handoff(
         const std::string & current_attn_backend,
         const std::string & target_attn_backend,
@@ -109,6 +116,13 @@ llama_hetero_route_spec llama_kv_cache_dynamic_decode_route_for_initial_placemen
         const char * decode_schedule);
 
 bool llama_context_should_apply_qnn_workpoint_switch(
+        const llama_hetero_route_spec & current_route,
+        const llama_hetero_route_spec & target_route,
+        uint32_t                        n_tokens,
+        const std::string &             current_workpoint,
+        const char *                    target_workpoint);
+
+bool llama_context_should_apply_prefill_qnn_workpoint(
         const llama_hetero_route_spec & current_route,
         const llama_hetero_route_spec & target_route,
         uint32_t                        n_tokens,
@@ -289,6 +303,56 @@ int main() {
                         qnn_plan.route,
                         gpu_plan.route,
                         1,
+                        "burst",
+                        "low_balanced"));
+    });
+
+    t.test("qnn prefill can apply HTP workpoint before prefill graph execution", [](testing & t) {
+        const auto qnn_plan = llama_hetero_build_execution_plan("qnn-npu", nullptr);
+        const auto cpu_plan = llama_hetero_build_execution_plan("cpu", nullptr);
+
+        t.assert_true(
+                "qnn prefill with a different target workpoint should apply runtime HTP control",
+                llama_context_should_apply_prefill_qnn_workpoint(
+                        qnn_plan.route,
+                        qnn_plan.route,
+                        128,
+                        "burst",
+                        "low_balanced"));
+
+        t.assert_true(
+                "prefill route switches to qnn should apply the target workpoint before graph execution",
+                llama_context_should_apply_prefill_qnn_workpoint(
+                        cpu_plan.route,
+                        qnn_plan.route,
+                        128,
+                        "burst",
+                        "low_balanced"));
+
+        t.assert_true(
+                "single-token decode should not use the prefill workpoint path",
+                !llama_context_should_apply_prefill_qnn_workpoint(
+                        qnn_plan.route,
+                        qnn_plan.route,
+                        1,
+                        "burst",
+                        "low_balanced"));
+
+        t.assert_true(
+                "the same prefill workpoint should not be re-applied",
+                !llama_context_should_apply_prefill_qnn_workpoint(
+                        qnn_plan.route,
+                        qnn_plan.route,
+                        128,
+                        "low_balanced",
+                        "low_balanced"));
+
+        t.assert_true(
+                "non-qnn prefill targets should not apply QNN workpoint control",
+                !llama_context_should_apply_prefill_qnn_workpoint(
+                        qnn_plan.route,
+                        cpu_plan.route,
+                        128,
                         "burst",
                         "low_balanced"));
     });
@@ -821,6 +885,44 @@ int main() {
                         /* dynamic_route_enabled = */ false,
                         /* dynamic_route_uses_qnn = */ true,
                         /* preload_enabled = */ true));
+    });
+
+    t.test("qnn graph preload token sizes include decode and prefill batches", [](testing & t) {
+        const auto both = llama_context_dynamic_qnn_preload_token_sizes(
+                /* dynamic_route_enabled = */ true,
+                /* dynamic_prefill_uses_qnn = */ true,
+                /* dynamic_decode_uses_qnn = */ true,
+                /* preload_enabled = */ true,
+                /* prefill_tokens = */ 128);
+        t.assert_equal("prefill+decode qnn should preload two token sizes", both.size(), (size_t) 2);
+        t.assert_equal("decode graph token size", both[0], (size_t) 1);
+        t.assert_equal("prefill graph token size", both[1], (size_t) 128);
+
+        const auto prefill_only = llama_context_dynamic_qnn_preload_token_sizes(
+                /* dynamic_route_enabled = */ true,
+                /* dynamic_prefill_uses_qnn = */ true,
+                /* dynamic_decode_uses_qnn = */ false,
+                /* preload_enabled = */ true,
+                /* prefill_tokens = */ 128);
+        t.assert_equal("prefill-only qnn should preload one token size", prefill_only.size(), (size_t) 1);
+        t.assert_equal("prefill graph token size", prefill_only[0], (size_t) 128);
+
+        const auto decode_only = llama_context_dynamic_qnn_preload_token_sizes(
+                /* dynamic_route_enabled = */ true,
+                /* dynamic_prefill_uses_qnn = */ false,
+                /* dynamic_decode_uses_qnn = */ true,
+                /* preload_enabled = */ true,
+                /* prefill_tokens = */ 128);
+        t.assert_equal("decode-only qnn should preload one token size", decode_only.size(), (size_t) 1);
+        t.assert_equal("decode graph token size", decode_only[0], (size_t) 1);
+
+        const auto disabled = llama_context_dynamic_qnn_preload_token_sizes(
+                /* dynamic_route_enabled = */ true,
+                /* dynamic_prefill_uses_qnn = */ true,
+                /* dynamic_decode_uses_qnn = */ true,
+                /* preload_enabled = */ false,
+                /* prefill_tokens = */ 128);
+        t.assert_equal("disabled env should not preload qnn graphs", disabled.size(), (size_t) 0);
     });
 
     t.test("single-token cpu to opencl decode can try UMA KV handoff", [](testing & t) {

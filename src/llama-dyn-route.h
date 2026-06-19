@@ -54,6 +54,7 @@ struct llama_dynamic_route_runtime_config {
     llama_dynamic_route_candidate prefill;
     llama_dynamic_route_candidate decode;
     llama_dynamic_route_candidate fallback;
+    llama_dynamic_backend_state prefill_backend_state;
     std::vector<llama_dynamic_decode_schedule_entry> decode_schedule;
 
     int64_t slo_us = 0;

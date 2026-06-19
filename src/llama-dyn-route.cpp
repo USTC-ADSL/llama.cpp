@@ -679,6 +679,7 @@ llama_dynamic_route_runtime_config llama_dynamic_route_config_from_env() {
     const char * mode_env = std::getenv("GGML_HETERO_DYNAMIC_MODE");
     const char * prefill_route_env = std::getenv("GGML_HETERO_DYNAMIC_PREFILL_ROUTE");
     const char * prefill_kv_env    = std::getenv("GGML_HETERO_DYNAMIC_PREFILL_KV");
+    const char * prefill_qnn_workpoint_env = std::getenv("GGML_HETERO_DYNAMIC_PREFILL_QNN_WORKPOINT");
     const char * decode_route_env  = std::getenv("GGML_HETERO_DYNAMIC_DECODE_ROUTE");
     const char * decode_kv_env     = std::getenv("GGML_HETERO_DYNAMIC_DECODE_KV");
     const char * fallback_route_env = std::getenv("GGML_HETERO_DYNAMIC_FALLBACK_ROUTE");
@@ -691,6 +692,7 @@ llama_dynamic_route_runtime_config llama_dynamic_route_config_from_env() {
     if (mode_env == nullptr || mode_env[0] == '\0') {
         if ((prefill_route_env != nullptr && prefill_route_env[0] != '\0') ||
             (prefill_kv_env    != nullptr && prefill_kv_env   [0] != '\0') ||
+            (prefill_qnn_workpoint_env != nullptr && prefill_qnn_workpoint_env[0] != '\0') ||
             (decode_route_env  != nullptr && decode_route_env [0] != '\0') ||
             (decode_kv_env     != nullptr && decode_kv_env    [0] != '\0') ||
             (fallback_route_env != nullptr && fallback_route_env[0] != '\0') ||
@@ -708,6 +710,10 @@ llama_dynamic_route_runtime_config llama_dynamic_route_config_from_env() {
     set_candidate(config.prefill,  "prefill",  prefill_route_env,  prefill_kv_env);
     set_candidate(config.decode,   "decode",   decode_route_env,   decode_kv_env);
     set_candidate(config.fallback, "fallback", fallback_route_env, fallback_kv_env);
+    if (prefill_qnn_workpoint_env != nullptr && prefill_qnn_workpoint_env[0] != '\0') {
+        config.prefill_backend_state.has_qnn_workpoint = true;
+        config.prefill_backend_state.qnn_workpoint = prefill_qnn_workpoint_env;
+    }
     config.decode_schedule = parse_decode_schedule(decode_schedule_env);
 
     config.slo_us        = env_i64_value("GGML_HETERO_DYNAMIC_SLO_US", 0);
@@ -941,6 +947,9 @@ llama_dynamic_route_decision llama_dynamic_route_decide(
                 *chosen->plan,
                 chosen->label,
                 best_under_slo != nullptr ? chosen->success_reason : "cost-best-effort-over-slo");
+        if (is_prefill && chosen->plan == &primary.plan) {
+            decision.backend_state = config.prefill_backend_state;
+        }
 
         if (config.trace_enabled) {
             std::fprintf(stderr,
@@ -965,6 +974,9 @@ llama_dynamic_route_decision llama_dynamic_route_decide(
                     ? "phase-prefill-route"
                     : (decode_switch_after_active ? "decode-switch-after" : "phase-decode-route"));
         if (decision.should_apply || decision.reason == "already-active") {
+            if (is_prefill) {
+                decision.backend_state = config.prefill_backend_state;
+            }
             return decision;
         }
     }
