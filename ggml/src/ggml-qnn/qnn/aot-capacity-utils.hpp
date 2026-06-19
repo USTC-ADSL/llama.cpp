@@ -125,4 +125,34 @@ inline bool qnn_aot_select_capacity_identity(
     return true;
 }
 
+inline std::vector<qnn_aot_graph_capacity_view> qnn_aot_select_capacity_chain(
+        const std::vector<qnn_aot_graph_capacity_view> & graphs,
+        const qnn_aot_capacity_request &                 request,
+        qnn_aot_capacity_identity *                      out_identity = nullptr) {
+    std::vector<qnn_aot_graph_capacity_view> chain;
+
+    qnn_aot_capacity_identity identity;
+    if (!qnn_aot_select_capacity_identity(graphs, request, identity)) {
+        return chain;
+    }
+
+    const size_t batch_size = qnn_aot_select_batch_size(graphs, request.n_tokens);
+    if (batch_size == 0) {
+        return chain;
+    }
+
+    for (const auto & graph : graphs) {
+        if (graph.batch_size == batch_size &&
+            qnn_aot_capacity_identity_matches(graph, identity)) {
+            chain.push_back(graph);
+        }
+    }
+
+    if (out_identity != nullptr) {
+        *out_identity = identity;
+    }
+
+    return chain;
+}
+
 } // namespace qnn

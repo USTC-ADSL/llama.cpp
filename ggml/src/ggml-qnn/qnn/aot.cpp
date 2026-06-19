@@ -4003,68 +4003,84 @@ qnn_aot_graph * qnn_aot_runtime::select_attention_graph(size_t start_layer_id, s
     return best_ge != nullptr ? best_ge : best_lt;
 }
 
-qnn_aot_runtime::graph_bucket * qnn_aot_runtime::ensure_transformer_graph_bucket_loaded(size_t batch_size) {
+qnn_aot_graph_capacity_view qnn_aot_runtime::capacity_view_for_graph_config(const qnn_aot_graph_config & config) const {
+    qnn_aot_graph_capacity_view view;
+    view.batch_size = config.batch_size;
+    view.cache_size = config.cache_size;
+    view.context_size = config.context_size;
+    view.model_path = resolve_model_path(config.model_path);
+    return view;
+}
+
+qnn_aot_capacity_identity qnn_aot_runtime::capacity_identity_for_graph_config(const qnn_aot_graph_config & config) const {
+    const auto view = capacity_view_for_graph_config(config);
+    qnn_aot_capacity_identity identity;
+    identity.model_path = view.model_path;
+    identity.cache_size = view.cache_size;
+    identity.context_size = view.context_size;
+    return identity;
+}
+
+bool qnn_aot_runtime::ensure_transformer_graph_chain_loaded(
+        size_t                            batch_size,
+        const qnn_aot_capacity_identity & identity) {
     bool has_matching_config = false;
     for (const auto & graph_config : _config.transformer_graphs) {
         if (graph_config.batch_size != batch_size) {
             continue;
         }
+        if (!qnn_aot_capacity_identity_matches(capacity_view_for_graph_config(graph_config), identity)) {
+            continue;
+        }
 
         has_matching_config = true;
         if (ensure_graph_loaded(graph_config, _transformer_graphs) == nullptr) {
-            return nullptr;
+            return false;
         }
     }
 
-    if (!has_matching_config) {
-        return nullptr;
+    return has_matching_config;
+}
+
+std::vector<qnn_aot_graph *> qnn_aot_runtime::select_transformer_graph_chain(size_t n_tokens) {
+    std::vector<qnn_aot_graph *> selected_graphs;
+    if (_config.transformer_graphs.empty()) {
+        return selected_graphs;
+    }
+
+    std::vector<qnn_aot_graph_capacity_view> graph_views;
+    graph_views.reserve(_config.transformer_graphs.size());
+    for (const auto & config : _config.transformer_graphs) {
+        graph_views.push_back(capacity_view_for_graph_config(config));
+    }
+
+    qnn_aot_capacity_request request = _has_capacity_request ? _capacity_request : qnn_aot_capacity_request{};
+    request.n_tokens = std::max<size_t>(1, n_tokens);
+
+    qnn_aot_capacity_identity identity;
+    const auto selected_views = qnn_aot_select_capacity_chain(graph_views, request, &identity);
+    if (selected_views.empty()) {
+        return selected_graphs;
+    }
+
+    const size_t batch_size = selected_views.front().batch_size;
+    if (!ensure_transformer_graph_chain_loaded(batch_size, identity)) {
+        return selected_graphs;
     }
 
     auto bucket_it = _transformer_graphs.find(batch_size);
-    return bucket_it != _transformer_graphs.end() ? &bucket_it->second : nullptr;
-}
-
-qnn_aot_runtime::graph_bucket * qnn_aot_runtime::select_transformer_graphs(size_t n_tokens) {
-    if (_config.transformer_graphs.empty()) {
-        return nullptr;
+    if (bucket_it == _transformer_graphs.end()) {
+        return selected_graphs;
     }
 
-    const size_t target_tokens = std::max<size_t>(1, n_tokens);
-    bool have_ge = false;
-    bool have_lt = false;
-    size_t best_ge = 0;
-    size_t best_lt = 0;
-    size_t last_batch = std::numeric_limits<size_t>::max();
-
-    for (const auto & config : _config.transformer_graphs) {
-        if (config.batch_size == last_batch) {
-            continue;
-        }
-        last_batch = config.batch_size;
-
-        if (config.batch_size >= target_tokens) {
-            if (!have_ge || config.batch_size < best_ge) {
-                best_ge = config.batch_size;
-                have_ge = true;
-            }
-            continue;
-        }
-
-        if (!have_lt || config.batch_size > best_lt) {
-            best_lt = config.batch_size;
-            have_lt = true;
+    for (const auto & graph_ptr : bucket_it->second) {
+        if (graph_ptr &&
+            qnn_aot_capacity_identity_matches(capacity_view_for_graph_config(graph_ptr->config()), identity)) {
+            selected_graphs.push_back(graph_ptr.get());
         }
     }
 
-    if (have_ge) {
-        return ensure_transformer_graph_bucket_loaded(best_ge);
-    }
-
-    if (have_lt) {
-        return ensure_transformer_graph_bucket_loaded(best_lt);
-    }
-
-    return nullptr;
+    return selected_graphs;
 }
 
 bool qnn_aot_runtime::preload_decode_graphs(size_t n_tokens) {
@@ -4077,7 +4093,7 @@ bool qnn_aot_runtime::preload_decode_graphs(size_t n_tokens) {
 
     if (!_config.transformer_graphs.empty()) {
         requested = true;
-        ok = select_transformer_graphs(n_tokens) != nullptr && ok;
+        ok = !select_transformer_graph_chain(n_tokens).empty() && ok;
     }
 
     if (!_config.lm_head_graphs.empty()) {
@@ -4117,6 +4133,7 @@ qnn_aot_graph * qnn_aot_runtime::ensure_graph_loaded(const qnn_aot_graph_config 
     const int64_t t_total_start_us = trace_timing ? ggml_time_us() : 0;
     std::unique_lock<std::mutex> lock(_lazy_graph_mutex);
     const int64_t lock_wait_us = trace_timing ? ggml_time_us() - t_total_start_us : 0;
+    const qnn_aot_capacity_identity target_identity = capacity_identity_for_graph_config(graph_config);
     auto & bucket = family[graph_config.batch_size];
     for (auto & graph_ptr : bucket) {
         if (!graph_ptr) {
@@ -4127,7 +4144,8 @@ qnn_aot_graph * qnn_aot_runtime::ensure_graph_loaded(const qnn_aot_graph_config 
         if (loaded.graph_name == graph_config.graph_name &&
             loaded.start_layer_id == graph_config.start_layer_id &&
             loaded.end_layer_id == graph_config.end_layer_id &&
-            loaded.batch_size == graph_config.batch_size) {
+            loaded.batch_size == graph_config.batch_size &&
+            qnn_aot_capacity_identity_matches(capacity_view_for_graph_config(loaded), target_identity)) {
             if (trace_timing) {
                 QNN_LOG_INFO("AOT_LOAD_TRACE kind=ensure_graph_loaded graph_name=%s model_path=%s batch_size=%zu cache_size=%zu context_size=%zu graph_cache_hit=1 context_cache_hit=1 lock_wait_us=%lld context_resolve_us=0 graph_create_us=0 seed_kv_us=0 total_us=%lld success=1\n",
                              graph_config.graph_name.c_str(),
@@ -4175,7 +4193,10 @@ qnn_aot_graph * qnn_aot_runtime::ensure_graph_loaded(const qnn_aot_graph_config 
         for (auto existing_graph = existing_bucket->second.rbegin();
              existing_graph != existing_bucket->second.rend();
              ++existing_graph) {
-            if (*existing_graph && (*existing_graph)->config().model_path == runtime_config.model_path) {
+            if (*existing_graph &&
+                qnn_aot_capacity_identity_matches(
+                    capacity_view_for_graph_config((*existing_graph)->config()),
+                    target_identity)) {
                 sibling = existing_graph->get();
                 break;
             }
@@ -5673,19 +5694,8 @@ bool qnn_aot_runtime::execute_attention(ggml_cgraph * cgraph, const aot_match_re
 
 bool qnn_aot_runtime::execute_transformer(ggml_cgraph * cgraph, const aot_match_result & match, ggml_tensor * last_row_out) {
     GGML_UNUSED(cgraph);
-    const auto * graph_bucket = select_transformer_graphs(match.n_tokens);
-    if (graph_bucket == nullptr || !match.embd || (match.out == nullptr && last_row_out == nullptr)) {
-        return false;
-    }
-
-    std::vector<qnn_aot_graph *> graphs;
-    graphs.reserve(graph_bucket->size());
-    for (const auto & graph_ptr : *graph_bucket) {
-        if (graph_ptr) {
-            graphs.push_back(graph_ptr.get());
-        }
-    }
-    if (graphs.empty()) {
+    std::vector<qnn_aot_graph *> graphs = select_transformer_graph_chain(match.n_tokens);
+    if (graphs.empty() || !match.embd || (match.out == nullptr && last_row_out == nullptr)) {
         return false;
     }
 

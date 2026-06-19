@@ -230,5 +230,62 @@ int main(void) {
             "batch 1 and batch 128 should be able to share the same capacity identity");
     }
 
+    {
+        const std::vector<qnn::qnn_aot_graph_capacity_view> mixed_bucket = {
+            graph_view(1, 1920, 2048, "qnn-2k.bin"),
+            graph_view(1, 3968, 4096, "qnn-4k.bin"),
+            graph_view(1, 3968, 4096, "qnn-4k.bin"),
+        };
+
+        qnn::qnn_aot_capacity_identity identity;
+        qnn::qnn_aot_capacity_request request;
+        request.n_tokens = 1;
+        request.required_kv_slots = 2500;
+        request.preferred_context_size = 4096;
+
+        const auto chain = qnn::qnn_aot_select_capacity_chain(mixed_bucket, request, &identity);
+
+        ok &= expect_eq_size(
+            chain.size(),
+            2,
+            "mixed 2K/4K bucket should return only the selected 4K chain");
+        for (const auto & view : chain) {
+            ok &= expect_true(
+                qnn::qnn_aot_capacity_identity_matches(view, identity),
+                "selected chain entries must share one capacity identity");
+        }
+        ok &= expect_identity(
+            identity,
+            "qnn-4k.bin",
+            3968,
+            4096,
+            "selected chain identity should be the requested 4K graph");
+    }
+
+    {
+        const std::vector<qnn::qnn_aot_graph_capacity_view> mixed_bucket = {
+            graph_view(1, 1920, 2048, "qnn-2k.bin"),
+            graph_view(1, 1920, 2048, "qnn-2k.bin"),
+            graph_view(1, 3968, 4096, "qnn-4k.bin"),
+        };
+
+        qnn::qnn_aot_capacity_identity identity;
+        qnn::qnn_aot_capacity_request request;
+        request.n_tokens = 1;
+
+        const auto chain = qnn::qnn_aot_select_capacity_chain(mixed_bucket, request, &identity);
+
+        ok &= expect_eq_size(
+            chain.size(),
+            2,
+            "default batch-only compatibility should still choose one internally consistent capacity chain");
+        ok &= expect_identity(
+            identity,
+            "qnn-2k.bin",
+            1920,
+            2048,
+            "default mixed-capacity selection should choose the smallest sufficient capacity");
+    }
+
     return ok ? 0 : 1;
 }
