@@ -287,5 +287,31 @@ int main(void) {
             "default mixed-capacity selection should choose the smallest sufficient capacity");
     }
 
+    {
+        const std::vector<qnn::qnn_aot_graph_kv_cursor_view> cursor_views = {
+            { graph_view(1, 1920, 2048, "qnn-2k.bin"), 0, 24, 1800 },
+            { graph_view(1, 3968, 4096, "qnn-4k.bin"), 0, 12, 0 },
+            { graph_view(1, 3968, 4096, "qnn-4k.bin"), 12, 24, 32 },
+        };
+
+        qnn::qnn_aot_capacity_identity identity;
+        identity.model_path = "qnn-4k.bin";
+        identity.cache_size = 3968;
+        identity.context_size = 4096;
+
+        size_t active_cursor = 9999;
+        ok &= expect_true(
+            qnn::qnn_aot_select_active_kv_cursor(cursor_views, identity, active_cursor),
+            "selected capacity chain should expose an active private KV cursor");
+        ok &= expect_eq_size(
+            active_cursor,
+            0,
+            "selected capacity active cursor should use the minimum cursor across its stateful chain");
+        ok &= expect_eq_size(
+            qnn::qnn_aot_kv_cursor_after_prefix_import(active_cursor, 1800),
+            1800,
+            "selected capacity cursor should advance to the imported generic prefix");
+    }
+
     return ok ? 0 : 1;
 }

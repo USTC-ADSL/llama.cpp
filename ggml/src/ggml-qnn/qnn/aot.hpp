@@ -278,6 +278,8 @@ class qnn_aot_runtime {
     void mark_graph_kv_position(const qnn_aot_graph_config & config, size_t kv_position);
     void mark_loaded_seed_kv_position(qnn_aot_graph & graph);
     void mark_all_graph_kv_positions(size_t kv_position);
+    size_t active_kv_position_for_graph(const qnn_aot_graph & graph) const;
+    size_t active_kv_position_for_graph_chain(const std::vector<qnn_aot_graph *> & graphs) const;
 
     void zero_transformer_state();
     size_t infer_start_pos(const std::vector<ggml_tensor *> & inputs, size_t n_tokens) const;

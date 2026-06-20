@@ -4874,6 +4874,40 @@ void qnn_aot_runtime::mark_all_graph_kv_positions(size_t kv_position) {
     }
 }
 
+size_t qnn_aot_runtime::active_kv_position_for_graph(const qnn_aot_graph & graph) const {
+    return graph_kv_position(graph.config());
+}
+
+size_t qnn_aot_runtime::active_kv_position_for_graph_chain(const std::vector<qnn_aot_graph *> & graphs) const {
+    if (graphs.empty()) {
+        return 0;
+    }
+
+    qnn_aot_capacity_identity identity = capacity_identity_for_graph_config(graphs.front()->config());
+    std::vector<qnn_aot_graph_kv_cursor_view> cursor_views;
+    cursor_views.reserve(graphs.size());
+    for (const auto * graph : graphs) {
+        if (graph == nullptr) {
+            continue;
+        }
+
+        const auto & config = graph->config();
+        qnn_aot_graph_kv_cursor_view view;
+        view.capacity = capacity_view_for_graph_config(config);
+        view.start_layer_id = config.start_layer_id;
+        view.end_layer_id = config.end_layer_id;
+        view.kv_position = graph_kv_position(config);
+        cursor_views.push_back(view);
+    }
+
+    size_t cursor = 0;
+    if (qnn_aot_select_active_kv_cursor(cursor_views, identity, cursor)) {
+        return cursor;
+    }
+
+    return graph_kv_position(graphs.front()->config());
+}
+
 bool qnn_aot_runtime::import_missing_generic_kv_prefix_to_graph(qnn_aot_graph & graph,
                                                                 const aot_match_result & match,
                                                                 size_t required_prefix_tokens,
@@ -5553,6 +5587,15 @@ bool qnn_aot_runtime::execute_attention(ggml_cgraph * cgraph, const aot_match_re
         return false;
     }
 
+    const size_t previous_kv_position = _kv_position;
+    _kv_position = active_kv_position_for_graph(*graph);
+    if (aot_trace_bind_enabled() && previous_kv_position != _kv_position) {
+        QNN_LOG_INFO("[aot] restored attention private KV cursor: graph=%s previous=%zu active=%zu\n",
+                     graph->config().graph_name.c_str(),
+                     previous_kv_position,
+                     _kv_position);
+    }
+
     const bool apply_seed_prefix_offset =
         _seed_kv_loaded &&
         _seed_kv_size > 0 &&
@@ -5622,7 +5665,7 @@ bool qnn_aot_runtime::execute_attention(ggml_cgraph * cgraph, const aot_match_re
                      generic_prefix_tokens);
         return false;
     }
-    _kv_position = std::max(_kv_position, generic_prefix_tokens);
+    _kv_position = qnn::qnn_aot_kv_cursor_after_prefix_import(_kv_position, generic_prefix_tokens);
 
     if (match.embd->type != GGML_TYPE_F32 || match.out->type != GGML_TYPE_F32) {
         QNN_LOG_WARN("[aot] attention IO expects F32 tensors, got %s -> %s\n",
@@ -5756,6 +5799,15 @@ bool qnn_aot_runtime::execute_transformer(ggml_cgraph * cgraph, const aot_match_
         }
     }
 
+    const size_t previous_kv_position = _kv_position;
+    _kv_position = active_kv_position_for_graph_chain(graphs);
+    if (aot_trace_bind_enabled() && previous_kv_position != _kv_position) {
+        QNN_LOG_INFO("[aot] restored transformer private KV cursor: graph=%s previous=%zu active=%zu\n",
+                     graphs.front()->config().graph_name.c_str(),
+                     previous_kv_position,
+                     _kv_position);
+    }
+
     const bool apply_seed_prefix_offset =
         _seed_kv_loaded &&
         _seed_kv_size > 0 &&
@@ -5827,7 +5879,7 @@ bool qnn_aot_runtime::execute_transformer(ggml_cgraph * cgraph, const aot_match_
             return false;
         }
     }
-    _kv_position = std::max(_kv_position, generic_prefix_tokens);
+    _kv_position = qnn::qnn_aot_kv_cursor_after_prefix_import(_kv_position, generic_prefix_tokens);
 
     if (match.embd->type != GGML_TYPE_F32 ||
         (match.out != nullptr && match.out->type != GGML_TYPE_F32) ||

@@ -25,6 +25,13 @@ struct qnn_aot_graph_capacity_view {
     std::string model_path;
 };
 
+struct qnn_aot_graph_kv_cursor_view {
+    qnn_aot_graph_capacity_view capacity;
+    size_t                      start_layer_id = 0;
+    size_t                      end_layer_id = 0;
+    size_t                      kv_position = 0;
+};
+
 inline bool qnn_aot_capacity_identity_matches(
         const qnn_aot_graph_capacity_view & view,
         const qnn_aot_capacity_identity &   identity) {
@@ -153,6 +160,42 @@ inline std::vector<qnn_aot_graph_capacity_view> qnn_aot_select_capacity_chain(
     }
 
     return chain;
+}
+
+inline bool qnn_aot_select_active_kv_cursor(
+        const std::vector<qnn_aot_graph_kv_cursor_view> & graphs,
+        const qnn_aot_capacity_identity &                 identity,
+        size_t &                                          out_cursor) {
+    bool found = false;
+    size_t cursor = 0;
+
+    for (const auto & graph : graphs) {
+        if (!qnn_aot_capacity_identity_matches(graph.capacity, identity)) {
+            continue;
+        }
+
+        if (graph.end_layer_id <= graph.start_layer_id) {
+            continue;
+        }
+
+        if (!found || graph.kv_position < cursor) {
+            cursor = graph.kv_position;
+        }
+        found = true;
+    }
+
+    if (!found) {
+        return false;
+    }
+
+    out_cursor = cursor;
+    return true;
+}
+
+inline size_t qnn_aot_kv_cursor_after_prefix_import(
+        size_t graph_kv_position,
+        size_t required_prefix_tokens) {
+    return graph_kv_position < required_prefix_tokens ? required_prefix_tokens : graph_kv_position;
 }
 
 } // namespace qnn
