@@ -184,6 +184,19 @@ bool llama_context_should_apply_qnn_capacity_switch(
         const llama_dynamic_backend_state & target_state,
         bool                                generic_kv_enabled);
 
+bool llama_context_is_qnn_request_capacity_boundary(
+        uint32_t n_tokens,
+        size_t   seq0_prefix_tokens_before_decode,
+        bool     qnn_prefix_replay_active);
+
+uint64_t llama_context_qnn_request_required_kv_slots(
+        uint32_t input_tokens,
+        uint64_t margin);
+
+uint64_t llama_context_qnn_request_capacity_margin_from_env(const char * value);
+
+uint64_t llama_context_qnn_request_capacity_margin();
+
 bool llama_context_should_apply_gpu_freq_switch(
         const llama_hetero_route_spec & current_route,
         const llama_hetero_route_spec & target_route,
@@ -696,6 +709,47 @@ bool llama_context_should_apply_prefill_qnn_workpoint(
     const std::string current = llama_context_canonical_qnn_workpoint(current_workpoint.c_str());
     const std::string target  = llama_context_canonical_qnn_workpoint(target_workpoint);
     return !target.empty() && current != target;
+}
+
+bool llama_context_is_qnn_request_capacity_boundary(
+        uint32_t n_tokens,
+        size_t   seq0_prefix_tokens_before_decode,
+        bool     qnn_prefix_replay_active) {
+    return !qnn_prefix_replay_active &&
+           n_tokens > 1 &&
+           seq0_prefix_tokens_before_decode == 0;
+}
+
+uint64_t llama_context_qnn_request_required_kv_slots(
+        uint32_t input_tokens,
+        uint64_t margin) {
+    const uint64_t tokens = input_tokens;
+    if (margin > std::numeric_limits<uint64_t>::max() - tokens) {
+        return std::numeric_limits<uint64_t>::max();
+    }
+
+    return tokens + margin;
+}
+
+uint64_t llama_context_qnn_request_capacity_margin_from_env(const char * value) {
+    constexpr uint64_t default_margin = 32;
+    if (value == nullptr || value[0] == '\0') {
+        return default_margin;
+    }
+
+    char * end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed == 0) {
+        return default_margin;
+    }
+
+    return static_cast<uint64_t>(parsed);
+}
+
+uint64_t llama_context_qnn_request_capacity_margin() {
+    return llama_context_qnn_request_capacity_margin_from_env(
+            std::getenv("GGML_HETERO_DYNAMIC_QNN_REQUEST_KV_MARGIN"));
 }
 
 bool llama_context_should_apply_qnn_capacity_switch(
@@ -2958,6 +3012,90 @@ void llama_context::clear_dynamic_seq0_token_history() {
 
 void llama_context::reset_dynamic_route_runtime_state() {
     dynamic_route_state = {};
+}
+
+void llama_context::maybe_prepare_dynamic_qnn_request_capacity(
+        uint32_t n_tokens,
+        size_t   seq0_prefix_tokens_before_decode) {
+    if (!llama_context_is_qnn_request_capacity_boundary(
+                n_tokens,
+                seq0_prefix_tokens_before_decode,
+                qnn_prefix_replay_active)) {
+        return;
+    }
+
+    reset_dynamic_route_runtime_state();
+    dynamic_seq0_token_history.clear();
+    qnn_current_required_kv_slots = 0;
+    qnn_current_context_size = 0;
+
+    bool request_may_use_qnn =
+        aot_active_route_requests_qnn ||
+        hetero_route_requests_qnn(hetero_plan.route) ||
+        hetero_route_requests_qnn(hetero_plan_base.route) ||
+        llama_dynamic_route_uses_qnn(dynamic_route_config.prefill.plan) ||
+        llama_dynamic_route_uses_qnn(dynamic_route_config.decode.plan) ||
+        llama_dynamic_route_uses_qnn(dynamic_route_config.fallback.plan);
+    for (const auto & entry : dynamic_route_config.decode_schedule) {
+        request_may_use_qnn = request_may_use_qnn || llama_dynamic_route_uses_qnn(entry.route.plan);
+    }
+    if (!request_may_use_qnn) {
+        return;
+    }
+
+    ggml_backend_t qnn_backend = find_backend_for_route("qnn-npu");
+    if (qnn_backend == nullptr) {
+        LLAMA_LOG_WARN("%s: skipping request QNN capacity selection because qnn-npu backend is unavailable\n",
+                __func__);
+        return;
+    }
+
+    ggml_backend_dev_t qnn_dev = ggml_backend_get_device(qnn_backend);
+    ggml_backend_reg_t qnn_reg = qnn_dev != nullptr ? ggml_backend_dev_backend_reg(qnn_dev) : nullptr;
+    auto * reset_state_fn =
+        qnn_reg != nullptr
+            ? (ggml_backend_qnn_aot_reset_state_t)
+                  ggml_backend_reg_get_proc_address(qnn_reg, "ggml_backend_qnn_aot_reset_state")
+            : nullptr;
+    auto * set_capacity_fn =
+        qnn_reg != nullptr
+            ? (ggml_backend_qnn_aot_set_required_kv_capacity_t)
+                  ggml_backend_reg_get_proc_address(qnn_reg, "ggml_backend_qnn_aot_set_required_kv_capacity")
+            : nullptr;
+
+    if (reset_state_fn == nullptr) {
+        LLAMA_LOG_WARN("%s: qnn backend does not expose ggml_backend_qnn_aot_reset_state; request capacity selection skipped\n",
+                __func__);
+        return;
+    }
+    if (set_capacity_fn == nullptr) {
+        LLAMA_LOG_WARN("%s: qnn backend does not expose ggml_backend_qnn_aot_set_required_kv_capacity; request capacity selection skipped\n",
+                __func__);
+        return;
+    }
+
+    if (!reset_state_fn(qnn_backend)) {
+        LLAMA_LOG_WARN("%s: failed to reset QNN AoT state at new request boundary\n", __func__);
+        return;
+    }
+
+    const uint64_t margin = llama_context_qnn_request_capacity_margin();
+    const uint64_t required_kv_slots = llama_context_qnn_request_required_kv_slots(n_tokens, margin);
+    if (!set_capacity_fn(qnn_backend, static_cast<size_t>(required_kv_slots), /* preferred_context_size = */ 0)) {
+        LLAMA_LOG_WARN("%s: failed to set QNN request capacity required_kv_slots=%" PRIu64 "\n",
+                __func__,
+                required_kv_slots);
+        return;
+    }
+
+    qnn_current_required_kv_slots = required_kv_slots;
+    qnn_current_context_size = 0;
+    LLAMA_LOG_INFO("%s: prepared QNN request capacity required_kv_slots=%" PRIu64
+            " input_tokens=%u margin=%" PRIu64 "\n",
+            __func__,
+            required_kv_slots,
+            n_tokens,
+            margin);
 }
 
 void llama_context::record_dynamic_seq0_token_history(const llama_batch & batch_inp, size_t prefix_tokens_before_decode) {
@@ -6870,6 +7008,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     output_swaps.clear();
 
     sched_reserve_request_tokens = n_tokens_all;
+    maybe_prepare_dynamic_qnn_request_capacity(n_tokens_all, seq0_prefix_tokens_before_decode);
     maybe_apply_dynamic_route(n_tokens_all);
     if (qnn_prefix_replay_pending) {
         const bool trace_was_active = hetero_phase_trace.active;

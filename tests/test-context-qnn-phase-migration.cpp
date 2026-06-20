@@ -4,6 +4,7 @@
 #include "../src/llama-kv-cache.h"
 #include "testing.h"
 
+#include <cstdlib>
 #include <string>
 #include <utility>
 #include <vector>
@@ -137,6 +138,19 @@ bool llama_context_should_apply_qnn_capacity_switch(
         uint64_t                             current_context_size,
         const llama_dynamic_backend_state &  target_state,
         bool                                 generic_kv_enabled);
+
+bool llama_context_is_qnn_request_capacity_boundary(
+        uint32_t n_tokens,
+        size_t   seq0_prefix_tokens_before_decode,
+        bool     qnn_prefix_replay_active);
+
+uint64_t llama_context_qnn_request_required_kv_slots(
+        uint32_t input_tokens,
+        uint64_t margin);
+
+uint64_t llama_context_qnn_request_capacity_margin_from_env(const char * value);
+
+uint64_t llama_context_qnn_request_capacity_margin();
 
 std::vector<std::pair<size_t, size_t>> llama_kv_cache_plan_token_prefix_sync_ranges(
         size_t   tensor_offset,
@@ -430,6 +444,101 @@ int main() {
                         /* current_context_size = */ 2048,
                         target_4k,
                         /* generic_kv_enabled = */ false));
+    });
+
+    t.test("qnn request capacity boundary starts on empty prefill only", [](testing & t) {
+        t.assert_true(
+                "prefill on an empty seq0 prefix should start a new request capacity selection",
+                llama_context_is_qnn_request_capacity_boundary(
+                        /* n_tokens = */ 128,
+                        /* seq0_prefix_tokens_before_decode = */ 0,
+                        /* qnn_prefix_replay_active = */ false));
+
+        t.assert_true(
+                "single-token decode should not start a new request capacity selection",
+                !llama_context_is_qnn_request_capacity_boundary(
+                        /* n_tokens = */ 1,
+                        /* seq0_prefix_tokens_before_decode = */ 0,
+                        /* qnn_prefix_replay_active = */ false));
+
+        t.assert_true(
+                "prefill with an existing seq0 prefix should not reset request capacity state",
+                !llama_context_is_qnn_request_capacity_boundary(
+                        /* n_tokens = */ 128,
+                        /* seq0_prefix_tokens_before_decode = */ 64,
+                        /* qnn_prefix_replay_active = */ false));
+
+        t.assert_true(
+                "qnn prefix replay must not recursively start a new request boundary",
+                !llama_context_is_qnn_request_capacity_boundary(
+                        /* n_tokens = */ 128,
+                        /* seq0_prefix_tokens_before_decode = */ 0,
+                        /* qnn_prefix_replay_active = */ true));
+    });
+
+    t.test("qnn request capacity uses input tokens plus margin", [](testing & t) {
+        t.assert_equal(
+                "1000 token request with default margin should stay under a 2K artifact guard",
+                llama_context_qnn_request_required_kv_slots(
+                        /* input_tokens = */ 1000,
+                        /* margin = */ 32),
+                (uint64_t) 1032);
+
+        t.assert_equal(
+                "2500 token request should request enough KV slots to avoid the 2K graph",
+                llama_context_qnn_request_required_kv_slots(
+                        /* input_tokens = */ 2500,
+                        /* margin = */ 32),
+                (uint64_t) 2532);
+    });
+
+    t.test("qnn request capacity margin defaults to 32 and accepts env override", [](testing & t) {
+        t.assert_equal(
+                "unset margin env should use the explicit default",
+                llama_context_qnn_request_capacity_margin_from_env(nullptr),
+                (uint64_t) 32);
+
+        t.assert_equal(
+                "empty margin env should use the explicit default",
+                llama_context_qnn_request_capacity_margin_from_env(""),
+                (uint64_t) 32);
+
+        t.assert_equal(
+                "invalid margin env should use the explicit default",
+                llama_context_qnn_request_capacity_margin_from_env("not-a-number"),
+                (uint64_t) 32);
+
+        t.assert_equal(
+                "zero margin env should use the explicit default",
+                llama_context_qnn_request_capacity_margin_from_env("0"),
+                (uint64_t) 32);
+
+        t.assert_equal(
+                "valid margin env should override the default",
+                llama_context_qnn_request_capacity_margin_from_env("96"),
+                (uint64_t) 96);
+
+        const char * old_margin = std::getenv("GGML_HETERO_DYNAMIC_QNN_REQUEST_KV_MARGIN");
+        const std::string old_margin_storage = old_margin != nullptr ? old_margin : "";
+        const bool had_old_margin = old_margin != nullptr;
+
+        unsetenv("GGML_HETERO_DYNAMIC_QNN_REQUEST_KV_MARGIN");
+        t.assert_equal(
+                "runtime margin env should default when unset",
+                llama_context_qnn_request_capacity_margin(),
+                (uint64_t) 32);
+
+        setenv("GGML_HETERO_DYNAMIC_QNN_REQUEST_KV_MARGIN", "128", 1);
+        t.assert_equal(
+                "runtime margin env should honor overrides",
+                llama_context_qnn_request_capacity_margin(),
+                (uint64_t) 128);
+
+        if (had_old_margin) {
+            setenv("GGML_HETERO_DYNAMIC_QNN_REQUEST_KV_MARGIN", old_margin_storage.c_str(), 1);
+        } else {
+            unsetenv("GGML_HETERO_DYNAMIC_QNN_REQUEST_KV_MARGIN");
+        }
     });
 
     t.test("qnn to opencl phase migration uses qnn shared host contract", [](testing & t) {

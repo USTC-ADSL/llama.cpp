@@ -322,6 +322,7 @@ private:
     void record_dynamic_seq0_token_history(const llama_batch & batch_inp, size_t prefix_tokens_before_decode);
     bool replay_dynamic_qnn_prefix();
     bool should_sync_before_dynamic_gpu_freq_switch(uint32_t n_tokens) const;
+    void maybe_prepare_dynamic_qnn_request_capacity(uint32_t n_tokens, size_t seq0_prefix_tokens_before_decode);
     void maybe_apply_dynamic_route(uint32_t n_tokens);
 
     //
