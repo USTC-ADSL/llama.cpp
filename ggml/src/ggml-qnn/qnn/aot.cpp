@@ -4134,6 +4134,15 @@ qnn_aot_graph * qnn_aot_runtime::ensure_graph_loaded(const qnn_aot_graph_config 
     std::unique_lock<std::mutex> lock(_lazy_graph_mutex);
     const int64_t lock_wait_us = trace_timing ? ggml_time_us() - t_total_start_us : 0;
     const qnn_aot_capacity_identity target_identity = capacity_identity_for_graph_config(graph_config);
+    const auto graph_cache_view_for_config = [this](const qnn_aot_graph_config & config) {
+        qnn_aot_graph_cache_view view;
+        view.graph_name = config.graph_name;
+        view.start_layer_id = config.start_layer_id;
+        view.end_layer_id = config.end_layer_id;
+        view.capacity = capacity_view_for_graph_config(config);
+        return view;
+    };
+    const qnn_aot_graph_cache_view target_cache_view = graph_cache_view_for_config(graph_config);
     auto & bucket = family[graph_config.batch_size];
     for (auto & graph_ptr : bucket) {
         if (!graph_ptr) {
@@ -4141,11 +4150,7 @@ qnn_aot_graph * qnn_aot_runtime::ensure_graph_loaded(const qnn_aot_graph_config 
         }
 
         const auto & loaded = graph_ptr->config();
-        if (loaded.graph_name == graph_config.graph_name &&
-            loaded.start_layer_id == graph_config.start_layer_id &&
-            loaded.end_layer_id == graph_config.end_layer_id &&
-            loaded.batch_size == graph_config.batch_size &&
-            qnn_aot_capacity_identity_matches(capacity_view_for_graph_config(loaded), target_identity)) {
+        if (qnn_aot_graph_cache_entry_matches(graph_cache_view_for_config(loaded), target_cache_view)) {
             if (trace_timing) {
                 QNN_LOG_INFO("AOT_LOAD_TRACE kind=ensure_graph_loaded graph_name=%s model_path=%s batch_size=%zu cache_size=%zu context_size=%zu graph_cache_hit=1 context_cache_hit=1 lock_wait_us=%lld context_resolve_us=0 graph_create_us=0 seed_kv_us=0 total_us=%lld success=1\n",
                              graph_config.graph_name.c_str(),

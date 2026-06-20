@@ -66,6 +66,22 @@ static qnn::qnn_aot_graph_capacity_view graph_view(
     return view;
 }
 
+static qnn::qnn_aot_graph_cache_view graph_cache_view(
+        const char * graph_name,
+        size_t      start_layer_id,
+        size_t      end_layer_id,
+        size_t      batch_size,
+        size_t      cache_size,
+        size_t      context_size,
+        const char * model_path) {
+    qnn::qnn_aot_graph_cache_view view;
+    view.graph_name = graph_name;
+    view.start_layer_id = start_layer_id;
+    view.end_layer_id = end_layer_id;
+    view.capacity = graph_view(batch_size, cache_size, context_size, model_path);
+    return view;
+}
+
 static bool expect_identity(
         const qnn::qnn_aot_capacity_identity & identity,
         const char *                          model_path,
@@ -368,6 +384,119 @@ int main(void) {
             qnn::qnn_aot_kv_cursor_after_prefix_import(active_cursor, 1800),
             1800,
             "integrated selected capacity should advance from generic prefix import after switching");
+    }
+
+    {
+        const std::vector<qnn::qnn_aot_graph_capacity_view> cross_request_graphs = {
+            graph_view(1,   1920, 2048, "qnn-2k.bin"),
+            graph_view(1,   1920, 2048, "qnn-2k.bin"),
+            graph_view(128, 1920, 2048, "qnn-2k.bin"),
+            graph_view(128, 1920, 2048, "qnn-2k.bin"),
+            graph_view(1,   3968, 4096, "qnn-4k.bin"),
+            graph_view(1,   3968, 4096, "qnn-4k.bin"),
+            graph_view(128, 3968, 4096, "qnn-4k.bin"),
+            graph_view(128, 3968, 4096, "qnn-4k.bin"),
+            graph_view(1,   6016, 6144, "qnn-6k.bin"),
+            graph_view(128, 6016, 6144, "qnn-6k.bin"),
+        };
+
+        qnn::qnn_aot_capacity_request first_request_prefill;
+        first_request_prefill.n_tokens = 1000;
+        first_request_prefill.required_kv_slots = 1032;
+
+        qnn::qnn_aot_capacity_identity first_identity;
+        const auto first_chain = qnn::qnn_aot_select_capacity_chain(
+            cross_request_graphs,
+            first_request_prefill,
+            &first_identity);
+
+        ok &= expect_eq_size(
+            first_chain.size(),
+            2,
+            "first request should select the 2K prefill graph shards");
+        ok &= expect_eq_size(
+            first_chain.empty() ? 0 : first_chain.front().batch_size,
+            128,
+            "first request prefill should use the largest available prefill batch bucket");
+        ok &= expect_identity(
+            first_identity,
+            "qnn-2k.bin",
+            1920,
+            2048,
+            "first request with 1032 required slots should choose the 2K capacity");
+
+        qnn::qnn_aot_capacity_request second_request_prefill;
+        second_request_prefill.n_tokens = 2500;
+        second_request_prefill.required_kv_slots = 2532;
+
+        qnn::qnn_aot_capacity_identity second_identity;
+        const auto second_chain = qnn::qnn_aot_select_capacity_chain(
+            cross_request_graphs,
+            second_request_prefill,
+            &second_identity);
+
+        ok &= expect_eq_size(
+            second_chain.size(),
+            2,
+            "second request should select the 4K prefill graph shards after 2K was loaded");
+        ok &= expect_eq_size(
+            second_chain.empty() ? 0 : second_chain.front().batch_size,
+            128,
+            "second request prefill should still use the prefill batch bucket while changing capacity");
+        ok &= expect_identity(
+            second_identity,
+            "qnn-4k.bin",
+            3968,
+            4096,
+            "second request with 2532 required slots should choose the 4K capacity");
+
+        const auto loaded_2k = graph_cache_view(
+            "transformer_shard_0",
+            0,
+            12,
+            128,
+            1920,
+            2048,
+            "qnn-2k.bin");
+        const auto requested_4k = graph_cache_view(
+            "transformer_shard_0",
+            0,
+            12,
+            128,
+            3968,
+            4096,
+            "qnn-4k.bin");
+        const auto loaded_4k = graph_cache_view(
+            "transformer_shard_0",
+            0,
+            12,
+            128,
+            3968,
+            4096,
+            "qnn-4k.bin");
+
+        ok &= expect_false(
+            qnn::qnn_aot_graph_cache_entry_matches(loaded_2k, requested_4k),
+            "loaded 2K graph must not satisfy a later 4K graph cache lookup");
+        ok &= expect_true(
+            qnn::qnn_aot_graph_cache_entry_matches(loaded_4k, requested_4k),
+            "matching 4K graph should satisfy the 4K graph cache lookup");
+
+        const std::vector<qnn::qnn_aot_graph_kv_cursor_view> cross_request_cursors = {
+            { graph_view(128, 1920, 2048, "qnn-2k.bin"), 0, 12, 1000 },
+            { graph_view(128, 1920, 2048, "qnn-2k.bin"), 12, 24, 1000 },
+            { graph_view(128, 3968, 4096, "qnn-4k.bin"), 0, 12, 0 },
+            { graph_view(128, 3968, 4096, "qnn-4k.bin"), 12, 24, 0 },
+        };
+
+        size_t second_cursor = 9999;
+        ok &= expect_true(
+            qnn::qnn_aot_select_active_kv_cursor(cross_request_cursors, second_identity, second_cursor),
+            "second request selected 4K chain should expose its own private cursor");
+        ok &= expect_eq_size(
+            second_cursor,
+            0,
+            "second request must start from the selected 4K cursor, not the loaded 2K cursor");
     }
 
     return ok ? 0 : 1;

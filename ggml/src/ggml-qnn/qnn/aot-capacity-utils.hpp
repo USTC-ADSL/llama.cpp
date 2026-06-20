@@ -32,12 +32,36 @@ struct qnn_aot_graph_kv_cursor_view {
     size_t                      kv_position = 0;
 };
 
+struct qnn_aot_graph_cache_view {
+    std::string                 graph_name;
+    size_t                      start_layer_id = 0;
+    size_t                      end_layer_id = 0;
+    qnn_aot_graph_capacity_view capacity;
+};
+
 inline bool qnn_aot_capacity_identity_matches(
         const qnn_aot_graph_capacity_view & view,
         const qnn_aot_capacity_identity &   identity) {
     return view.model_path == identity.model_path &&
            view.cache_size == identity.cache_size &&
            view.context_size == identity.context_size;
+}
+
+inline bool qnn_aot_graph_cache_entry_matches(
+        const qnn_aot_graph_cache_view & loaded,
+        const qnn_aot_graph_cache_view & requested) {
+    if (loaded.graph_name != requested.graph_name ||
+        loaded.start_layer_id != requested.start_layer_id ||
+        loaded.end_layer_id != requested.end_layer_id ||
+        loaded.capacity.batch_size != requested.capacity.batch_size) {
+        return false;
+    }
+
+    qnn_aot_capacity_identity requested_identity;
+    requested_identity.model_path = requested.capacity.model_path;
+    requested_identity.cache_size = requested.capacity.cache_size;
+    requested_identity.context_size = requested.capacity.context_size;
+    return qnn_aot_capacity_identity_matches(loaded.capacity, requested_identity);
 }
 
 inline size_t qnn_aot_select_batch_size(
