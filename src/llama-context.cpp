@@ -193,9 +193,20 @@ uint64_t llama_context_qnn_request_required_kv_slots(
         uint32_t input_tokens,
         uint64_t margin);
 
+uint32_t llama_context_qnn_request_input_tokens(
+        uint32_t decode_tokens,
+        uint32_t declared_request_tokens);
+
 uint64_t llama_context_qnn_request_capacity_margin_from_env(const char * value);
 
 uint64_t llama_context_qnn_request_capacity_margin();
+
+bool llama_context_should_prepare_qnn_request_capacity(
+        bool                                      qnn_backend_available,
+        bool                                      aot_active_route_requests_qnn,
+        const llama_hetero_route_spec &           current_route,
+        const llama_hetero_route_spec &           base_route,
+        const llama_dynamic_route_runtime_config & dynamic_route_config);
 
 bool llama_context_should_apply_gpu_freq_switch(
         const llama_hetero_route_spec & current_route,
@@ -731,6 +742,12 @@ uint64_t llama_context_qnn_request_required_kv_slots(
     return tokens + margin;
 }
 
+uint32_t llama_context_qnn_request_input_tokens(
+        uint32_t decode_tokens,
+        uint32_t declared_request_tokens) {
+    return std::max(decode_tokens, declared_request_tokens);
+}
+
 uint64_t llama_context_qnn_request_capacity_margin_from_env(const char * value) {
     constexpr uint64_t default_margin = 32;
     if (value == nullptr || value[0] == '\0') {
@@ -750,6 +767,48 @@ uint64_t llama_context_qnn_request_capacity_margin_from_env(const char * value) 
 uint64_t llama_context_qnn_request_capacity_margin() {
     return llama_context_qnn_request_capacity_margin_from_env(
             std::getenv("GGML_HETERO_DYNAMIC_QNN_REQUEST_KV_MARGIN"));
+}
+
+bool llama_context_should_prepare_qnn_request_capacity(
+        bool                                      qnn_backend_available,
+        bool                                      aot_active_route_requests_qnn,
+        const llama_hetero_route_spec &           current_route,
+        const llama_hetero_route_spec &           base_route,
+        const llama_dynamic_route_runtime_config & dynamic_route_config) {
+    const auto route_requests_qnn = [](const llama_hetero_route_spec & route) {
+        static constexpr std::array<llama_hetero_route_stage, 5> kStages = {{
+            llama_hetero_route_stage::ATTN_PROJ,
+            llama_hetero_route_stage::ATTN_CORE,
+            llama_hetero_route_stage::ATTN_OUT,
+            llama_hetero_route_stage::FFN,
+            llama_hetero_route_stage::OUTPUT,
+        }};
+
+        for (const auto stage : kStages) {
+            if (llama_hetero_is_qnn_backend(route.backend_for(stage))) {
+                return true;
+            }
+        }
+
+        return false;
+    };
+
+    if (qnn_backend_available || aot_active_route_requests_qnn ||
+        route_requests_qnn(current_route) ||
+        route_requests_qnn(base_route) ||
+        llama_dynamic_route_uses_qnn(dynamic_route_config.prefill.plan) ||
+        llama_dynamic_route_uses_qnn(dynamic_route_config.decode.plan) ||
+        llama_dynamic_route_uses_qnn(dynamic_route_config.fallback.plan)) {
+        return true;
+    }
+
+    for (const auto & entry : dynamic_route_config.decode_schedule) {
+        if (llama_dynamic_route_uses_qnn(entry.route.plan)) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 bool llama_context_should_apply_qnn_capacity_switch(
@@ -3014,6 +3073,10 @@ void llama_context::reset_dynamic_route_runtime_state() {
     dynamic_route_state = {};
 }
 
+void llama_context::set_qnn_request_input_token_hint(uint32_t input_tokens) {
+    qnn_request_input_token_hint = input_tokens;
+}
+
 void llama_context::maybe_prepare_dynamic_qnn_request_capacity(
         uint32_t n_tokens,
         size_t   seq0_prefix_tokens_before_decode) {
@@ -3029,21 +3092,22 @@ void llama_context::maybe_prepare_dynamic_qnn_request_capacity(
     qnn_current_required_kv_slots = 0;
     qnn_current_context_size = 0;
 
-    bool request_may_use_qnn =
-        aot_active_route_requests_qnn ||
-        hetero_route_requests_qnn(hetero_plan.route) ||
-        hetero_route_requests_qnn(hetero_plan_base.route) ||
-        llama_dynamic_route_uses_qnn(dynamic_route_config.prefill.plan) ||
-        llama_dynamic_route_uses_qnn(dynamic_route_config.decode.plan) ||
-        llama_dynamic_route_uses_qnn(dynamic_route_config.fallback.plan);
-    for (const auto & entry : dynamic_route_config.decode_schedule) {
-        request_may_use_qnn = request_may_use_qnn || llama_dynamic_route_uses_qnn(entry.route.plan);
-    }
+    const uint32_t request_input_tokens =
+        llama_context_qnn_request_input_tokens(n_tokens, qnn_request_input_token_hint);
+    qnn_request_input_token_hint = 0;
+
+    ggml_backend_t qnn_backend = find_backend_for_route("qnn-npu");
+    const bool request_may_use_qnn =
+        llama_context_should_prepare_qnn_request_capacity(
+                qnn_backend != nullptr,
+                aot_active_route_requests_qnn,
+                hetero_plan.route,
+                hetero_plan_base.route,
+                dynamic_route_config);
     if (!request_may_use_qnn) {
         return;
     }
 
-    ggml_backend_t qnn_backend = find_backend_for_route("qnn-npu");
     if (qnn_backend == nullptr) {
         LLAMA_LOG_WARN("%s: skipping request QNN capacity selection because qnn-npu backend is unavailable\n",
                 __func__);
@@ -3080,7 +3144,7 @@ void llama_context::maybe_prepare_dynamic_qnn_request_capacity(
     }
 
     const uint64_t margin = llama_context_qnn_request_capacity_margin();
-    const uint64_t required_kv_slots = llama_context_qnn_request_required_kv_slots(n_tokens, margin);
+    const uint64_t required_kv_slots = llama_context_qnn_request_required_kv_slots(request_input_tokens, margin);
     if (!set_capacity_fn(qnn_backend, static_cast<size_t>(required_kv_slots), /* preferred_context_size = */ 0)) {
         LLAMA_LOG_WARN("%s: failed to set QNN request capacity required_kv_slots=%" PRIu64 "\n",
                 __func__,
@@ -3091,9 +3155,10 @@ void llama_context::maybe_prepare_dynamic_qnn_request_capacity(
     qnn_current_required_kv_slots = required_kv_slots;
     qnn_current_context_size = 0;
     LLAMA_LOG_INFO("%s: prepared QNN request capacity required_kv_slots=%" PRIu64
-            " input_tokens=%u margin=%" PRIu64 "\n",
+            " input_tokens=%u decode_tokens=%u margin=%" PRIu64 "\n",
             __func__,
             required_kv_slots,
+            request_input_tokens,
             n_tokens,
             margin);
 }

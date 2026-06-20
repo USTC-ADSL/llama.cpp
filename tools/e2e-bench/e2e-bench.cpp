@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <sstream>
 #include <string>
@@ -188,10 +189,6 @@ static bool run_sample(
     const int64_t start_us = llama_time_us();
 
     const std::vector<llama_token> depth_tokens = make_depth_tokens(vocab, params.n_depth);
-    if (!decode_tokens(ctx, depth_tokens, params.n_batch, n_past)) {
-        return false;
-    }
-
     std::vector<llama_token> prompt_tokens = common_tokenize(vocab, sample.prompt, true, true);
     const int max_prompt_tokens = std::max(1, (int) llama_n_ctx(ctx) - params.n_depth - target_gen_tokens);
     int prompt_cap = max_prompt_tokens;
@@ -207,6 +204,15 @@ static bool run_sample(
 
     if (prompt_tokens.empty() && target_gen_tokens > 0) {
         prompt_tokens.push_back(llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : (llama_token) 1);
+    }
+
+    const uint32_t qnn_request_input_tokens = (uint32_t) std::min<size_t>(
+            (size_t) std::numeric_limits<uint32_t>::max(),
+            depth_tokens.size() + prompt_tokens.size());
+    ctx->set_qnn_request_input_token_hint(qnn_request_input_tokens);
+
+    if (!decode_tokens(ctx, depth_tokens, params.n_batch, n_past)) {
+        return false;
     }
 
     if (!decode_tokens(ctx, prompt_tokens, params.n_batch, n_past)) {

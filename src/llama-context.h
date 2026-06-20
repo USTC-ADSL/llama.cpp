@@ -213,6 +213,7 @@ struct llama_context {
     void set_dynamic_seq0_token_history(const std::vector<llama_token> & tokens);
     void clear_dynamic_seq0_token_history();
     void reset_dynamic_route_runtime_state();
+    void set_qnn_request_input_token_hint(uint32_t input_tokens);
 
     //
     // training
@@ -448,6 +449,7 @@ private:
     llama_dynamic_route_runtime_config dynamic_route_config;
     llama_dynamic_route_runtime_state  dynamic_route_state;
     std::string qnn_htp_current_workpoint;
+    uint32_t qnn_request_input_token_hint = 0;
     uint64_t qnn_current_required_kv_slots = 0;
     uint64_t qnn_current_context_size = 0;
     uint64_t gpu_current_freq_hz = 0;

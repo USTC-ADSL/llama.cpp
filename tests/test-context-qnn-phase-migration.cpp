@@ -148,9 +148,20 @@ uint64_t llama_context_qnn_request_required_kv_slots(
         uint32_t input_tokens,
         uint64_t margin);
 
+uint32_t llama_context_qnn_request_input_tokens(
+        uint32_t decode_tokens,
+        uint32_t declared_request_tokens);
+
 uint64_t llama_context_qnn_request_capacity_margin_from_env(const char * value);
 
 uint64_t llama_context_qnn_request_capacity_margin();
+
+bool llama_context_should_prepare_qnn_request_capacity(
+        bool                                      qnn_backend_available,
+        bool                                      aot_active_route_requests_qnn,
+        const llama_hetero_route_spec &           current_route,
+        const llama_hetero_route_spec &           base_route,
+        const llama_dynamic_route_runtime_config & dynamic_route_config);
 
 std::vector<std::pair<size_t, size_t>> llama_kv_cache_plan_token_prefix_sync_ranges(
         size_t   tensor_offset,
@@ -492,6 +503,29 @@ int main() {
                 (uint64_t) 2532);
     });
 
+    t.test("qnn request capacity can use declared request length over decode chunk", [](testing & t) {
+        t.assert_equal(
+                "without a declared request length, uses the current decode token count",
+                llama_context_qnn_request_input_tokens(
+                        /* decode_tokens = */ 128,
+                        /* declared_request_tokens = */ 0),
+                (uint32_t) 128);
+
+        t.assert_equal(
+                "declared request length carries full prompt size when decode is chunked",
+                llama_context_qnn_request_input_tokens(
+                        /* decode_tokens = */ 128,
+                        /* declared_request_tokens = */ 2501),
+                (uint32_t) 2501);
+
+        t.assert_equal(
+                "never shrinks below the current decode token count",
+                llama_context_qnn_request_input_tokens(
+                        /* decode_tokens = */ 256,
+                        /* declared_request_tokens = */ 128),
+                (uint32_t) 256);
+    });
+
     t.test("qnn request capacity margin defaults to 32 and accepts env override", [](testing & t) {
         t.assert_equal(
                 "unset margin env should use the explicit default",
@@ -539,6 +573,40 @@ int main() {
         } else {
             unsetenv("GGML_HETERO_DYNAMIC_QNN_REQUEST_KV_MARGIN");
         }
+    });
+
+    t.test("qnn request capacity also prepares for static qnn backend", [](testing & t) {
+        const auto empty_plan = llama_hetero_build_execution_plan("", nullptr);
+        llama_dynamic_route_runtime_config empty_dynamic;
+
+        t.assert_true(
+                "a static qnn-npu backend without a dynamic route should still receive request capacity selection",
+                llama_context_should_prepare_qnn_request_capacity(
+                        /* qnn_backend_available = */ true,
+                        /* aot_active_route_requests_qnn = */ false,
+                        empty_plan.route,
+                        empty_plan.route,
+                        empty_dynamic));
+
+        t.assert_true(
+                "no qnn backend and no qnn route should skip request capacity selection",
+                !llama_context_should_prepare_qnn_request_capacity(
+                        /* qnn_backend_available = */ false,
+                        /* aot_active_route_requests_qnn = */ false,
+                        empty_plan.route,
+                        empty_plan.route,
+                        empty_dynamic));
+
+        llama_dynamic_route_runtime_config dynamic_qnn;
+        dynamic_qnn.prefill.plan = llama_hetero_build_execution_plan("qnn-npu", nullptr);
+        t.assert_true(
+                "dynamic qnn routes should still request capacity even before backend availability is checked",
+                llama_context_should_prepare_qnn_request_capacity(
+                        /* qnn_backend_available = */ false,
+                        /* aot_active_route_requests_qnn = */ false,
+                        empty_plan.route,
+                        empty_plan.route,
+                        dynamic_qnn));
     });
 
     t.test("qnn to opencl phase migration uses qnn shared host contract", [](testing & t) {
