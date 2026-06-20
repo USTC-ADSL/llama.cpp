@@ -447,6 +447,8 @@ private:
     llama_dynamic_route_runtime_config dynamic_route_config;
     llama_dynamic_route_runtime_state  dynamic_route_state;
     std::string qnn_htp_current_workpoint;
+    uint64_t qnn_current_required_kv_slots = 0;
+    uint64_t qnn_current_context_size = 0;
     uint64_t gpu_current_freq_hz = 0;
     uint64_t cpu_current_freq_khz = 0;
     llama_context_freq_constraints gpu_default_freq_hz;

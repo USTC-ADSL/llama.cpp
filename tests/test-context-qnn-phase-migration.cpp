@@ -129,6 +129,15 @@ bool llama_context_should_apply_prefill_qnn_workpoint(
         const std::string &             current_workpoint,
         const char *                    target_workpoint);
 
+bool llama_context_should_apply_qnn_capacity_switch(
+        const llama_hetero_route_spec &      current_route,
+        const llama_hetero_route_spec &      target_route,
+        uint32_t                             n_tokens,
+        uint64_t                             current_required_kv_slots,
+        uint64_t                             current_context_size,
+        const llama_dynamic_backend_state &  target_state,
+        bool                                 generic_kv_enabled);
+
 std::vector<std::pair<size_t, size_t>> llama_kv_cache_plan_token_prefix_sync_ranges(
         size_t   tensor_offset,
         size_t   token_bytes,
@@ -355,6 +364,72 @@ int main() {
                         128,
                         "burst",
                         "low_balanced"));
+    });
+
+    t.test("qnn same-backend decode can switch KV capacity without a route change", [](testing & t) {
+        const auto qnn_plan = llama_hetero_build_execution_plan("qnn-npu", nullptr);
+        const auto gpu_plan = llama_hetero_build_execution_plan("opencl", nullptr);
+
+        llama_dynamic_backend_state target_4k;
+        target_4k.has_qnn_context_size = true;
+        target_4k.qnn_context_size = 4096;
+        target_4k.has_qnn_required_kv_slots = true;
+        target_4k.qnn_required_kv_slots = 2500;
+
+        t.assert_true(
+                "qnn->qnn single-token decode with a different target capacity should apply runtime capacity control",
+                llama_context_should_apply_qnn_capacity_switch(
+                        qnn_plan.route,
+                        qnn_plan.route,
+                        1,
+                        /* current_required_kv_slots = */ 1920,
+                        /* current_context_size = */ 2048,
+                        target_4k,
+                        /* generic_kv_enabled = */ true));
+
+        t.assert_true(
+                "the same capacity should not be re-applied every decode token",
+                !llama_context_should_apply_qnn_capacity_switch(
+                        qnn_plan.route,
+                        qnn_plan.route,
+                        1,
+                        /* current_required_kv_slots = */ 2500,
+                        /* current_context_size = */ 4096,
+                        target_4k,
+                        /* generic_kv_enabled = */ true));
+
+        t.assert_true(
+                "prefill-sized batches must not trigger decode capacity-only switching",
+                !llama_context_should_apply_qnn_capacity_switch(
+                        qnn_plan.route,
+                        qnn_plan.route,
+                        128,
+                        /* current_required_kv_slots = */ 1920,
+                        /* current_context_size = */ 2048,
+                        target_4k,
+                        /* generic_kv_enabled = */ true));
+
+        t.assert_true(
+                "qnn capacity-only switching only applies when the target route stays on qnn",
+                !llama_context_should_apply_qnn_capacity_switch(
+                        qnn_plan.route,
+                        gpu_plan.route,
+                        1,
+                        /* current_required_kv_slots = */ 1920,
+                        /* current_context_size = */ 2048,
+                        target_4k,
+                        /* generic_kv_enabled = */ true));
+
+        t.assert_true(
+                "same-qnn private capacity migration must be refused without generic KV writeback",
+                !llama_context_should_apply_qnn_capacity_switch(
+                        qnn_plan.route,
+                        qnn_plan.route,
+                        1,
+                        /* current_required_kv_slots = */ 1920,
+                        /* current_context_size = */ 2048,
+                        target_4k,
+                        /* generic_kv_enabled = */ false));
     });
 
     t.test("qnn to opencl phase migration uses qnn shared host contract", [](testing & t) {

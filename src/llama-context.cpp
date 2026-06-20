@@ -175,6 +175,15 @@ bool llama_context_should_apply_prefill_qnn_workpoint(
         const std::string &             current_workpoint,
         const char *                    target_workpoint);
 
+bool llama_context_should_apply_qnn_capacity_switch(
+        const llama_hetero_route_spec &     current_route,
+        const llama_hetero_route_spec &     target_route,
+        uint32_t                            n_tokens,
+        uint64_t                            current_required_kv_slots,
+        uint64_t                            current_context_size,
+        const llama_dynamic_backend_state & target_state,
+        bool                                generic_kv_enabled);
+
 bool llama_context_should_apply_gpu_freq_switch(
         const llama_hetero_route_spec & current_route,
         const llama_hetero_route_spec & target_route,
@@ -689,6 +698,47 @@ bool llama_context_should_apply_prefill_qnn_workpoint(
     return !target.empty() && current != target;
 }
 
+bool llama_context_should_apply_qnn_capacity_switch(
+        const llama_hetero_route_spec &     current_route,
+        const llama_hetero_route_spec &     target_route,
+        uint32_t                            n_tokens,
+        uint64_t                            current_required_kv_slots,
+        uint64_t                            current_context_size,
+        const llama_dynamic_backend_state & target_state,
+        bool                                generic_kv_enabled) {
+    if (n_tokens != 1) {
+        return false;
+    }
+
+    if (!target_state.has_qnn_context_size && !target_state.has_qnn_required_kv_slots) {
+        return false;
+    }
+
+    const std::string current_backend =
+        llama_hetero_canonical_backend(llama_hetero_phase_backend_for_route(current_route));
+    const std::string target_backend =
+        llama_hetero_canonical_backend(llama_hetero_phase_backend_for_route(target_route));
+    if (current_backend != "qnn-npu" || target_backend != "qnn-npu") {
+        return false;
+    }
+
+    if (!generic_kv_enabled) {
+        return false;
+    }
+
+    const uint64_t target_required_kv_slots =
+        target_state.has_qnn_required_kv_slots
+            ? target_state.qnn_required_kv_slots
+            : current_required_kv_slots;
+    const uint64_t target_context_size =
+        target_state.has_qnn_context_size
+            ? target_state.qnn_context_size
+            : current_context_size;
+
+    return target_required_kv_slots != current_required_kv_slots ||
+           target_context_size != current_context_size;
+}
+
 bool llama_context_should_apply_gpu_freq_switch(
         const llama_hetero_route_spec & current_route,
         const llama_hetero_route_spec & target_route,
@@ -885,6 +935,8 @@ using ggml_backend_qnn_aot_has_pending_generic_kv_writeback_t = bool (*)(ggml_ba
 using ggml_backend_qnn_aot_flush_pending_generic_kv_writeback_t = bool (*)(ggml_backend_t backend);
 using ggml_backend_qnn_aot_reset_state_t = bool (*)(ggml_backend_t backend);
 using ggml_backend_qnn_aot_preload_decode_graphs_t = bool (*)(ggml_backend_t backend, size_t n_tokens);
+using ggml_backend_qnn_aot_set_required_kv_capacity_t =
+    bool (*)(ggml_backend_t backend, size_t required_kv_slots, size_t preferred_context_size);
 using ggml_backend_qnn_set_htp_workpoint_t = bool (*)(ggml_backend_t backend, const char * workpoint);
 
 bool hetero_dynamic_trace_timing_enabled() {
@@ -3306,6 +3358,26 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         llama_hetero_canonical_backend(llama_hetero_phase_backend_for_route(hetero_plan.route));
     const std::string target_phase_backend =
         llama_hetero_canonical_backend(llama_hetero_phase_backend_for_route(decision.plan.route));
+    const bool generic_qnn_kv_enabled = env_flag_enabled("GGML_QNN_AOT_WRITE_GENERIC_KV");
+    const bool target_has_qnn_capacity_state =
+        decision.backend_state.has_qnn_context_size ||
+        decision.backend_state.has_qnn_required_kv_slots;
+    const uint64_t target_qnn_required_kv_slots =
+        decision.backend_state.has_qnn_required_kv_slots
+            ? decision.backend_state.qnn_required_kv_slots
+            : qnn_current_required_kv_slots;
+    const uint64_t target_qnn_context_size =
+        decision.backend_state.has_qnn_context_size
+            ? decision.backend_state.qnn_context_size
+            : qnn_current_context_size;
+    const bool qnn_capacity_target_differs =
+        target_has_qnn_capacity_state &&
+        (target_qnn_required_kv_slots != qnn_current_required_kv_slots ||
+         target_qnn_context_size != qnn_current_context_size);
+    const bool qnn_capacity_requires_private_migration =
+        current_phase_backend == "qnn-npu" &&
+        target_phase_backend == "qnn-npu" &&
+        qnn_capacity_target_differs;
     const bool schedule_route_switch_pending =
         decision.should_apply && decision.decode_schedule_active;
     const bool prefill_route_switch_pending =
@@ -3346,6 +3418,156 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         target_qnn_workpoint[0] != '\0' &&
         llama_context_canonical_qnn_workpoint(qnn_htp_current_workpoint.c_str()) !=
             llama_context_canonical_qnn_workpoint(target_qnn_workpoint);
+
+    const bool should_apply_qnn_capacity_state_only =
+        !decision.should_apply &&
+        decision.reason != "decode-switch-wait" &&
+        llama_context_should_apply_qnn_capacity_switch(
+                hetero_plan.route,
+                decision.plan.route,
+                n_tokens,
+                qnn_current_required_kv_slots,
+                qnn_current_context_size,
+                decision.backend_state,
+                generic_qnn_kv_enabled);
+    const bool should_refuse_qnn_capacity_state_without_generic_kv =
+        !decision.should_apply &&
+        decision.reason != "decode-switch-wait" &&
+        n_tokens == 1 &&
+        qnn_capacity_requires_private_migration &&
+        !generic_qnn_kv_enabled;
+    const bool should_apply_qnn_capacity_before_route =
+        decision.should_apply &&
+        target_phase_backend == "qnn-npu" &&
+        target_has_qnn_capacity_state;
+
+    if (should_refuse_qnn_capacity_state_without_generic_kv) {
+        LLAMA_LOG_WARN("%s: refusing qnn capacity-only switch to required_kv_slots=%" PRIu64
+                " context_size=%" PRIu64 " because GGML_QNN_AOT_WRITE_GENERIC_KV is not enabled\n",
+                __func__,
+                target_qnn_required_kv_slots,
+                target_qnn_context_size);
+    }
+
+    const auto flush_pending_qnn_generic_kv_writeback = [&]() -> bool {
+        ggml_backend_t qnn_backend = find_backend_for_route("qnn-npu");
+        if (qnn_backend == nullptr) {
+            LLAMA_LOG_WARN("%s: qnn backend unavailable for generic KV writeback flush before capacity switch\n",
+                    __func__);
+            return false;
+        }
+
+        ggml_backend_dev_t qnn_dev = ggml_backend_get_device(qnn_backend);
+        ggml_backend_reg_t qnn_reg = qnn_dev != nullptr ? ggml_backend_dev_backend_reg(qnn_dev) : nullptr;
+        auto * has_pending_fn =
+            qnn_reg != nullptr
+                ? (ggml_backend_qnn_aot_has_pending_generic_kv_writeback_t)
+                      ggml_backend_reg_get_proc_address(qnn_reg, "ggml_backend_qnn_aot_has_pending_generic_kv_writeback")
+                : nullptr;
+        auto * flush_pending_fn =
+            qnn_reg != nullptr
+                ? (ggml_backend_qnn_aot_flush_pending_generic_kv_writeback_t)
+                      ggml_backend_reg_get_proc_address(qnn_reg, "ggml_backend_qnn_aot_flush_pending_generic_kv_writeback")
+                : nullptr;
+
+        if (has_pending_fn == nullptr || flush_pending_fn == nullptr) {
+            LLAMA_LOG_WARN("%s: qnn backend does not expose generic KV writeback flush hooks; refusing capacity switch\n",
+                    __func__);
+            return false;
+        }
+
+        if (!has_pending_fn(qnn_backend)) {
+            return true;
+        }
+
+        LLAMA_LOG_INFO("%s: flushing pending QNN generic KV before capacity switch\n", __func__);
+        const int64_t t_kv_migration_start_us = trace_timing ? ggml_time_us() : 0;
+        const bool flushed = flush_pending_fn(qnn_backend);
+        const int64_t t_kv_migration_end_us = trace_timing ? ggml_time_us() : 0;
+        if (trace_timing && hetero_phase_trace.active) {
+            hetero_phase_trace.kv_migration_us += t_kv_migration_end_us - t_kv_migration_start_us;
+        }
+        if (!flushed) {
+            LLAMA_LOG_ERROR("%s: failed to flush pending QNN generic KV before capacity switch\n", __func__);
+        }
+        return flushed;
+    };
+
+    const auto apply_qnn_capacity_state = [&](bool require_generic_flush) -> bool {
+        if (require_generic_flush) {
+            if (!generic_qnn_kv_enabled) {
+                LLAMA_LOG_WARN("%s: refusing qnn capacity switch because GGML_QNN_AOT_WRITE_GENERIC_KV is not enabled\n",
+                        __func__);
+                return false;
+            }
+            if (!flush_pending_qnn_generic_kv_writeback()) {
+                return false;
+            }
+        }
+
+        ggml_backend_t qnn_backend = find_backend_for_route("qnn-npu");
+        if (qnn_backend == nullptr) {
+            LLAMA_LOG_ERROR("%s: qnn-npu backend unavailable for runtime capacity switch\n", __func__);
+            return false;
+        }
+
+        ggml_backend_dev_t qnn_dev = ggml_backend_get_device(qnn_backend);
+        ggml_backend_reg_t qnn_reg = qnn_dev != nullptr ? ggml_backend_dev_backend_reg(qnn_dev) : nullptr;
+        auto * set_capacity_fn =
+            qnn_reg != nullptr
+                ? (ggml_backend_qnn_aot_set_required_kv_capacity_t)
+                      ggml_backend_reg_get_proc_address(qnn_reg, "ggml_backend_qnn_aot_set_required_kv_capacity")
+                : nullptr;
+        if (set_capacity_fn == nullptr) {
+            LLAMA_LOG_ERROR("%s: qnn backend does not expose ggml_backend_qnn_aot_set_required_kv_capacity\n",
+                    __func__);
+            return false;
+        }
+
+        return set_capacity_fn(
+                qnn_backend,
+                static_cast<size_t>(target_qnn_required_kv_slots),
+                static_cast<size_t>(target_qnn_context_size));
+    };
+
+    if (should_apply_qnn_capacity_state_only || should_apply_qnn_capacity_before_route) {
+        const bool require_generic_flush = qnn_capacity_requires_private_migration;
+        const bool applied = apply_qnn_capacity_state(require_generic_flush);
+
+        if (trace_timing && hetero_phase_trace.active && should_apply_qnn_capacity_state_only) {
+            hetero_phase_trace.route_applied = applied;
+            hetero_phase_trace.route_noop = true;
+            hetero_phase_trace.route_apply_us = 0;
+            hetero_phase_trace.route_label = decision.plan_label.empty() ? "decode" : decision.plan_label;
+            hetero_phase_trace.route_reason = applied ? "qnn-capacity-only" : "qnn-capacity-apply-failed";
+            hetero_phase_trace.source_route = source_route;
+            hetero_phase_trace.target_route = target_route;
+        }
+
+        if (applied) {
+            qnn_current_required_kv_slots = target_qnn_required_kv_slots;
+            qnn_current_context_size = target_qnn_context_size;
+            if (should_apply_qnn_capacity_state_only) {
+                dynamic_route_state.route_switches++;
+            }
+            LLAMA_LOG_INFO("%s: applied qnn capacity switch required_kv_slots=%" PRIu64
+                    " context_size=%" PRIu64 "\n",
+                    __func__,
+                    qnn_current_required_kv_slots,
+                    qnn_current_context_size);
+        } else {
+            LLAMA_LOG_ERROR("%s: failed to apply qnn capacity switch required_kv_slots=%" PRIu64
+                    " context_size=%" PRIu64 "\n",
+                    __func__,
+                    target_qnn_required_kv_slots,
+                    target_qnn_context_size);
+        }
+
+        if (!applied ||
+                (should_apply_qnn_capacity_state_only && !should_apply_qnn_workpoint_state_only)) {
+            return;
+        }
+    }
 
     if (should_apply_qnn_workpoint_state_only || should_apply_qnn_workpoint_before_route) {
         ggml_backend_t qnn_backend = find_backend_for_route("qnn-npu");
@@ -4286,11 +4508,6 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         n_tokens == 1 &&
         hetero_route_requests_qnn(hetero_plan.route) &&
         !hetero_route_requests_qnn(decision.plan.route);
-    const char * generic_qnn_kv_env = std::getenv("GGML_QNN_AOT_WRITE_GENERIC_KV");
-    const bool generic_qnn_kv_enabled =
-        generic_qnn_kv_env != nullptr &&
-        generic_qnn_kv_env[0] != '\0' &&
-        std::strcmp(generic_qnn_kv_env, "0") != 0;
     const bool should_attempt_qnn_kv_migration =
         llama_context_should_attempt_qnn_phase_kv_migration(
                 current_attn_backend,
