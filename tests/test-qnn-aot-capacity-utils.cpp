@@ -313,5 +313,62 @@ int main(void) {
             "selected capacity cursor should advance to the imported generic prefix");
     }
 
+    {
+        const std::vector<qnn::qnn_aot_graph_capacity_view> mixed_graphs = {
+            graph_view(1, 1920, 2048, "qnn-2k.bin"),
+            graph_view(1, 1920, 2048, "qnn-2k.bin"),
+            graph_view(1, 3968, 4096, "qnn-4k.bin"),
+            graph_view(1, 3968, 4096, "qnn-4k.bin"),
+            graph_view(1, 6016, 6144, "qnn-6k.bin"),
+            graph_view(1, 6016, 6144, "qnn-6k.bin"),
+        };
+        const std::vector<qnn::qnn_aot_graph_kv_cursor_view> mixed_cursors = {
+            { graph_view(1, 1920, 2048, "qnn-2k.bin"), 0, 12, 1792 },
+            { graph_view(1, 1920, 2048, "qnn-2k.bin"), 12, 24, 1800 },
+            { graph_view(1, 3968, 4096, "qnn-4k.bin"), 0, 12, 0 },
+            { graph_view(1, 3968, 4096, "qnn-4k.bin"), 12, 24, 24 },
+            { graph_view(1, 6016, 6144, "qnn-6k.bin"), 0, 12, 0 },
+            { graph_view(1, 6016, 6144, "qnn-6k.bin"), 12, 24, 0 },
+        };
+
+        qnn::qnn_aot_capacity_request request;
+        request.n_tokens = 1;
+        request.required_kv_slots = 2500;
+        request.preferred_context_size = 4096;
+
+        qnn::qnn_aot_capacity_identity selected_identity;
+        const auto selected_chain =
+            qnn::qnn_aot_select_capacity_chain(mixed_graphs, request, &selected_identity);
+
+        ok &= expect_eq_size(
+            selected_chain.size(),
+            2,
+            "integrated capacity switch should select only the 4K graph shards");
+        ok &= expect_identity(
+            selected_identity,
+            "qnn-4k.bin",
+            3968,
+            4096,
+            "integrated capacity switch should select the requested 4K identity");
+        for (const auto & view : selected_chain) {
+            ok &= expect_true(
+                qnn::qnn_aot_capacity_identity_matches(view, selected_identity),
+                "integrated selected graph shard should match the selected capacity identity");
+        }
+
+        size_t active_cursor = 9999;
+        ok &= expect_true(
+            qnn::qnn_aot_select_active_kv_cursor(mixed_cursors, selected_identity, active_cursor),
+            "integrated selected capacity should resolve a private KV cursor");
+        ok &= expect_eq_size(
+            active_cursor,
+            0,
+            "integrated selected capacity must not reuse the loaded 2K private KV cursor");
+        ok &= expect_eq_size(
+            qnn::qnn_aot_kv_cursor_after_prefix_import(active_cursor, 1800),
+            1800,
+            "integrated selected capacity should advance from generic prefix import after switching");
+    }
+
     return ok ? 0 : 1;
 }
