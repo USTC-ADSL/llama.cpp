@@ -279,6 +279,57 @@ int main(void) {
     }
 
     {
+        const std::vector<qnn::qnn_aot_graph_capacity_view> sharded_bucket = {
+            graph_view(1, 1920, 2048, "qnn-2k_0.bin"),
+            graph_view(1, 1920, 2048, "qnn-2k_1.bin"),
+            graph_view(1, 3968, 4096, "qnn-4k_0.bin"),
+            graph_view(1, 3968, 4096, "qnn-4k_1.bin"),
+        };
+
+        qnn::qnn_aot_capacity_identity identity;
+        qnn::qnn_aot_capacity_request request;
+        request.n_tokens = 1;
+        request.required_kv_slots = 2500;
+        request.preferred_context_size = 4096;
+
+        const auto chain = qnn::qnn_aot_select_capacity_chain(sharded_bucket, request, &identity);
+
+        ok &= expect_eq_size(
+            chain.size(),
+            2,
+            "same-capacity transformer shards with different model paths should stay in one selected chain");
+        ok &= expect_identity(
+            identity,
+            "qnn-4k_0.bin",
+            3968,
+            4096,
+            "selected identity should still name one concrete graph for cache ownership");
+        for (const auto & view : chain) {
+            ok &= expect_true(
+                qnn::qnn_aot_capacity_shape_matches(view, 1, identity),
+                "selected sharded chain entries must share batch/cache/context");
+        }
+        ok &= expect_false(
+            qnn::qnn_aot_graph_cache_entry_matches(
+                graph_cache_view("transformer_shard_0", 0, 18, 1, 3968, 4096, "qnn-4k_0.bin"),
+                graph_cache_view("transformer_shard_0", 0, 18, 1, 3968, 4096, "qnn-4k_1.bin")),
+            "different transformer shard binaries must not share a graph cache entry");
+
+        const std::vector<qnn::qnn_aot_graph_kv_cursor_view> sharded_cursors = {
+            { graph_view(1, 3968, 4096, "qnn-4k_0.bin"), 0, 18, 1800 },
+            { graph_view(1, 3968, 4096, "qnn-4k_1.bin"), 18, 36, 1792 },
+        };
+        size_t active_cursor = 9999;
+        ok &= expect_true(
+            qnn::qnn_aot_select_active_kv_cursor_for_chain(sharded_cursors, active_cursor),
+            "selected sharded chain should resolve a cursor across all shards");
+        ok &= expect_eq_size(
+            active_cursor,
+            1792,
+            "selected sharded chain cursor should use the minimum cursor across all model paths");
+    }
+
+    {
         const std::vector<qnn::qnn_aot_graph_capacity_view> mixed_bucket = {
             graph_view(1, 1920, 2048, "qnn-2k.bin"),
             graph_view(1, 1920, 2048, "qnn-2k.bin"),
