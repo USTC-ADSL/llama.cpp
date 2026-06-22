@@ -4026,10 +4026,7 @@ bool qnn_aot_runtime::ensure_transformer_graph_chain_loaded(
         const qnn_aot_capacity_identity & identity) {
     bool has_matching_config = false;
     for (const auto & graph_config : _config.transformer_graphs) {
-        if (graph_config.batch_size != batch_size) {
-            continue;
-        }
-        if (!qnn_aot_capacity_identity_matches(capacity_view_for_graph_config(graph_config), identity)) {
+        if (!qnn_aot_capacity_shape_matches(capacity_view_for_graph_config(graph_config), batch_size, identity)) {
             continue;
         }
 
@@ -4075,7 +4072,7 @@ std::vector<qnn_aot_graph *> qnn_aot_runtime::select_transformer_graph_chain(siz
 
     for (const auto & graph_ptr : bucket_it->second) {
         if (graph_ptr &&
-            qnn_aot_capacity_identity_matches(capacity_view_for_graph_config(graph_ptr->config()), identity)) {
+            qnn_aot_capacity_shape_matches(capacity_view_for_graph_config(graph_ptr->config()), batch_size, identity)) {
             selected_graphs.push_back(graph_ptr.get());
         }
     }
@@ -4888,7 +4885,6 @@ size_t qnn_aot_runtime::active_kv_position_for_graph_chain(const std::vector<qnn
         return 0;
     }
 
-    qnn_aot_capacity_identity identity = capacity_identity_for_graph_config(graphs.front()->config());
     std::vector<qnn_aot_graph_kv_cursor_view> cursor_views;
     cursor_views.reserve(graphs.size());
     for (const auto * graph : graphs) {
@@ -4906,7 +4902,7 @@ size_t qnn_aot_runtime::active_kv_position_for_graph_chain(const std::vector<qnn
     }
 
     size_t cursor = 0;
-    if (qnn_aot_select_active_kv_cursor(cursor_views, identity, cursor)) {
+    if (qnn_aot_select_active_kv_cursor_for_chain(cursor_views, cursor)) {
         return cursor;
     }
 
@@ -5761,6 +5757,8 @@ bool qnn_aot_runtime::execute_transformer(ggml_cgraph * cgraph, const aot_match_
     }
 
     const size_t graph_batch_size = graphs.front()->batch_size();
+    bool saw_layer_range = false;
+    size_t chain_start_layer = 0;
     size_t expected_start_layer = 0;
     for (size_t i = 0; i < graphs.size(); ++i) {
         auto * graph = graphs[i];
@@ -5774,8 +5772,10 @@ bool qnn_aot_runtime::execute_transformer(ggml_cgraph * cgraph, const aot_match_
         }
 
         if (config.end_layer_id > config.start_layer_id) {
-            if (i == 0) {
+            if (!saw_layer_range) {
+                chain_start_layer = config.start_layer_id;
                 expected_start_layer = config.start_layer_id;
+                saw_layer_range = true;
             }
             if (config.start_layer_id != expected_start_layer) {
                 QNN_LOG_WARN("[aot] transformer graph chain is not contiguous for batch=%zu: expected start=%zu got start=%zu end=%zu graph=%s\n",
@@ -5788,6 +5788,15 @@ bool qnn_aot_runtime::execute_transformer(ggml_cgraph * cgraph, const aot_match_
             }
             expected_start_layer = config.end_layer_id;
         }
+    }
+    if (!saw_layer_range || chain_start_layer != 0 || expected_start_layer != _config.model.n_layers) {
+        QNN_LOG_WARN("[aot] transformer graph chain does not cover the full model for batch=%zu: start=%zu end=%zu n_layers=%zu parts=%zu\n",
+                     graph_batch_size,
+                     saw_layer_range ? chain_start_layer : 0,
+                     saw_layer_range ? expected_start_layer : 0,
+                     _config.model.n_layers,
+                     graphs.size());
+        return false;
     }
 
     if (aot_trace_match_enabled()) {

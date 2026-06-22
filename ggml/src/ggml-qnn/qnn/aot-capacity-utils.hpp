@@ -47,6 +47,15 @@ inline bool qnn_aot_capacity_identity_matches(
            view.context_size == identity.context_size;
 }
 
+inline bool qnn_aot_capacity_shape_matches(
+        const qnn_aot_graph_capacity_view & view,
+        size_t                              batch_size,
+        const qnn_aot_capacity_identity &   identity) {
+    return view.batch_size == batch_size &&
+           view.cache_size == identity.cache_size &&
+           view.context_size == identity.context_size;
+}
+
 inline bool qnn_aot_graph_cache_entry_matches(
         const qnn_aot_graph_cache_view & loaded,
         const qnn_aot_graph_cache_view & requested) {
@@ -173,8 +182,7 @@ inline std::vector<qnn_aot_graph_capacity_view> qnn_aot_select_capacity_chain(
     }
 
     for (const auto & graph : graphs) {
-        if (graph.batch_size == batch_size &&
-            qnn_aot_capacity_identity_matches(graph, identity)) {
+        if (qnn_aot_capacity_shape_matches(graph, batch_size, identity)) {
             chain.push_back(graph);
         }
     }
@@ -198,6 +206,31 @@ inline bool qnn_aot_select_active_kv_cursor(
             continue;
         }
 
+        if (graph.end_layer_id <= graph.start_layer_id) {
+            continue;
+        }
+
+        if (!found || graph.kv_position < cursor) {
+            cursor = graph.kv_position;
+        }
+        found = true;
+    }
+
+    if (!found) {
+        return false;
+    }
+
+    out_cursor = cursor;
+    return true;
+}
+
+inline bool qnn_aot_select_active_kv_cursor_for_chain(
+        const std::vector<qnn_aot_graph_kv_cursor_view> & graphs,
+        size_t &                                          out_cursor) {
+    bool found = false;
+    size_t cursor = 0;
+
+    for (const auto & graph : graphs) {
         if (graph.end_layer_id <= graph.start_layer_id) {
             continue;
         }
