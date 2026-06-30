@@ -8,11 +8,18 @@ import re
 import shlex
 import subprocess
 import time
+import sys
 from pathlib import Path
 from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from hetero_route_spec import route_spec_for_fixed_state as route_spec_for_state
+
 SIMULATOR = ROOT / "scripts" / "simulate_system_benefit.py"
 
 
@@ -25,24 +32,6 @@ def normalize_backend(value: str) -> str:
     if upper.startswith("CPU"):
         return "CPU"
     return upper
-
-
-def route_spec_for_state(state: str) -> str:
-    text = state.strip()
-    lowered = text.lower()
-    numbers = [int(item) for item in re.findall(r"\d+", text)]
-    if lowered.startswith("gpu_") or lowered.isdigit():
-        freq_mhz = numbers[-1] if numbers else int(text)
-        return f"opencl{{gpu_freq_hz={freq_mhz * 1_000_000}}}"
-    if lowered.startswith("npu_") or lowered in {"burst", "balanced", "low_balanced"}:
-        workpoint = lowered.removeprefix("npu_")
-        return f"qnn-npu{{workpoint={workpoint}}}"
-    if "b2s4" in lowered and len([item for item in numbers if item >= 100000]) >= 2:
-        freqs = [item for item in numbers if item >= 100000]
-        return f"cpu{{threads=6,affinity=FC,cpu_policy0_freq_khz={freqs[1]},cpu_policy6_freq_khz={freqs[0]}}}"
-    if lowered.startswith("cpu_") or lowered.startswith("b"):
-        return "cpu"
-    raise ValueError(f"cannot map fixed backend/state to route spec: {state}")
 
 
 def load_plan_schedule(path: Path) -> tuple[str, dict[str, Any]]:

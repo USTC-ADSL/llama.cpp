@@ -7,16 +7,30 @@
 #include "../../src/llama-context.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <chrono>
 #include <clocale>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
+
+#if defined(__clang__)
+#    pragma clang diagnostic push
+#    pragma clang diagnostic ignored "-Wmissing-prototypes"
+#endif
+#define SYSTEM_BENEFIT_PLANNER_NO_MAIN
+#include "../system-benefit-planner/system-benefit-planner.cpp"
+#if defined(__clang__)
+#    pragma clang diagnostic pop
+#endif
 
 struct sample_result {
     int     rep           = 0;
@@ -58,7 +72,19 @@ static void print_usage(int, char ** argv) {
             "  --dataset PATH           JSONL file or directory; ShareGPT conversations are supported\n"
             "  --limit N, --samples N   max dataset samples; 0 means all\n"
             "  --dataset-output-tokens  generate the same token count as each dataset assistant output\n"
-            "  --no-wait-start          do not wait at READY before MEASURE_BEGIN\n",
+            "  --no-wait-start          do not wait at READY before MEASURE_BEGIN\n"
+            "\n"
+            "system-benefit planner options:\n"
+            "  --planner-decode-profile PATH   enable planner and read decode profile CSV\n"
+            "  --planner-prefill-profile PATH  optional prefill profile CSV; defaults to NPU burst fallback\n"
+            "  --planner-ttft-slo-ms MS        TTFT SLO for prefill planning\n"
+            "  --planner-tbt-slo-ms MS         TBT SLO for decode planning\n"
+            "  --planner-input-len N           optional planner input override; otherwise use each sample input\n"
+            "  --planner-output-len N          optional planner output override; otherwise plan to --planner-max-context\n"
+            "  --planner-bucket-size N         decode bucket size, default 32\n"
+            "  --planner-max-context N         total context upper bound when output length is unspecified, default 6144\n"
+            "  --planner-context-match MODE    exact, floor, ceil, or nearest\n"
+            "  --planner-initial-decode-state STATE\n",
             argv[0]);
 }
 
@@ -99,6 +125,202 @@ static bool parse_devices_arg(const std::string & value, std::vector<ggml_backen
     return true;
 }
 
+static bool e2e_bench_planner_enabled(const e2e_bench_params & params) {
+    return !params.planner_decode_profile.empty();
+}
+
+static constexpr int E2E_BENCH_PLANNER_PREFILL_BATCH = 128;
+
+static int e2e_bench_planner_prefill_batch_size(size_t input_tokens) {
+    if (input_tokens == 0) {
+        return 1;
+    }
+    return std::max(1, std::min<int>(E2E_BENCH_PLANNER_PREFILL_BATCH, (int) input_tokens));
+}
+
+static std::vector<llama_token> e2e_bench_concat_tokens(
+        const std::vector<llama_token> & lhs,
+        const std::vector<llama_token> & rhs) {
+    std::vector<llama_token> out;
+    out.reserve(lhs.size() + rhs.size());
+    out.insert(out.end(), lhs.begin(), lhs.end());
+    out.insert(out.end(), rhs.begin(), rhs.end());
+    return out;
+}
+
+struct e2e_bench_dynamic_route_plan {
+    int input_len = 0;
+    int output_len = 0;
+    double planner_elapsed_ms = 0.0;
+    bool planner_cache_hit = false;
+    system_benefit_planner::prefill_plan prefill;
+    system_benefit_planner::decode_plan decode;
+    std::string prefill_route;
+    std::string prefill_qnn_workpoint;
+    std::string decode_schedule;
+    llama_dynamic_route_config prefill_config{};
+    llama_dynamic_route_config config{};
+
+    void bind_config() {
+        prefill_config = llama_dynamic_route_default_config();
+        prefill_config.mode = "phase";
+        prefill_config.prefill_route = prefill_route.empty() ? nullptr : prefill_route.c_str();
+        prefill_config.prefill_qnn_workpoint = prefill_qnn_workpoint.empty() ? nullptr : prefill_qnn_workpoint.c_str();
+        prefill_config.prefill_qnn_context_size = prefill.qnn_context_size;
+        prefill_config.prefill_qnn_required_kv_slots = prefill.qnn_required_kv_slots;
+        prefill_config.decode_route = prefill_route.empty() ? nullptr : prefill_route.c_str();
+        prefill_config.allow_qnn = true;
+
+        config = prefill_config;
+        config.decode_schedule = decode_schedule.empty() ? nullptr : decode_schedule.c_str();
+        config.allow_qnn = true;
+    }
+};
+
+struct e2e_bench_plan_cache_key {
+    int input_len = 0;
+    int output_len = 0;
+
+    bool operator<(const e2e_bench_plan_cache_key & rhs) const {
+        return std::tie(input_len, output_len) < std::tie(rhs.input_len, rhs.output_len);
+    }
+};
+
+struct e2e_bench_planner_state {
+    bool enabled = false;
+    system_benefit_planner::options args;
+    std::vector<system_benefit_planner::profile_record> prefill_records;
+    std::vector<system_benefit_planner::profile_record> decode_records;
+    std::map<e2e_bench_plan_cache_key, e2e_bench_dynamic_route_plan> plan_cache;
+};
+
+static int e2e_bench_planner_output_len_for_input(
+        const e2e_bench_params & params,
+        int                      input_len,
+        std::string &            err) {
+    if (params.planner_output_len >= 0) {
+        return params.planner_output_len;
+    }
+    const int output_len = params.planner_max_context - input_len;
+    if (output_len <= 0) {
+        err = "--planner-max-context must be larger than the planner input length when --planner-output-len is omitted";
+        return -1;
+    }
+    return output_len;
+}
+
+static bool e2e_bench_init_planner(
+        const e2e_bench_params &  params,
+        e2e_bench_planner_state & planner,
+        std::string &             err) {
+    planner.enabled = e2e_bench_planner_enabled(params);
+    if (!planner.enabled) {
+        return true;
+    }
+    if (params.planner_ttft_slo_ms < 0.0) {
+        err = "--planner-ttft-slo-ms is required when planner is enabled";
+        return false;
+    }
+    if (params.planner_tbt_slo_ms <= 0.0) {
+        err = "--planner-tbt-slo-ms must be > 0 when planner is enabled";
+        return false;
+    }
+
+    planner.args.prefill_profile = params.planner_prefill_profile;
+    planner.args.decode_profile = params.planner_decode_profile;
+    planner.args.ttft_slo_ms = params.planner_ttft_slo_ms;
+    planner.args.tbt_slo_ms = params.planner_tbt_slo_ms;
+    planner.args.bucket_size = params.planner_bucket_size;
+    planner.args.context_match = params.planner_context_match;
+    planner.args.initial_decode_state = params.planner_initial_decode_state;
+
+    try {
+        if (!planner.args.prefill_profile.empty()) {
+            planner.prefill_records = system_benefit_planner::load_profile_csv(planner.args.prefill_profile);
+        }
+        planner.decode_records = system_benefit_planner::load_profile_csv(planner.args.decode_profile);
+    } catch (const std::exception & e) {
+        err = std::string("planner profile load failed: ") + e.what();
+        return false;
+    }
+    return true;
+}
+
+static bool e2e_bench_make_dynamic_route_plan(
+        const e2e_bench_params &         params,
+        e2e_bench_planner_state &        planner,
+        int                              input_len,
+        e2e_bench_dynamic_route_plan &   out,
+        std::string &                    err) {
+    const auto planner_start = std::chrono::steady_clock::now();
+    err.clear();
+    if (!planner.enabled) {
+        return true;
+    }
+    if (input_len < 0) {
+        err = "planner input length must be >= 0";
+        return false;
+    }
+
+    system_benefit_planner::options args = planner.args;
+    args.input_len = input_len;
+    args.output_len = e2e_bench_planner_output_len_for_input(params, input_len, err);
+    if (!err.empty()) {
+        return false;
+    }
+    if (args.output_len <= 0) {
+        err = "planner output length must be > 0";
+        return false;
+    }
+
+    const e2e_bench_plan_cache_key cache_key{args.input_len, args.output_len};
+    const auto cache_it = planner.plan_cache.find(cache_key);
+    if (cache_it != planner.plan_cache.end()) {
+        out = cache_it->second;
+        out.planner_cache_hit = true;
+        out.planner_elapsed_ms = system_benefit_planner::elapsed_ms_since(planner_start);
+        out.bind_config();
+        return true;
+    }
+
+    try {
+        out = {};
+        out.input_len = args.input_len;
+        out.output_len = args.output_len;
+        out.planner_cache_hit = false;
+        out.prefill = system_benefit_planner::plan_prefill(planner.prefill_records, args);
+        out.decode = system_benefit_planner::plan_decode(planner.decode_records, args);
+        out.prefill_route = system_benefit_planner::route_spec_without_state_suffix(out.prefill.route_spec);
+        if (system_benefit_planner::normalize_backend(out.prefill.backend) == "NPU") {
+            out.prefill_qnn_workpoint = out.prefill.qnn_workpoint;
+        }
+        out.decode_schedule = out.decode.schedule;
+        out.planner_elapsed_ms = system_benefit_planner::elapsed_ms_since(planner_start);
+        out.bind_config();
+        planner.plan_cache[cache_key] = out;
+    } catch (const std::exception & e) {
+        err = std::string("planner failed: ") + e.what();
+        return false;
+    }
+    return true;
+}
+
+static void e2e_bench_print_planner_summary(
+        const char *                            tag,
+        const e2e_bench_dynamic_route_plan &    plan) {
+    std::fprintf(stderr,
+            "llama-e2e-bench: planner[%s] input_len=%d output_len=%d elapsed_ms=%.3f cache_hit=%d\n",
+            tag,
+            plan.input_len,
+            plan.output_len,
+            plan.planner_elapsed_ms,
+            plan.planner_cache_hit ? 1 : 0);
+    system_benefit_planner::print_summary(std::cerr, plan.prefill, plan.decode, plan.planner_elapsed_ms);
+    if (plan.decode_schedule != plan.decode.schedule) {
+        std::fprintf(stderr, "runtime_decode_schedule=%s\n", plan.decode_schedule.c_str());
+    }
+}
+
 static std::string make_synthetic_prompt(int n_prompt) {
     std::string prompt;
     for (int i = 0; i < n_prompt; ++i) {
@@ -127,7 +349,13 @@ static std::vector<llama_token> make_depth_tokens(const llama_vocab * vocab, int
     return tokens;
 }
 
-static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & tokens, int n_batch, int & n_past) {
+static bool decode_tokens(
+        llama_context *                  ctx,
+        const std::vector<llama_token> & tokens,
+        int                              n_batch,
+        int &                            n_past,
+        bool                             sync_each_batch = false,
+        bool                             emit_final_logits = true) {
     if (tokens.empty()) {
         return true;
     }
@@ -136,9 +364,10 @@ static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & 
     size_t offset = 0;
     while (offset < tokens.size()) {
         common_batch_clear(batch);
-        const int n_cur = std::min<int>(n_batch, (int) (tokens.size() - offset));
+        const int n_rem = (int) (tokens.size() - offset);
+        const int n_cur = std::min<int>(n_batch, n_rem);
         for (int i = 0; i < n_cur; ++i) {
-            const bool logits = offset + i + 1 == tokens.size();
+            const bool logits = emit_final_logits && offset + i + 1 == tokens.size();
             common_batch_add(batch, tokens[offset + i], n_past + i, { 0 }, logits);
         }
         const int res = llama_decode(ctx, batch);
@@ -149,8 +378,13 @@ static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & 
         }
         n_past += n_cur;
         offset += (size_t) n_cur;
+        if (sync_each_batch) {
+            llama_synchronize(ctx);
+        }
     }
-    llama_synchronize(ctx);
+    if (!sync_each_batch) {
+        llama_synchronize(ctx);
+    }
     llama_batch_free(batch);
     return true;
 }
@@ -169,11 +403,20 @@ static bool decode_one(llama_context * ctx, llama_token token, int pos) {
     return true;
 }
 
+static bool decode_planner_input_tokens(
+        llama_context *                  ctx,
+        const std::vector<llama_token> & tokens,
+        int                              prefill_batch,
+        int &                            n_past) {
+    return decode_tokens(ctx, tokens, prefill_batch, n_past, /* sync_each_batch = */ true, /* emit_final_logits = */ true);
+}
+
 static bool run_sample(
         llama_context * ctx,
         llama_sampler * sampler,
         const e2e_bench_sample & sample,
         const e2e_bench_params & params,
+        e2e_bench_planner_state * planner,
         bool dataset_prompt,
         int target_gen_tokens,
         sample_result & result) {
@@ -206,17 +449,60 @@ static bool run_sample(
         prompt_tokens.push_back(llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : (llama_token) 1);
     }
 
+    const int actual_input_tokens = (int) (depth_tokens.size() + prompt_tokens.size());
+    e2e_bench_dynamic_route_plan route_plan;
+    bool route_plan_ready = false;
+    if (planner != nullptr && planner->enabled) {
+        const int planner_input_len = params.planner_input_len >= 0 ? params.planner_input_len : actual_input_tokens;
+        std::string planner_err;
+        if (!e2e_bench_make_dynamic_route_plan(params, *planner, planner_input_len, route_plan, planner_err)) {
+            std::fprintf(stderr, "llama-e2e-bench: planner failed for sample input_len=%d: %s\n",
+                    planner_input_len,
+                    planner_err.c_str());
+            return false;
+        }
+        route_plan_ready = true;
+        e2e_bench_print_planner_summary("sample", route_plan);
+        if (!llama_set_dynamic_route_config(ctx, route_plan.prefill_config)) {
+            std::fprintf(stderr, "llama-e2e-bench: failed to apply planner prefill route for input_len=%d output_len=%d\n",
+                    route_plan.input_len,
+                    route_plan.output_len);
+            return false;
+        }
+        ctx->reset_dynamic_route_runtime_state();
+    }
+
     const uint32_t qnn_request_input_tokens = (uint32_t) std::min<size_t>(
             (size_t) std::numeric_limits<uint32_t>::max(),
             depth_tokens.size() + prompt_tokens.size());
     ctx->set_qnn_request_input_token_hint(qnn_request_input_tokens);
 
-    if (!decode_tokens(ctx, depth_tokens, params.n_batch, n_past)) {
-        return false;
+    const std::vector<llama_token> input_tokens = e2e_bench_concat_tokens(depth_tokens, prompt_tokens);
+    const int prefill_batch = (planner != nullptr && planner->enabled)
+        ? e2e_bench_planner_prefill_batch_size(input_tokens.size())
+        : params.n_batch;
+    if (planner != nullptr && planner->enabled) {
+        if (!decode_planner_input_tokens(ctx, input_tokens, prefill_batch, n_past)) {
+            return false;
+        }
+    } else {
+        if (!decode_tokens(ctx, input_tokens, prefill_batch, n_past)) {
+            return false;
+        }
     }
 
-    if (!decode_tokens(ctx, prompt_tokens, params.n_batch, n_past)) {
-        return false;
+    if (planner != nullptr && planner->enabled) {
+        if (!route_plan_ready) {
+            std::fprintf(stderr, "llama-e2e-bench: internal error: missing planner route plan before decode\n");
+            return false;
+        }
+        if (!llama_set_dynamic_route_config(ctx, route_plan.config)) {
+            std::fprintf(stderr, "llama-e2e-bench: failed to apply planner decode route for input_len=%d output_len=%d\n",
+                    route_plan.input_len,
+                    route_plan.output_len);
+            return false;
+        }
+        ctx->reset_dynamic_route_runtime_state();
     }
 
     int generated = 0;
@@ -265,10 +551,11 @@ static bool run_warmup(
         const std::vector<e2e_bench_sample> & samples,
         const std::vector<int> &              sample_gen_tokens,
         const e2e_bench_params &              params,
+        e2e_bench_planner_state *             planner,
         bool                                  dataset_prompt) {
     const int warmup_gen_tokens = sample_gen_tokens.empty() ? 0 : std::min(sample_gen_tokens.front(), 1);
     sample_result ignored;
-    return run_sample(ctx, sampler, samples.front(), params, dataset_prompt, warmup_gen_tokens, ignored);
+    return run_sample(ctx, sampler, samples.front(), params, planner, dataset_prompt, warmup_gen_tokens, ignored);
 }
 
 int main(int argc, char ** argv) {
@@ -286,6 +573,22 @@ int main(int argc, char ** argv) {
         print_usage(argc, argv);
         return 0;
     }
+    bool dataset_prompt = !params.dataset.empty();
+
+    e2e_bench_planner_state planner;
+    if (!e2e_bench_init_planner(params, planner, err)) {
+        std::fprintf(stderr, "llama-e2e-bench: error: %s\n", err.c_str());
+        return 1;
+    }
+    e2e_bench_dynamic_route_plan bootstrap_route_plan;
+    if (planner.enabled) {
+        const int bootstrap_input_len = params.planner_input_len >= 0 ? params.planner_input_len : 0;
+        if (!e2e_bench_make_dynamic_route_plan(params, planner, bootstrap_input_len, bootstrap_route_plan, err)) {
+            std::fprintf(stderr, "llama-e2e-bench: error: %s\n", err.c_str());
+            return 1;
+        }
+        e2e_bench_print_planner_summary("bootstrap", bootstrap_route_plan);
+    }
 
     ggml_backend_load_all();
     llama_backend_init();
@@ -302,7 +605,6 @@ int main(int argc, char ** argv) {
     }
 
     std::vector<e2e_bench_sample> samples;
-    bool dataset_prompt = !params.dataset.empty();
     if (dataset_prompt) {
         samples = e2e_bench_load_samples(params.dataset, params.limit, err);
         if (!err.empty()) {
@@ -320,6 +622,12 @@ int main(int argc, char ** argv) {
     mparams.use_mmap     = params.use_mmap;
     if (!devices.empty()) {
         mparams.devices = devices.data();
+    }
+    if (planner.enabled) {
+        mparams.hetero_dynamic_prefill_route =
+            bootstrap_route_plan.prefill_route.empty() ? nullptr : bootstrap_route_plan.prefill_route.c_str();
+        mparams.hetero_dynamic_decode_schedule =
+            bootstrap_route_plan.decode_schedule.empty() ? nullptr : bootstrap_route_plan.decode_schedule.c_str();
     }
 
     llama_model * model = llama_model_load_from_file(params.model.c_str(), mparams);
@@ -342,6 +650,12 @@ int main(int argc, char ** argv) {
     cparams.n_threads_batch = params.n_threads;
     cparams.no_perf         = false;
     cparams.swa_full        = false;
+    if (planner.enabled) {
+        const uint32_t planner_prefill_batch = (uint32_t) E2E_BENCH_PLANNER_PREFILL_BATCH;
+        cparams.n_batch = std::max(cparams.n_batch, planner_prefill_batch);
+        cparams.n_ubatch = std::max(cparams.n_ubatch, planner_prefill_batch);
+        cparams.dynamic_route_config = &bootstrap_route_plan.config;
+    }
 
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (ctx == nullptr) {
@@ -357,7 +671,7 @@ int main(int argc, char ** argv) {
 
     if (!params.no_warmup) {
         std::fprintf(stderr, "llama-e2e-bench: warmup begin\n");
-        if (!run_warmup(ctx, sampler, samples, sample_gen_tokens, params, dataset_prompt)) {
+        if (!run_warmup(ctx, sampler, samples, sample_gen_tokens, params, planner.enabled ? &planner : nullptr, dataset_prompt)) {
             std::fprintf(stderr, "llama-e2e-bench: error: warmup failed\n");
             llama_sampler_free(sampler);
             llama_free(ctx);
@@ -409,7 +723,7 @@ int main(int argc, char ** argv) {
             result.sample = (int) i + 1;
             std::fprintf(stderr, "llama-e2e-bench: SAMPLE_BEGIN rep=%d sample=%zu/%zu\n", rep + 1, i + 1, samples.size());
             std::fflush(stderr);
-            if (!run_sample(ctx, sampler, samples[i], params, dataset_prompt, sample_gen_tokens[i], result)) {
+            if (!run_sample(ctx, sampler, samples[i], params, planner.enabled ? &planner : nullptr, dataset_prompt, sample_gen_tokens[i], result)) {
                 std::fprintf(stderr, "llama-e2e-bench: error: sample failed rep=%d sample=%zu\n", rep + 1, i + 1);
                 llama_sampler_free(sampler);
                 llama_free(ctx);

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <dirent.h>
 #include <fstream>
@@ -35,6 +36,17 @@ struct e2e_bench_params {
     bool verbose    = false;
     bool help       = false;
     bool dataset_output_tokens = false;
+
+    std::string planner_prefill_profile;
+    std::string planner_decode_profile;
+    std::string planner_context_match = "exact";
+    std::string planner_initial_decode_state;
+    double planner_ttft_slo_ms = -1.0;
+    double planner_tbt_slo_ms  = -1.0;
+    int planner_input_len  = -1;
+    int planner_output_len = -1;
+    int planner_bucket_size = 32;
+    int planner_max_context = 6144;
 };
 
 struct e2e_bench_sample {
@@ -80,6 +92,21 @@ static inline bool e2e_bench_parse_int(const std::string & text, int & out) {
     return true;
 }
 
+static inline bool e2e_bench_parse_double(const std::string & text, double & out) {
+    std::string value = e2e_bench_trim(text);
+    if (value.empty()) {
+        return false;
+    }
+    char * end = nullptr;
+    errno = 0;
+    double parsed = std::strtod(value.c_str(), &end);
+    if (errno != 0 || end == value.c_str() || *end != '\0') {
+        return false;
+    }
+    out = parsed;
+    return true;
+}
+
 static inline bool e2e_bench_parse_bool(const std::string & text, bool & out) {
     std::string value = e2e_bench_trim(text);
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
@@ -116,6 +143,16 @@ static inline bool e2e_bench_parse_args(int argc, char ** argv, e2e_bench_params
             }
             if (!e2e_bench_parse_int(value, target)) {
                 err = "invalid integer for " + arg + ": " + value;
+                return false;
+            }
+            return true;
+        };
+        auto parse_double_arg = [&](double & target) {
+            if (!e2e_bench_take_arg(argc, argv, i, value, err)) {
+                return false;
+            }
+            if (!e2e_bench_parse_double(value, target)) {
+                err = "invalid number for " + arg + ": " + value;
                 return false;
             }
             return true;
@@ -211,6 +248,46 @@ static inline bool e2e_bench_parse_args(int argc, char ** argv, e2e_bench_params
             params.wait_start = false;
         } else if (arg == "--wait-start") {
             params.wait_start = true;
+        } else if (arg == "--planner-prefill-profile") {
+            if (!e2e_bench_take_arg(argc, argv, i, params.planner_prefill_profile, err)) {
+                return false;
+            }
+        } else if (arg == "--planner-decode-profile" || arg == "--planner-profile") {
+            if (!e2e_bench_take_arg(argc, argv, i, params.planner_decode_profile, err)) {
+                return false;
+            }
+        } else if (arg == "--planner-ttft-slo-ms") {
+            if (!parse_double_arg(params.planner_ttft_slo_ms)) {
+                return false;
+            }
+        } else if (arg == "--planner-tbt-slo-ms") {
+            if (!parse_double_arg(params.planner_tbt_slo_ms)) {
+                return false;
+            }
+        } else if (arg == "--planner-input-len") {
+            if (!parse_int_arg(params.planner_input_len)) {
+                return false;
+            }
+        } else if (arg == "--planner-output-len") {
+            if (!parse_int_arg(params.planner_output_len)) {
+                return false;
+            }
+        } else if (arg == "--planner-bucket-size") {
+            if (!parse_int_arg(params.planner_bucket_size)) {
+                return false;
+            }
+        } else if (arg == "--planner-max-context") {
+            if (!parse_int_arg(params.planner_max_context)) {
+                return false;
+            }
+        } else if (arg == "--planner-context-match") {
+            if (!e2e_bench_take_arg(argc, argv, i, params.planner_context_match, err)) {
+                return false;
+            }
+        } else if (arg == "--planner-initial-decode-state") {
+            if (!e2e_bench_take_arg(argc, argv, i, params.planner_initial_decode_state, err)) {
+                return false;
+            }
         } else {
             err = "unknown argument: " + arg;
             return false;
@@ -227,6 +304,19 @@ static inline bool e2e_bench_parse_args(int argc, char ** argv, e2e_bench_params
     if (params.n_threads <= 0 || params.n_gen < 0 || params.n_prompt < 0 || params.n_depth < 0 ||
         params.n_batch <= 0 || params.n_ubatch <= 0 || params.reps <= 0 || params.limit < 0) {
         err = "numeric arguments are out of range";
+        return false;
+    }
+    if (params.planner_bucket_size <= 0 || params.planner_max_context <= 0 ||
+        params.planner_input_len < -1 || params.planner_output_len < -1) {
+        err = "planner numeric arguments are out of range";
+        return false;
+    }
+    if (!params.planner_decode_profile.empty() &&
+        params.planner_context_match != "exact" &&
+        params.planner_context_match != "floor" &&
+        params.planner_context_match != "ceil" &&
+        params.planner_context_match != "nearest") {
+        err = "--planner-context-match must be exact, floor, ceil, or nearest";
         return false;
     }
     return true;

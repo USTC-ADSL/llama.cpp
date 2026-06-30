@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import runpy
 import subprocess
 import sys
 from pathlib import Path
@@ -49,6 +50,18 @@ def _power_rows(head_value: float, kept_value: float, tail_value: float) -> list
     for idx in range(16, 19):
         rows.append({"timestamp_ms": idx, "power_mw_est": tail_value})
     return rows
+
+
+def test_default_backend_transition_latency_table() -> None:
+    simulator = runpy.run_path(str(ROOT / "scripts" / "simulate_system_benefit.py"))
+    backend_transition_latency_ms = simulator["backend_transition_latency_ms"]
+
+    assert backend_transition_latency_ms("NPU", "CPU") == pytest.approx(5.0)
+    assert backend_transition_latency_ms("GPU", "CPU") == pytest.approx(15.0)
+    assert backend_transition_latency_ms("CPU", "GPU") == pytest.approx(20.0)
+    assert backend_transition_latency_ms("NPU", "GPU") == pytest.approx(20.0)
+    assert backend_transition_latency_ms("CPU", "NPU") == pytest.approx(80.0)
+    assert backend_transition_latency_ms("GPU", "NPU") == pytest.approx(80.0)
 
 
 def test_build_profile_and_simulate_system_benefit(tmp_path: Path) -> None:
@@ -859,8 +872,104 @@ def test_exact_context_match_allows_profile_bucket_covering_final_partial_segmen
     assert [(segment["context_bucket_lo"], segment["context_bucket_hi"]) for segment in segments] == [(1, 32), (33, 50)]
     assert segments[1]["matched_profile_bucket_lo"] == 33
     assert segments[1]["matched_profile_bucket_hi"] == 64
-    assert segments[1]["context_match"] == "covering_partial_bucket"
+    assert segments[1]["context_match"] == "exact"
     assert segments[1]["num_tokens"] == 18
+
+
+def test_decode_segments_align_non_multiple_input_to_next_context_bucket(tmp_path: Path) -> None:
+    profile_path = tmp_path / "aligned_input_profile.csv"
+    result_path = tmp_path / "aligned_input_result.json"
+    rows = []
+    for bucket_lo, bucket_hi in [(513, 544), (545, 576)]:
+        rows.extend(
+            [
+                {
+                    "phase": "decode",
+                    "backend": "GPU",
+                    "state_name": "gpu_967",
+                    "state_group": "GPU",
+                    "bucket_lo": bucket_lo,
+                    "bucket_hi": bucket_hi,
+                    "bucket_tokens": 32,
+                    "throughput_tps": 16,
+                    "power_mw": 800,
+                    "energy_mj_per_token": 50,
+                    "energy_mj_per_bucket": 1600,
+                },
+                {
+                    "phase": "decode",
+                    "backend": "CPU",
+                    "state_name": "cpu_B2_4320000",
+                    "state_group": "B2",
+                    "bucket_lo": bucket_lo,
+                    "bucket_hi": bucket_hi,
+                    "bucket_tokens": 32,
+                    "throughput_tps": 16 if bucket_lo == 513 else 100,
+                    "power_mw": 100000 if bucket_lo == 513 else 1,
+                    "energy_mj_per_token": 6250 if bucket_lo == 513 else 0.01,
+                    "energy_mj_per_bucket": 200000 if bucket_lo == 513 else 0.32,
+                },
+            ]
+        )
+    _write_csv(profile_path, rows)
+
+    sim = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "simulate_system_benefit.py"),
+            "--profile",
+            str(profile_path),
+            "--input-len",
+            "500",
+            "--output-len",
+            "76",
+            "--slo-tbt-ms",
+            "100",
+            "--prefill-latency-ms",
+            "0",
+            "--prefill-energy-mj",
+            "0",
+            "--baseline-prefill-latency-ms",
+            "0",
+            "--baseline-prefill-energy-mj",
+            "0",
+            "--baseline-decode-backend",
+            "GPU",
+            "--baseline-decode-state",
+            "gpu_967",
+            "--context-match",
+            "exact",
+            "--bucket-size",
+            "32",
+            "--output",
+            str(result_path),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert sim.returncode == 0, sim.stderr
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    segments = result["scheduled"]["segments"]
+    assert [(segment["context_bucket_lo"], segment["context_bucket_hi"]) for segment in segments] == [
+        (501, 544),
+        (545, 576),
+    ]
+    assert [(segment["profile_query_bucket_lo"], segment["profile_query_bucket_hi"]) for segment in segments] == [
+        (513, 544),
+        (545, 576),
+    ]
+    assert [(segment["matched_profile_bucket_lo"], segment["matched_profile_bucket_hi"]) for segment in segments] == [
+        (513, 544),
+        (545, 576),
+    ]
+    assert [segment["num_tokens"] for segment in segments] == [44, 32]
+    assert result["scheduled"]["decode_schedule_env"] == (
+        "1:opencl{gpu_freq_hz=967000000};"
+        "45:cpu{threads=2,affinity=C0,cpu_policy6_freq_khz=4320000}"
+    )
 
 
 def test_plot_decode_state_timeline_writes_svg(tmp_path: Path) -> None:

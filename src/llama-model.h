@@ -579,6 +579,10 @@ struct llama_model {
 
     bool has_tensor_overrides() const;
     const llama_hetero_execution_plan & get_hetero_plan() const;
+    const char * get_hetero_dynamic_prefill_route() const;
+    const char * get_hetero_dynamic_decode_route() const;
+    const char * get_hetero_dynamic_fallback_route() const;
+    const char * get_hetero_dynamic_decode_schedule() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
     void register_opencl_cpu_extra_cpu_copy(

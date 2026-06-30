@@ -845,7 +845,9 @@ static int llama_model_load(struct gguf_context * metadata, llama_model_set_tens
 
     try {
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, params.use_mmap, params.use_direct_io,
-            params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides, model.get_hetero_plan());
+            params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides, model.get_hetero_plan(),
+            params.hetero_dynamic_prefill_route, params.hetero_dynamic_decode_route,
+            params.hetero_dynamic_fallback_route, params.hetero_dynamic_decode_schedule);
 
         ml.print_info();
 

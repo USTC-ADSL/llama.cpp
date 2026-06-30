@@ -520,8 +520,19 @@ llama_model_loader::llama_model_loader(
         bool no_alloc,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
-        llama_hetero_execution_plan hetero_plan)
-        : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud), hetero_plan(std::move(hetero_plan)) {
+        llama_hetero_execution_plan hetero_plan,
+        const char * param_hetero_dynamic_prefill_route,
+        const char * param_hetero_dynamic_decode_route,
+        const char * param_hetero_dynamic_fallback_route,
+        const char * param_hetero_dynamic_decode_schedule)
+        : metadata(meta),
+          set_tensor_data(set_tensor_data),
+          set_tensor_data_ud(set_tensor_data_ud),
+          hetero_plan(std::move(hetero_plan)),
+          hetero_dynamic_prefill_route(param_hetero_dynamic_prefill_route != nullptr ? param_hetero_dynamic_prefill_route : ""),
+          hetero_dynamic_decode_route(param_hetero_dynamic_decode_route != nullptr ? param_hetero_dynamic_decode_route : ""),
+          hetero_dynamic_fallback_route(param_hetero_dynamic_fallback_route != nullptr ? param_hetero_dynamic_fallback_route : ""),
+          hetero_dynamic_decode_schedule(param_hetero_dynamic_decode_schedule != nullptr ? param_hetero_dynamic_decode_schedule : "") {
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
         trace = atoi(getenv("LLAMA_TRACE"));
@@ -1305,6 +1316,48 @@ bool llama_model_loader_decode_schedule_requires_opencl_weight_portability(
     return false;
 }
 
+static bool llama_model_loader_route_requires_qnn_output_host_weight(
+        const llama_hetero_route_spec & route) {
+    if (!route.has_any_route()) {
+        return false;
+    }
+
+    return llama_hetero_backend_kind(llama_hetero_phase_output_tail_backend_for_route(route)) == 3;
+}
+
+static bool llama_model_loader_decode_schedule_requires_qnn_output_host_weight(
+        const char * decode_schedule) {
+    if (decode_schedule == nullptr || decode_schedule[0] == '\0') {
+        return false;
+    }
+
+    const std::string spec = decode_schedule;
+    size_t pos = 0;
+    while (pos < spec.size()) {
+        const size_t next = spec.find(';', pos);
+        const std::string raw_entry = spec.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+        const std::string entry = llama_hetero_trim(raw_entry);
+        if (!entry.empty()) {
+            const size_t split = entry.find(':');
+            if (split != std::string::npos) {
+                const std::string route_spec =
+                    llama_model_loader_strip_decode_schedule_state(entry.substr(split + 1));
+                if (llama_model_loader_route_requires_qnn_output_host_weight(
+                            llama_hetero_parse_route_spec(route_spec.c_str()))) {
+                    return true;
+                }
+            }
+        }
+
+        if (next == std::string::npos) {
+            break;
+        }
+        pos = next + 1;
+    }
+
+    return false;
+}
+
 bool llama_model_loader_should_preserve_opencl_host_buft_for_mmap(
         bool hetero_phase_route_active,
         bool hetero_portable_cpu_weights_for_opencl_dynamic_stage,
@@ -1332,16 +1385,35 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         llama_hetero_backend_kind(llama_hetero_phase_backend_for_route(hetero_route));
     const int hetero_output_tail_backend_kind =
         llama_hetero_backend_kind(llama_hetero_phase_output_tail_backend_for_route(hetero_route));
-    const llama_hetero_route_spec dynamic_prefill_route =
-        llama_hetero_parse_route_spec(std::getenv("GGML_HETERO_DYNAMIC_PREFILL_ROUTE"));
-    const llama_hetero_route_spec dynamic_decode_route =
-        llama_hetero_parse_route_spec(std::getenv("GGML_HETERO_DYNAMIC_DECODE_ROUTE"));
-    const llama_hetero_route_spec dynamic_fallback_route =
-        llama_hetero_parse_route_spec(std::getenv("GGML_HETERO_DYNAMIC_FALLBACK_ROUTE"));
-    const char * dynamic_decode_schedule_env = std::getenv("GGML_HETERO_DYNAMIC_DECODE_SCHEDULE");
-    if (dynamic_decode_schedule_env == nullptr || dynamic_decode_schedule_env[0] == '\0') {
-        dynamic_decode_schedule_env = std::getenv("GGML_HETERO_DECODE_ROUTE_SCHEDULE");
+    const char * dynamic_prefill_route_value =
+        hetero_dynamic_prefill_route.empty() ? nullptr : hetero_dynamic_prefill_route.c_str();
+    if (dynamic_prefill_route_value == nullptr || dynamic_prefill_route_value[0] == '\0') {
+        dynamic_prefill_route_value = std::getenv("GGML_HETERO_DYNAMIC_PREFILL_ROUTE");
     }
+    const char * dynamic_decode_route_value =
+        hetero_dynamic_decode_route.empty() ? nullptr : hetero_dynamic_decode_route.c_str();
+    if (dynamic_decode_route_value == nullptr || dynamic_decode_route_value[0] == '\0') {
+        dynamic_decode_route_value = std::getenv("GGML_HETERO_DYNAMIC_DECODE_ROUTE");
+    }
+    const char * dynamic_fallback_route_value =
+        hetero_dynamic_fallback_route.empty() ? nullptr : hetero_dynamic_fallback_route.c_str();
+    if (dynamic_fallback_route_value == nullptr || dynamic_fallback_route_value[0] == '\0') {
+        dynamic_fallback_route_value = std::getenv("GGML_HETERO_DYNAMIC_FALLBACK_ROUTE");
+    }
+    const char * dynamic_decode_schedule_value =
+        hetero_dynamic_decode_schedule.empty() ? nullptr : hetero_dynamic_decode_schedule.c_str();
+    if (dynamic_decode_schedule_value == nullptr || dynamic_decode_schedule_value[0] == '\0') {
+        dynamic_decode_schedule_value = std::getenv("GGML_HETERO_DYNAMIC_DECODE_SCHEDULE");
+    }
+    if (dynamic_decode_schedule_value == nullptr || dynamic_decode_schedule_value[0] == '\0') {
+        dynamic_decode_schedule_value = std::getenv("GGML_HETERO_DECODE_ROUTE_SCHEDULE");
+    }
+    const llama_hetero_route_spec dynamic_prefill_route =
+        llama_hetero_parse_route_spec(dynamic_prefill_route_value);
+    const llama_hetero_route_spec dynamic_decode_route =
+        llama_hetero_parse_route_spec(dynamic_decode_route_value);
+    const llama_hetero_route_spec dynamic_fallback_route =
+        llama_hetero_parse_route_spec(dynamic_fallback_route_value);
     const int dynamic_prefill_backend_kind =
         llama_hetero_backend_kind(llama_hetero_phase_backend_for_route(dynamic_prefill_route));
     const int dynamic_decode_backend_kind =
@@ -1362,7 +1434,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 dynamic_prefill_route,
                 dynamic_decode_route,
                 dynamic_fallback_route) ||
-        llama_model_loader_decode_schedule_requires_opencl_weight_portability(dynamic_decode_schedule_env);
+        llama_model_loader_decode_schedule_requires_opencl_weight_portability(dynamic_decode_schedule_value);
     const bool enable_opencl_cpu_extra_cpu_copy =
         llama_model_loader_should_enable_opencl_cpu_extra_cpu_copy(
                 dynamic_prefill_route,
@@ -1373,7 +1445,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 dynamic_prefill_route,
                 dynamic_decode_route,
                 dynamic_fallback_route) ||
-        llama_model_loader_decode_schedule_requires_cpu_weight_residency(dynamic_decode_schedule_env);
+        llama_model_loader_decode_schedule_requires_cpu_weight_residency(dynamic_decode_schedule_value);
     const bool enable_dynamic_cpu_weight_copy =
         dynamic_cpu_weight_residency || enable_opencl_cpu_extra_cpu_copy;
     const bool enable_cpu_opencl_shared_host_weights =
@@ -1390,6 +1462,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         hetero_phase_route_active && hetero_phase_backend_kind == 1;
     const bool hetero_output_cpu_weights =
         hetero_phase_route_active && hetero_output_tail_backend_kind == 1;
+    const bool hetero_output_qnn_host_weights =
+        (hetero_phase_route_active && hetero_output_tail_backend_kind == 3) ||
+        llama_model_loader_route_requires_qnn_output_host_weight(dynamic_prefill_route) ||
+        llama_model_loader_route_requires_qnn_output_host_weight(dynamic_decode_route) ||
+        llama_model_loader_route_requires_qnn_output_host_weight(dynamic_fallback_route) ||
+        llama_model_loader_decode_schedule_requires_qnn_output_host_weight(dynamic_decode_schedule_value);
 
     const bool hetero_ffn_qnn_host_weights =
         hetero_phase_route_active && hetero_phase_backend_kind == 3;
@@ -1429,6 +1507,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     if (hetero_output_cpu_weights && !logged_hetero_output_cpu_weights) {
         LLAMA_LOG_INFO("%s: auto-routing output stage weights to CPU buffer types for hetero decode\n", __func__);
         logged_hetero_output_cpu_weights = true;
+    }
+
+    static bool logged_hetero_output_qnn_host_weights = false;
+    if (hetero_output_qnn_host_weights && !logged_hetero_output_qnn_host_weights) {
+        LLAMA_LOG_INFO("%s: auto-routing output stage weights to CPU-readable buffer types for QNN AoT bootstrap correction\n", __func__);
+        logged_hetero_output_qnn_host_weights = true;
     }
 
     static bool logged_hetero_ffn_qnn_host_weights = false;
@@ -1727,18 +1811,19 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         if (!buft && info.layer == LLM_TENSOR_LAYER_OUTPUT) {
-            if (hetero_output_cpu_weights) {
-                buft = hetero_portable_cpu_weights_for_opencl_dynamic_stage
+            if (hetero_output_cpu_weights || hetero_output_qnn_host_weights) {
+                buft = (!hetero_output_qnn_host_weights && hetero_portable_cpu_weights_for_opencl_dynamic_stage)
                     ? select_weight_opencl_portable_buft(hparams, t_meta, op, enable_cpu_opencl_shared_host_weights)
                     : select_weight_cpu_buft(hparams, t_meta, op, buft_list_cpu);
                 if (!buft) {
                     throw std::runtime_error(format("failed to auto-route hetero output tensor %s to a shared-host/CPU-readable buffer type", tensor_name.c_str()));
                 }
 
-                LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) auto-routed to %s for CPU output stage\n",
+                LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) auto-routed to %s for %s\n",
                         tensor_name.c_str(),
                         ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
-                        ggml_backend_buft_name(buft));
+                        ggml_backend_buft_name(buft),
+                        hetero_output_qnn_host_weights ? "QNN output bootstrap correction" : "CPU output stage");
             } else if (hetero_output_opencl_weights) {
                 buft = select_weight_device_buft(hparams, t_meta, op, "GPUOpenCL", false);
                 if (buft == nullptr) {

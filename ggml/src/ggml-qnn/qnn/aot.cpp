@@ -13,6 +13,7 @@
 #include <HTP/QnnHtpGraph.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <cmath>
@@ -1249,6 +1250,192 @@ bool graph_type_is_attn_core(const std::string & graph_type) {
            graph_type == "attn_kvcore" ||
            graph_type == "attention_kvcore" ||
            graph_type == "kvcore";
+}
+
+bool path_text_mentions_qwen25_3b(const std::filesystem::path & path) {
+    const std::string text = path.string();
+    return text.find("Qwen2.5-3B") != std::string::npos ||
+           text.find("Qwen2_5-3B") != std::string::npos;
+}
+
+std::vector<std::string> split_path_list_env(const char * value) {
+    std::vector<std::string> out;
+    if (value == nullptr || value[0] == '\0') {
+        return out;
+    }
+
+    std::string token;
+    for (const char ch : std::string(value)) {
+        if (ch == ':' || ch == ';' || ch == ',') {
+            token = trim_copy(token);
+            if (!token.empty()) {
+                out.push_back(token);
+            }
+            token.clear();
+            continue;
+        }
+        token.push_back(ch);
+    }
+
+    token = trim_copy(token);
+    if (!token.empty()) {
+        out.push_back(token);
+    }
+    return out;
+}
+
+std::filesystem::path weakly_canonical_or_absolute(const std::filesystem::path & path) {
+    std::error_code ec;
+    std::filesystem::path canonical = std::filesystem::weakly_canonical(path, ec);
+    if (!ec && !canonical.empty()) {
+        return canonical;
+    }
+    return std::filesystem::absolute(path, ec);
+}
+
+std::vector<std::filesystem::path> qwen25_3b_extra_aot_config_candidates(
+        const std::filesystem::path & primary_config_path,
+        const std::filesystem::path & model_dir) {
+    std::vector<std::filesystem::path> candidates;
+
+    const std::filesystem::path primary_qnn_dir =
+        model_dir.empty() ? primary_config_path.parent_path() : model_dir;
+    const std::filesystem::path primary_model_dir = primary_qnn_dir.parent_path();
+    const std::filesystem::path model_root = primary_model_dir.parent_path();
+
+    constexpr const char * repo_ctx4096 =
+        "models/Qwen2.5/Qwen2.5-3B-AoT-ctx4096-powerserve-20260514-151607/qnn/config.json";
+    constexpr const char * repo_ctx6144 =
+        "models/Qwen2.5/Qwen2.5-3B-AoT-ctx6144-powerserve-20260515-053108/qnn/config.json";
+    constexpr const char * ctx4096_dir = "Qwen2.5-3B-AoT-ctx4096-powerserve-20260514-151607";
+    constexpr const char * ctx6144_dir = "Qwen2.5-3B-AoT-ctx6144-powerserve-20260515-053108";
+    constexpr const char * user_ctx4096_dir = "Qwen2_5-3B-ctx4096-powerserve-20260514-151607";
+    constexpr const char * user_ctx6144_dir = "Qwen2_5-3B-ctx6144-powerserve-20260515-053108";
+
+    if (!model_root.empty()) {
+        candidates.push_back(model_root / ctx4096_dir / "qnn" / "config.json");
+        candidates.push_back(model_root / ctx6144_dir / "qnn" / "config.json");
+        candidates.push_back(model_root / user_ctx4096_dir / "qnn" / "config.json");
+        candidates.push_back(model_root / user_ctx6144_dir / "qnn" / "config.json");
+        candidates.push_back(model_root / "Qwen2.5" / ctx4096_dir / "qnn" / "config.json");
+        candidates.push_back(model_root / "Qwen2.5" / ctx6144_dir / "qnn" / "config.json");
+        candidates.push_back(model_root / "Qwen2.5-3B-4K" / "qnn" / "config.json");
+        candidates.push_back(model_root / "Qwen2.5-3B-6K" / "qnn" / "config.json");
+    }
+
+    candidates.emplace_back(repo_ctx4096);
+    candidates.emplace_back(repo_ctx6144);
+
+    return candidates;
+}
+
+bool qnn_aot_model_params_compatible(
+        const qnn::qnn_aot_model_params & lhs,
+        const qnn::qnn_aot_model_params & rhs) {
+    return lhs.n_layers == rhs.n_layers &&
+           lhs.vocab_size == rhs.vocab_size &&
+           lhs.embed_dim == rhs.embed_dim &&
+           lhs.ffn_hidden_dim == rhs.ffn_hidden_dim &&
+           lhs.head_dim == rhs.head_dim &&
+           lhs.n_kv_heads == rhs.n_kv_heads &&
+           lhs.tie_embedding == rhs.tie_embedding;
+}
+
+std::string qnn_aot_graph_config_identity(const qnn::qnn_aot_graph_config & graph) {
+    return graph.type +
+           "|name=" + graph.graph_name +
+           "|model=" + graph.model_path +
+           "|batch=" + std::to_string(graph.batch_size) +
+           "|cache=" + std::to_string(graph.cache_size) +
+           "|context=" + std::to_string(graph.context_size) +
+           "|layers=" + std::to_string(graph.start_layer_id) + "-" + std::to_string(graph.end_layer_id);
+}
+
+void qnn_aot_make_graph_paths_absolute(
+        qnn::qnn_aot_graph_config & graph,
+        const std::filesystem::path & config_dir) {
+    std::filesystem::path model_path(graph.model_path);
+    if (!model_path.is_absolute()) {
+        graph.model_path = (config_dir / model_path).string();
+    }
+
+    if (!graph.kv_path_format.empty()) {
+        std::filesystem::path kv_path(graph.kv_path_format);
+        if (!kv_path.is_absolute()) {
+            graph.kv_path_format = (config_dir / kv_path).string();
+        }
+    }
+}
+
+void append_extra_qnn_aot_graph_configs(
+        qnn::qnn_aot_config & config,
+        const std::string & primary_config_path,
+        const std::string & model_dir) {
+    std::vector<std::filesystem::path> candidates;
+    std::unordered_set<std::string>    seen_config_paths;
+
+    for (const std::string & entry : split_path_list_env(std::getenv("GGML_QNN_AOT_EXTRA_CONFIGS"))) {
+        candidates.emplace_back(entry);
+    }
+
+    const std::filesystem::path primary_path(primary_config_path);
+    const std::filesystem::path model_dir_path(model_dir);
+    if (path_text_mentions_qwen25_3b(primary_path) || path_text_mentions_qwen25_3b(model_dir_path)) {
+        const auto defaults = qwen25_3b_extra_aot_config_candidates(primary_path, model_dir_path);
+        candidates.insert(candidates.end(), defaults.begin(), defaults.end());
+    }
+
+    if (candidates.empty()) {
+        return;
+    }
+
+    const std::string primary_normalized = weakly_canonical_or_absolute(primary_path).string();
+    std::unordered_set<std::string> existing_graphs;
+    for (const auto & graph : config.transformer_graphs) {
+        existing_graphs.insert(qnn_aot_graph_config_identity(graph));
+    }
+
+    for (const auto & candidate : candidates) {
+        if (candidate.empty() || !std::filesystem::exists(candidate)) {
+            continue;
+        }
+
+        const std::filesystem::path normalized = weakly_canonical_or_absolute(candidate);
+        const std::string normalized_text = normalized.string();
+        if (normalized_text == primary_normalized || !seen_config_paths.insert(normalized_text).second) {
+            continue;
+        }
+
+        qnn::qnn_aot_config extra_config;
+        if (!extra_config.load(normalized_text)) {
+            QNN_LOG_WARN("[aot] failed to load extra AoT config %s\n", normalized_text.c_str());
+            continue;
+        }
+        if (!qnn_aot_model_params_compatible(config.model, extra_config.model)) {
+            QNN_LOG_WARN("[aot] skip extra AoT config %s because model parameters do not match primary config %s\n",
+                         normalized_text.c_str(),
+                         primary_config_path.c_str());
+            continue;
+        }
+
+        size_t appended = 0;
+        const std::filesystem::path config_dir = normalized.parent_path();
+        for (auto graph : extra_config.transformer_graphs) {
+            qnn_aot_make_graph_paths_absolute(graph, config_dir);
+            const std::string identity = qnn_aot_graph_config_identity(graph);
+            if (!existing_graphs.insert(identity).second) {
+                continue;
+            }
+            config.transformer_graphs.push_back(std::move(graph));
+            ++appended;
+        }
+
+        if (appended > 0) {
+            QNN_LOG_INFO("[aot] appended %zu transformer graphs from extra AoT config %s\n",
+                         appended,
+                         normalized_text.c_str());
+        }
+    }
 }
 
 bool parse_stage_layer_id(const char * name, size_t & layer_id) {
@@ -2538,6 +2725,7 @@ bool qnn_aot_runtime::initialize(const std::string & config_path, const std::str
     if (!_config.load(config_path)) {
         return false;
     }
+    append_extra_qnn_aot_graph_configs(_config, config_path, model_dir);
 
     if (_config.transformer_graphs.empty() && _config.attention_graphs.empty() && _config.attn_proj_graphs.empty() &&
         _config.attn_core_graphs.empty() &&
@@ -4824,6 +5012,7 @@ std::string qnn_aot_runtime::kv_state_key_for_graph(const qnn_aot_graph_config &
     return resolve_model_path(config.model_path) +
            "|type=" + config.type +
            "|layers=" + std::to_string(config.start_layer_id) + "-" + std::to_string(config.end_layer_id) +
+           "|batch=" + std::to_string(config.batch_size) +
            "|cache=" + std::to_string(config.cache_size) +
            "|context=" + std::to_string(config.context_size);
 }
@@ -4970,6 +5159,7 @@ bool qnn_aot_runtime::private_kv_migration_needs_generic_kv(const aot_match_resu
             "|layers=" + std::to_string(config.start_layer_id) + "-" + std::to_string(config.end_layer_id);
         const std::string state_key =
             resolve_model_path(config.model_path) +
+            "|batch=" + std::to_string(config.batch_size) +
             "|cache=" + std::to_string(config.cache_size) +
             "|context=" + std::to_string(config.context_size);
         auto & states = states_by_layer_range[layer_key];
@@ -5288,6 +5478,7 @@ bool qnn_aot_runtime::write_generic_kv_from_graph(qnn_aot_graph & graph,
             return false;
         }
     }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
 
     if (aot_trace_bind_enabled()) {
         const auto & graph_config = graph.config();

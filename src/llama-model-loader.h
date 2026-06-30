@@ -106,6 +106,10 @@ struct llama_model_loader {
     std::vector<std::pair<size_t, size_t>> mmaps_used;
 
     llama_hetero_execution_plan hetero_plan;
+    std::string hetero_dynamic_prefill_route;
+    std::string hetero_dynamic_decode_route;
+    std::string hetero_dynamic_fallback_route;
+    std::string hetero_dynamic_decode_schedule;
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
@@ -135,7 +139,11 @@ struct llama_model_loader {
         bool no_alloc,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
-        llama_hetero_execution_plan hetero_plan);
+        llama_hetero_execution_plan hetero_plan,
+        const char * hetero_dynamic_prefill_route = nullptr,
+        const char * hetero_dynamic_decode_route = nullptr,
+        const char * hetero_dynamic_fallback_route = nullptr,
+        const char * hetero_dynamic_decode_schedule = nullptr);
 
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type

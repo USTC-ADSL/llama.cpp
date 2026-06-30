@@ -12,6 +12,7 @@
 /docs/ecofrontier_online_planner_review.md
 /docs/superpowers/
 /docs/re.zip
+/figures
 
 # Local experiment scripts
 /test.sh
@@ -221,3 +222,4 @@ scripts/*
 !/scripts/plot_tbt_curves.py
 !/scripts/plot_energy_state_curve.py
 !/scripts/run_e2e_system_benefit.py
+!/scripts/run_e2e_experiment.py

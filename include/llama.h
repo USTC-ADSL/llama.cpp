@@ -321,6 +321,15 @@ extern "C" {
         // QNN values currently reserve the interface only.
         const char * hetero_kv_layout;
 
+        // [EXPERIMENTAL]
+        // Dynamic-route hints used during model loading for weight residency
+        // decisions. Runtime switching is controlled by llama_context_params
+        // / llama_set_dynamic_route_config.
+        const char * hetero_dynamic_prefill_route;
+        const char * hetero_dynamic_decode_route;
+        const char * hetero_dynamic_fallback_route;
+        const char * hetero_dynamic_decode_schedule;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool use_mmap;        // use mmap if possible
@@ -349,12 +358,16 @@ extern "C" {
         // (typically n_tokens > 1).
         const char * prefill_route;
         const char * prefill_kv_layout;
+        const char * prefill_qnn_workpoint;
+        uint64_t prefill_qnn_context_size;
+        uint64_t prefill_qnn_required_kv_slots;
 
         // [EXPERIMENTAL]
         // Candidate route used when llama_decode() receives a decode batch
         // (typically n_tokens == 1).
         const char * decode_route;
         const char * decode_kv_layout;
+        const char * decode_schedule;
 
         // [EXPERIMENTAL]
         // Optional fallback route tried after phase-specific route rejection
@@ -456,6 +469,12 @@ extern "C" {
         // stage-shared CPU/OpenCL zero-copy KV placement and reserve future
         // QNN/RPCMEM integration paths.
         const char * hetero_kv_layout;
+
+        // [EXPERIMENTAL]
+        // Optional explicit dynamic route configuration used while creating
+        // the context. Supplying this avoids relying on GGML_HETERO_DYNAMIC_*
+        // environment variables for backend switching.
+        const struct llama_dynamic_route_config * dynamic_route_config;
 
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)

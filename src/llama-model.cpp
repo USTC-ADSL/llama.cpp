@@ -8106,6 +8106,22 @@ const llama_hetero_execution_plan & llama_model::get_hetero_plan() const {
     return hetero_plan;
 }
 
+const char * llama_model::get_hetero_dynamic_prefill_route() const {
+    return params.hetero_dynamic_prefill_route;
+}
+
+const char * llama_model::get_hetero_dynamic_decode_route() const {
+    return params.hetero_dynamic_decode_route;
+}
+
+const char * llama_model::get_hetero_dynamic_fallback_route() const {
+    return params.hetero_dynamic_fallback_route;
+}
+
+const char * llama_model::get_hetero_dynamic_decode_schedule() const {
+    return params.hetero_dynamic_decode_schedule;
+}
+
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
             [name](const std::pair<std::string, ggml_tensor *> & it) {
@@ -8863,6 +8879,10 @@ llama_model_params llama_model_default_params() {
         /*.kv_overrides                =*/ nullptr,
         /*.hetero_phase_route          =*/ nullptr,
         /*.hetero_kv_layout            =*/ nullptr,
+        /*.hetero_dynamic_prefill_route =*/ nullptr,
+        /*.hetero_dynamic_decode_route =*/ nullptr,
+        /*.hetero_dynamic_fallback_route =*/ nullptr,
+        /*.hetero_dynamic_decode_schedule =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_direct_io               =*/ false,

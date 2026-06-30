@@ -34,11 +34,16 @@ DEFAULT_BASELINE_DECODE_STATES = {
 DEFAULT_BACKEND_TRANSITION_LATENCY_MS = {
     ("NPU", "CPU"): 5.0,
     ("GPU", "CPU"): 15.0,
-    ("CPU", "GPU"): 50.0,
-    ("NPU", "GPU"): 50.0,
-    ("CPU", "NPU"): 50.0,
-    ("GPU", "NPU"): 50.0,
+    ("CPU", "GPU"): 20.0,
+    ("NPU", "GPU"): 20.0,
+    ("CPU", "NPU"): 80.0,
+    ("GPU", "NPU"): 80.0,
 }
+QNN_GRAPH_CAPACITIES = (
+    {"context_size": 2048, "usable_kv_slots": 1920},
+    {"context_size": 4096, "usable_kv_slots": 3968},
+    {"context_size": 6144, "usable_kv_slots": 6016},
+)
 
 
 @dataclass(frozen=True)
@@ -77,6 +82,8 @@ class SegmentCandidate:
     segment_id: int
     context_bucket_lo: int
     context_bucket_hi: int
+    profile_query_bucket_lo: int
+    profile_query_bucket_hi: int
     num_tokens: int
     record: ProfileRecord
     matched_profile_bucket_lo: int
@@ -116,12 +123,66 @@ def dp_key(node: DpNode) -> tuple[int, float, float]:
     return (node.total_slo_violations, node.total_slo_miss_ms, node.total_energy_mj)
 
 
+def aligned_decode_segments(input_len: int, output_len: int, bucket_size: int) -> Iterable[tuple[int, int, int, int, int, int]]:
+    total_context_hi = input_len + output_len
+    context_lo = input_len + 1
+    profile_hi = ((input_len + bucket_size - 1) // bucket_size + 1) * bucket_size
+    segment_id = 0
+    while context_lo <= total_context_hi:
+        profile_lo = profile_hi - bucket_size + 1
+        context_hi = min(total_context_hi, profile_hi)
+        num_tokens = context_hi - context_lo + 1
+        yield segment_id, context_lo, context_hi, profile_lo, profile_hi, num_tokens
+        context_lo = context_hi + 1
+        profile_hi += bucket_size
+        segment_id += 1
+
+
 def backend_transition_latency_ms(from_backend: str | None, to_backend: str | None) -> float | None:
     if not from_backend or not to_backend:
         return None
     if from_backend == to_backend:
         return 0.0
     return DEFAULT_BACKEND_TRANSITION_LATENCY_MS.get((from_backend, to_backend))
+
+
+def qnn_graph_capacity_for_required(required_context: int) -> dict[str, int] | None:
+    if required_context <= 0:
+        return None
+    for capacity in QNN_GRAPH_CAPACITIES:
+        if required_context <= capacity["usable_kv_slots"]:
+            return capacity
+    return None
+
+
+def qnn_graph_capacity_for_context_size(context_size: int) -> dict[str, int] | None:
+    for capacity in QNN_GRAPH_CAPACITIES:
+        if context_size == capacity["context_size"]:
+            return capacity
+    return None
+
+
+def qnn_context_size_from_state(state_name: str, state_group: str = "") -> int | None:
+    text = f"{state_name} {state_group}".lower()
+    match = re.search(r"(?:cap|ctx|context)(\d+)", text)
+    if not match:
+        return None
+    context_size = int(match.group(1))
+    return context_size if qnn_graph_capacity_for_context_size(context_size) else None
+
+
+def qnn_profile_record_matches_query_capacity(record: "ProfileRecord", profile_query_bucket_hi: int) -> bool:
+    if record.backend != "NPU":
+        return True
+    query_capacity = qnn_graph_capacity_for_required(profile_query_bucket_hi)
+    if query_capacity is None:
+        return False
+    explicit_context = qnn_context_size_from_state(record.state_name, record.state_group)
+    if explicit_context is not None:
+        state_capacity = qnn_graph_capacity_for_context_size(explicit_context)
+        return bool(state_capacity and profile_query_bucket_hi <= state_capacity["usable_kv_slots"])
+    record_capacity = qnn_graph_capacity_for_required(record.bucket_hi)
+    return bool(record_capacity and record_capacity["context_size"] == query_capacity["context_size"])
 
 
 class Scheduler:
@@ -167,21 +228,29 @@ class EnergyDpScheduler(Scheduler):
             return empty_decode_plan(self.name)
 
         segments: list[list[SegmentCandidate]] = []
-        generated = 0
-        segment_id = 0
-        while generated < output_len:
-            num_tokens = min(bucket_size, output_len - generated)
-            context_bucket_lo = input_len + generated + 1
-            context_bucket_hi = input_len + generated + num_tokens
-            candidates = self.candidates_for_segment(segment_id, context_bucket_lo, context_bucket_hi, num_tokens)
+        for (
+            segment_id,
+            context_bucket_lo,
+            context_bucket_hi,
+            profile_query_bucket_lo,
+            profile_query_bucket_hi,
+            num_tokens,
+        ) in aligned_decode_segments(input_len, output_len, bucket_size):
+            candidates = self.candidates_for_segment(
+                segment_id,
+                context_bucket_lo,
+                context_bucket_hi,
+                profile_query_bucket_lo,
+                profile_query_bucket_hi,
+                num_tokens,
+            )
             if not candidates:
                 raise ValueError(
                     "no decode profile candidate for "
-                    f"segment {segment_id} context_bucket={context_bucket_lo}-{context_bucket_hi}"
+                    f"segment {segment_id} context_bucket={context_bucket_lo}-{context_bucket_hi} "
+                    f"profile_query_bucket={profile_query_bucket_lo}-{profile_query_bucket_hi}"
                 )
             segments.append(candidates)
-            generated += num_tokens
-            segment_id += 1
 
         dp: list[dict[str, DpNode]] = []
         for index, candidates in enumerate(segments):
@@ -264,6 +333,8 @@ class EnergyDpScheduler(Scheduler):
                     "context_len": candidate.context_bucket_hi,
                     "context_bucket_lo": candidate.context_bucket_lo,
                     "context_bucket_hi": candidate.context_bucket_hi,
+                    "profile_query_bucket_lo": candidate.profile_query_bucket_lo,
+                    "profile_query_bucket_hi": candidate.profile_query_bucket_hi,
                     "matched_profile_length": candidate.matched_profile_bucket_hi,
                     "matched_profile_bucket_lo": candidate.matched_profile_bucket_lo,
                     "matched_profile_bucket_hi": candidate.matched_profile_bucket_hi,
@@ -366,6 +437,8 @@ class EnergyDpScheduler(Scheduler):
         segment_id: int,
         context_bucket_lo: int,
         context_bucket_hi: int,
+        profile_query_bucket_lo: int,
+        profile_query_bucket_hi: int,
         num_tokens: int,
     ) -> list[SegmentCandidate]:
         candidates_by_state: dict[str, tuple[ProfileRecord, str]] = {}
@@ -378,11 +451,13 @@ class EnergyDpScheduler(Scheduler):
                 continue
             if self.fixed_state and not state_matches(record.backend, record.state_name, self.fixed_state):
                 continue
-            match = bucket_match(record, context_bucket_lo, context_bucket_hi, self.context_match)
+            if not qnn_profile_record_matches_query_capacity(record, profile_query_bucket_hi):
+                continue
+            match = bucket_match(record, profile_query_bucket_lo, profile_query_bucket_hi, self.context_match)
             if match is None:
                 continue
             previous = candidates_by_state.get(record.state_name)
-            if previous is None or match[0] < bucket_match_distance(previous[0], context_bucket_lo, context_bucket_hi):
+            if previous is None or match[0] < bucket_match_distance(previous[0], profile_query_bucket_lo, profile_query_bucket_hi):
                 candidates_by_state[record.state_name] = (record, match[1])
 
         raw: list[SegmentCandidate] = []
@@ -392,6 +467,8 @@ class EnergyDpScheduler(Scheduler):
                     segment_id=segment_id,
                     context_bucket_lo=context_bucket_lo,
                     context_bucket_hi=context_bucket_hi,
+                    profile_query_bucket_lo=profile_query_bucket_lo,
+                    profile_query_bucket_hi=profile_query_bucket_hi,
                     num_tokens=num_tokens,
                     record=record,
                     matched_profile_bucket_lo=record.bucket_lo,
@@ -411,6 +488,8 @@ class EnergyDpScheduler(Scheduler):
         state_name: str,
         context_bucket_lo: int,
         context_bucket_hi: int,
+        profile_query_bucket_lo: int,
+        profile_query_bucket_hi: int,
         num_tokens: int,
     ) -> SegmentCandidate | None:
         best: tuple[float, SegmentCandidate] | None = None
@@ -423,13 +502,17 @@ class EnergyDpScheduler(Scheduler):
                 continue
             if not state_matches(record.backend, record.state_name, state_name):
                 continue
-            match = bucket_match(record, context_bucket_lo, context_bucket_hi, self.context_match)
+            if not qnn_profile_record_matches_query_capacity(record, profile_query_bucket_hi):
+                continue
+            match = bucket_match(record, profile_query_bucket_lo, profile_query_bucket_hi, self.context_match)
             if match is None:
                 continue
             candidate = SegmentCandidate(
                 segment_id=-1,
                 context_bucket_lo=context_bucket_lo,
                 context_bucket_hi=context_bucket_hi,
+                profile_query_bucket_lo=profile_query_bucket_lo,
+                profile_query_bucket_hi=profile_query_bucket_hi,
                 num_tokens=num_tokens,
                 record=record,
                 matched_profile_bucket_lo=record.bucket_lo,
@@ -452,6 +535,8 @@ class EnergyDpScheduler(Scheduler):
             prev_state,
             current.context_bucket_lo,
             current.context_bucket_hi,
+            current.profile_query_bucket_lo,
+            current.profile_query_bucket_hi,
             current.num_tokens,
         )
         if previous_candidate is None or not previous_candidate.feasible_for_slo:
@@ -469,6 +554,8 @@ class EnergyDpScheduler(Scheduler):
             prev_state,
             current.context_bucket_lo,
             current.context_bucket_hi,
+            current.profile_query_bucket_lo,
+            current.profile_query_bucket_hi,
             current.num_tokens,
         )
         if previous_candidate is None:
@@ -723,7 +810,12 @@ def transition_state_matches(row_state: str, query_state: str, backend: str | No
     return state_matches(backend, row_state, query_state) if backend else False
 
 
-def route_spec_for_state(backend: str, state_name: str, state_group: str = "") -> str:
+def route_spec_for_state(
+    backend: str,
+    state_name: str,
+    state_group: str = "",
+    required_context: int | None = None,
+) -> str:
     backend = normalize_backend(backend)
     text = f"{state_name} {state_group}".strip()
     if backend == "GPU":
@@ -735,11 +827,33 @@ def route_spec_for_state(backend: str, state_name: str, state_group: str = "") -
     if backend == "NPU":
         lowered = text.lower()
         workpoint = state_name.removeprefix("npu_")
-        for candidate in ["low_balanced", "balanced", "burst", "low_power_saver", "power_saver", "low", "native"]:
+        for candidate in [
+            "low_balanced",
+            "high_performance",
+            "high_power_saver",
+            "low_power_saver",
+            "extreme_power_saver",
+            "power_saver",
+            "balanced",
+            "burst",
+            "native",
+            "low",
+        ]:
             if candidate in lowered:
                 workpoint = candidate
                 break
-        return f"qnn-npu{{workpoint={workpoint}}}"
+        explicit_context = qnn_context_size_from_state(state_name, state_group)
+        capacity = (
+            qnn_graph_capacity_for_context_size(explicit_context)
+            if explicit_context is not None
+            else qnn_graph_capacity_for_required(required_context or 0)
+        )
+        if capacity is None:
+            return f"qnn-npu{{workpoint={workpoint}}}"
+        return (
+            f"qnn-npu{{workpoint={workpoint},qnn_context_size={capacity['context_size']},"
+            f"qnn_required_kv_slots={capacity['usable_kv_slots']}}}"
+        )
     if backend == "CPU":
         return cpu_route_spec_for_state(state_name, state_group)
     return state_name
@@ -770,17 +884,21 @@ def cpu_route_spec_for_state(state_name: str, state_group: str = "") -> str:
 def build_decode_schedule_env(segments: list[dict[str, Any]], bucket_size: int) -> str:
     entries: list[str] = []
     previous_spec: str | None = None
-    for index, segment in enumerate(segments):
+    generated_before_segment = 0
+    for segment in segments:
         spec = route_spec_for_state(
             str(segment.get("backend") or ""),
             str(segment.get("selected_state") or ""),
             str(segment.get("state_group") or ""),
+            int(segment.get("profile_query_bucket_hi") or segment.get("context_bucket_hi") or 0),
         )
         if spec == previous_spec:
+            generated_before_segment += int(segment.get("num_tokens") or bucket_size)
             continue
-        start_token = index * bucket_size + 1
+        start_token = generated_before_segment + 1
         entries.append(f"{start_token}:{spec}")
         previous_spec = spec
+        generated_before_segment += int(segment.get("num_tokens") or bucket_size)
     return ";".join(entries)
 
 

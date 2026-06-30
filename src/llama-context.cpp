@@ -2183,7 +2183,14 @@ llama_context::llama_context(
         : model.get_hetero_plan();
     hetero_plan_base   = hetero_plan;
     aot_active_route_requests_qnn = hetero_route_requests_qnn(hetero_plan.route);
-    dynamic_route_config = llama_dynamic_route_config_from_env();
+    if (params.dynamic_route_config != nullptr) {
+        std::string dynamic_route_error;
+        if (!llama_dynamic_route_build_runtime_config(*params.dynamic_route_config, dynamic_route_config, &dynamic_route_error)) {
+            throw std::runtime_error(format("failed to build dynamic route config: %s", dynamic_route_error.c_str()));
+        }
+    } else {
+        dynamic_route_config = llama_dynamic_route_config_from_env();
+    }
 
     if (hetero_dynamic_trace_timing_enabled()) {
         hetero_decode_token_trace_records.reserve(cparams.n_ctx);
@@ -3080,10 +3087,15 @@ void llama_context::set_qnn_request_input_token_hint(uint32_t input_tokens) {
 void llama_context::maybe_prepare_dynamic_qnn_request_capacity(
         uint32_t n_tokens,
         size_t   seq0_prefix_tokens_before_decode) {
-    if (!llama_context_is_qnn_request_capacity_boundary(
-                n_tokens,
-                seq0_prefix_tokens_before_decode,
-                qnn_prefix_replay_active)) {
+    const bool batched_prefill_boundary = llama_context_is_qnn_request_capacity_boundary(
+            n_tokens,
+            seq0_prefix_tokens_before_decode,
+            qnn_prefix_replay_active);
+    const bool hinted_single_token_request_boundary =
+        !qnn_prefix_replay_active &&
+        qnn_request_input_token_hint > 0 &&
+        seq0_prefix_tokens_before_decode == 0;
+    if (!batched_prefill_boundary && !hinted_single_token_request_boundary) {
         return;
     }
 
@@ -3565,7 +3577,7 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
     const bool target_has_qnn_capacity_state =
         decision.backend_state.has_qnn_context_size ||
         decision.backend_state.has_qnn_required_kv_slots;
-    const uint64_t target_qnn_required_kv_slots =
+    uint64_t target_qnn_required_kv_slots =
         decision.backend_state.has_qnn_required_kv_slots
             ? decision.backend_state.qnn_required_kv_slots
             : qnn_current_required_kv_slots;
@@ -3573,6 +3585,10 @@ void llama_context::maybe_apply_dynamic_route(uint32_t n_tokens) {
         decision.backend_state.has_qnn_context_size
             ? decision.backend_state.qnn_context_size
             : qnn_current_context_size;
+    if (decision.backend_state.has_qnn_required_kv_slots &&
+        qnn_current_required_kv_slots > target_qnn_required_kv_slots) {
+        target_qnn_required_kv_slots = qnn_current_required_kv_slots;
+    }
     const bool qnn_capacity_target_differs =
         target_has_qnn_capacity_state &&
         (target_qnn_required_kv_slots != qnn_current_required_kv_slots ||
@@ -6501,9 +6517,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     const auto run_graph_once = [&](llm_graph_result * res, bool allow_reuse, bool force_cpu_graph) -> ggml_status {
         aot_force_cpu_graph = force_cpu_graph;
+        const uint32_t saved_n_outputs = n_outputs;
+        if (force_cpu_graph && n_outputs == 0 && ubatch.n_tokens > 0) {
+            // The correction graph output is discarded, but a zero-row output tail can trip CPU kernels.
+            n_outputs = ubatch.n_tokens;
+        }
 
         auto restore_force_cpu = [this]() {
             aot_force_cpu_graph = false;
+        };
+        auto restore_correction_outputs = [this, saved_n_outputs]() {
+            n_outputs = saved_n_outputs;
         };
 
         auto * gf = res->get_gf();
@@ -6526,12 +6550,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
             if (!gf) {
                 restore_force_cpu();
+                restore_correction_outputs();
                 LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
                 return GGML_STATUS_FAILED;
             }
 
             if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
                 restore_force_cpu();
+                restore_correction_outputs();
                 LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
                 return GGML_STATUS_ALLOC_FAILED;
             }
@@ -6541,6 +6567,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->set_inputs(&ubatch);
 
         restore_force_cpu();
+        restore_correction_outputs();
         if (trace_timing) {
             if (reused_graph) {
                 hetero_phase_trace.graph_runs_reused++;
@@ -6551,7 +6578,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return graph_compute(res->get_gf(), ubatch, ubatch.n_tokens > 1);
     };
 
-    const bool aot_single_token_pos0 =
+    const bool aot_generic_kv_writeback_enabled =
+        env_flag_enabled("GGML_QNN_AOT_WRITE_GENERIC_KV");
+    const bool aot_force_bootstrap_cpu_correction =
+        env_flag_enabled("GGML_QNN_AOT_FORCE_BOOTSTRAP_CPU_CORRECTION");
+    const bool aot_single_token_pos0_candidate =
         std::getenv("GGML_QNN_AOT_CONFIG") != nullptr &&
         aot_active_route_requests_qnn &&
         !aot_skip_bootstrap_for_next_decode &&
@@ -6559,6 +6590,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ubatch.n_pos > 0 &&
         ubatch.pos != nullptr &&
         ubatch.pos[0] == 0;
+    const bool aot_single_token_pos0 =
+        aot_single_token_pos0_candidate &&
+        (!aot_generic_kv_writeback_enabled || aot_force_bootstrap_cpu_correction);
 
     auto * res = gf_res_prev.get();
     auto status = run_graph_once(res, /* allow_reuse = */ true, /* force_cpu_graph = */ false);
@@ -6569,6 +6603,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    if (aot_single_token_pos0_candidate && !aot_single_token_pos0) {
+        LLAMA_LOG_INFO("%s: skipping AoT bootstrap CPU correction because GGML_QNN_AOT_WRITE_GENERIC_KV is enabled\n", __func__);
     }
 
     if (aot_single_token_pos0) {
@@ -6589,11 +6627,60 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->invalidate_reuse();
 
         auto * cpu_res = gf_res_reserve.get();
-        const bool correction_requires_preserving_offloaded_weights = model.n_gpu_layers() > 0;
+        const bool correction_requires_preserving_non_qnn_backends = model.n_gpu_layers() > 0;
 
-        if (correction_requires_preserving_offloaded_weights) {
-            LLAMA_LOG_INFO("%s: bootstrap correction keeps the steady-state scheduler because n_gpu_layers=%d leaves model weights pre-allocated on non-CPU backends\n",
+        if (correction_requires_preserving_non_qnn_backends) {
+            LLAMA_LOG_INFO("%s: bootstrap correction uses a temporary non-QNN scheduler because n_gpu_layers=%d leaves tensors pre-allocated on non-CPU backends\n",
                     __func__, model.n_gpu_layers());
+
+            std::vector<ggml_backend_t> correction_backend_ptrs;
+            std::vector<ggml_backend_buffer_type_t> correction_backend_bufts;
+
+            ggml_backend_buffer_type_t cpu_buft = ggml_backend_get_default_buffer_type(backend_cpu);
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                ggml_backend_t backend = backend_ptrs[i];
+                if (backend == nullptr) {
+                    continue;
+                }
+
+                const char * backend_name = ggml_backend_name(backend);
+                if (backend_name != nullptr && llama_hetero_is_qnn_backend(backend_name)) {
+                    continue;
+                }
+
+                if (backend == backend_cpu) {
+                    cpu_buft = backend_buft[i];
+                    continue;
+                }
+
+                correction_backend_ptrs.push_back(backend);
+                correction_backend_bufts.push_back(backend_buft[i]);
+            }
+
+            correction_backend_ptrs.push_back(backend_cpu);
+            correction_backend_bufts.push_back(cpu_buft);
+
+            aot_saved_sched = std::move(sched);
+            const int64_t t_bootstrap_sched_start_us = trace_timing ? ggml_time_us() : 0;
+            sched.reset(ggml_backend_sched_new(
+                    correction_backend_ptrs.data(),
+                    correction_backend_bufts.data(),
+                    correction_backend_ptrs.size(),
+                    cpu_res->get_max_nodes(),
+                    /* parallel = */ false,
+                    cparams.op_offload));
+            if (trace_timing) {
+                hetero_phase_trace.bootstrap_sched_rebuild_us += ggml_time_us() - t_bootstrap_sched_start_us;
+            }
+
+            if (!sched) {
+                sched = std::move(aot_saved_sched);
+                LLAMA_LOG_ERROR("%s: failed to create non-QNN scheduler for AoT bootstrap correction\n", __func__);
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
+
+            aot_bootstrap_cpu_sched_active = true;
         } else {
             ggml_backend_buffer_type_t cpu_buft = ggml_backend_get_default_buffer_type(backend_cpu);
             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -7866,7 +7953,8 @@ llm_graph_cb llama_context::graph_get_cb() const {
 
     return [&, qnn_aot_enabled, qnn_aot_backend, qnn_gpu_backend, qnn_cpu_backend,
             hetero_stage_enabled, hetero_route_uses_opencl,
-            hetero_phase_backend, hetero_output_backend](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
+            hetero_phase_backend, hetero_output_backend,
+            hetero_phase_backend_name](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
         if (il >= 0) {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
@@ -9200,6 +9288,7 @@ llama_context_params llama_context_default_params() {
         /*.abort_callback_data         =*/ nullptr,
         /*.hetero_phase_route          =*/ nullptr,
         /*.hetero_kv_layout            =*/ nullptr,
+        /*.dynamic_route_config        =*/ nullptr,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,
@@ -9218,8 +9307,12 @@ llama_dynamic_route_config llama_dynamic_route_default_config() {
         /*.mode               =*/ "disabled",
         /*.prefill_route      =*/ nullptr,
         /*.prefill_kv_layout  =*/ nullptr,
+        /*.prefill_qnn_workpoint =*/ nullptr,
+        /*.prefill_qnn_context_size =*/ 0,
+        /*.prefill_qnn_required_kv_slots =*/ 0,
         /*.decode_route       =*/ nullptr,
         /*.decode_kv_layout   =*/ nullptr,
+        /*.decode_schedule    =*/ nullptr,
         /*.fallback_route     =*/ nullptr,
         /*.fallback_kv_layout =*/ nullptr,
         /*.slo_us             =*/ 0,

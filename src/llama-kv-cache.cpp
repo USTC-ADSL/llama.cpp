@@ -321,16 +321,29 @@ llama_kv_cache::llama_kv_cache(
         return llama_hetero_canonical_backend(route.backend_for(llama_hetero_route_stage::ATTN_CORE));
     };
     const auto & hetero_route = model.get_hetero_plan().route;
-    const llama_hetero_route_spec dynamic_prefill_route =
-        llama_hetero_parse_route_spec(std::getenv("GGML_HETERO_DYNAMIC_PREFILL_ROUTE"));
-    const char * dynamic_decode_schedule_env = std::getenv("GGML_HETERO_DYNAMIC_DECODE_SCHEDULE");
-    if (dynamic_decode_schedule_env == nullptr || dynamic_decode_schedule_env[0] == '\0') {
-        dynamic_decode_schedule_env = std::getenv("GGML_HETERO_DECODE_ROUTE_SCHEDULE");
+    const auto model_dynamic_value_or_env = [](const char * value, const char * env_name) -> const char * {
+        if (value != nullptr && value[0] != '\0') {
+            return value;
+        }
+        return std::getenv(env_name);
+    };
+    const char * dynamic_prefill_route_value =
+        model_dynamic_value_or_env(model.get_hetero_dynamic_prefill_route(), "GGML_HETERO_DYNAMIC_PREFILL_ROUTE");
+    const char * dynamic_decode_schedule_value = model.get_hetero_dynamic_decode_schedule();
+    if (dynamic_decode_schedule_value == nullptr || dynamic_decode_schedule_value[0] == '\0') {
+        dynamic_decode_schedule_value = std::getenv("GGML_HETERO_DYNAMIC_DECODE_SCHEDULE");
     }
+    if (dynamic_decode_schedule_value == nullptr || dynamic_decode_schedule_value[0] == '\0') {
+        dynamic_decode_schedule_value = std::getenv("GGML_HETERO_DECODE_ROUTE_SCHEDULE");
+    }
+    const char * dynamic_decode_route_value =
+        model_dynamic_value_or_env(model.get_hetero_dynamic_decode_route(), "GGML_HETERO_DYNAMIC_DECODE_ROUTE");
+    const llama_hetero_route_spec dynamic_prefill_route =
+        llama_hetero_parse_route_spec(dynamic_prefill_route_value);
     const llama_hetero_route_spec dynamic_decode_route =
         llama_kv_cache_dynamic_decode_route_for_initial_placement(
-                std::getenv("GGML_HETERO_DYNAMIC_DECODE_ROUTE"),
-                dynamic_decode_schedule_env);
+                dynamic_decode_route_value,
+                dynamic_decode_schedule_value);
     const std::string dynamic_prefill_consumer_backend = route_attn_consumer_backend(dynamic_prefill_route);
     const std::string dynamic_decode_consumer_backend  = route_attn_consumer_backend(dynamic_decode_route);
     const bool dynamic_phase_switch_active =
@@ -345,6 +358,8 @@ llama_kv_cache::llama_kv_cache(
     const bool dynamic_phase_qnn_opencl_switch =
         (route_requests_qnn(dynamic_prefill_route) && route_attn_uses_opencl(dynamic_decode_route)) ||
         (route_attn_uses_opencl(dynamic_prefill_route) && route_requests_qnn(dynamic_decode_route));
+    const bool dynamic_prefill_requests_qnn = route_requests_qnn(dynamic_prefill_route);
+    const bool dynamic_decode_requests_qnn  = route_requests_qnn(dynamic_decode_route);
     const bool hetero_qnn_shared_host_requested =
         env_flag_enabled("GGML_HETERO_QNN_SHARED_HOST") &&
         (llama_hetero_route_has_qnn_adjacent_boundary(hetero_route) || dynamic_phase_qnn_opencl_switch);
@@ -428,6 +443,29 @@ llama_kv_cache::llama_kv_cache(
                         dynamic_prefill_consumer_backend.c_str(),
                         dynamic_decode_consumer_backend.c_str());
             }
+        }
+    }
+
+    if (shared_kv_buft == nullptr &&
+        consumer_kv_buft == nullptr &&
+        producer_kv_buft == nullptr &&
+        mixed_attn_shared_kv_buft == nullptr &&
+        !this->kv_contract.stage_boundary_active() &&
+        env_flag_enabled("GGML_QNN_AOT_WRITE_GENERIC_KV") &&
+        dynamic_prefill_requests_qnn &&
+        (!dynamic_decode_route.has_any_route() || dynamic_decode_requests_qnn)) {
+        ggml_backend_dev_t qnn_dev = ggml_backend_dev_by_name("qnn-npu");
+        ggml_backend_buffer_type_t qnn_host_buft =
+            qnn_dev != nullptr ? ggml_backend_dev_host_buffer_type(qnn_dev) : nullptr;
+
+        if (qnn_host_buft != nullptr) {
+            mixed_attn_shared_kv_buft = qnn_host_buft;
+            LLAMA_LOG_INFO("%s: dynamic qnn prefill/decode keeps legacy KV cache on %s so AoT generic KV writeback targets a QNN host-visible buffer\n",
+                    __func__,
+                    ggml_backend_buft_name(mixed_attn_shared_kv_buft));
+        } else {
+            LLAMA_LOG_WARN("%s: dynamic qnn prefill/decode requested host-visible generic KV placement, but qnn-npu-host is unavailable; falling back to legacy placement\n",
+                    __func__);
         }
     }
 

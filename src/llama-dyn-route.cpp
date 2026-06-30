@@ -673,6 +673,19 @@ bool llama_dynamic_route_build_runtime_config(
     set_candidate(out_config.prefill,  "prefill",  public_config.prefill_route,  public_config.prefill_kv_layout);
     set_candidate(out_config.decode,   "decode",   public_config.decode_route,   public_config.decode_kv_layout);
     set_candidate(out_config.fallback, "fallback", public_config.fallback_route, public_config.fallback_kv_layout);
+    if (public_config.prefill_qnn_workpoint != nullptr && public_config.prefill_qnn_workpoint[0] != '\0') {
+        out_config.prefill_backend_state.has_qnn_workpoint = true;
+        out_config.prefill_backend_state.qnn_workpoint = public_config.prefill_qnn_workpoint;
+    }
+    if (public_config.prefill_qnn_context_size > 0) {
+        out_config.prefill_backend_state.has_qnn_context_size = true;
+        out_config.prefill_backend_state.qnn_context_size = public_config.prefill_qnn_context_size;
+    }
+    if (public_config.prefill_qnn_required_kv_slots > 0) {
+        out_config.prefill_backend_state.has_qnn_required_kv_slots = true;
+        out_config.prefill_backend_state.qnn_required_kv_slots = public_config.prefill_qnn_required_kv_slots;
+    }
+    out_config.decode_schedule = parse_decode_schedule(public_config.decode_schedule);
 
     out_config.slo_us        = public_config.slo_us;
     out_config.allow_qnn     = public_config.allow_qnn;
